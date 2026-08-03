@@ -172,7 +172,33 @@ def init_db():
             -- this setting.
             monthly_voice_cap_usd REAL,
 
+            -- August's generation service keys (FLUX, Ideogram, ElevenLabs,
+            -- Veo/Gemini) — a single Fernet-encrypted JSON blob rather than
+            -- four separate columns, e.g. {"flux": "...", "veo": "..."}.
+            -- Server-side only (Option A style) — unlike the main LLM key,
+            -- there's no Option B browser-held variant for these, since
+            -- generation happens async/server-side regardless (Veo in
+            -- particular can take several minutes, long past any single
+            -- browser-unlock session).
+            encrypted_generation_keys TEXT,
+
+            -- Same NULL-means-default / -1-means-uncapped pattern as
+            -- monthly_voice_cap_usd, for August's generation spend.
+            monthly_generation_cap_usd REAL,
+
             created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- August's generation spend, one row per successful generation —
+        -- same shape as Home's generation_costs table, scoped per customer
+        -- since Cloud serves many customers from one database.
+        CREATE TABLE IF NOT EXISTS generation_costs (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id         TEXT,
+            service             TEXT,  -- 'flux' | 'ideogram' | 'elevenlabs' | 'veo'
+            estimated_cost_usd  REAL,
+            created_at          TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
         -- Per-customer memories (same schema as Home)
@@ -305,19 +331,27 @@ def init_db():
             ON grading_assignments(customer_id, assignment_name);
         CREATE INDEX IF NOT EXISTS idx_call_usage_customer
             ON call_usage(customer_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_generation_costs_customer
+            ON generation_costs(customer_id, created_at);
         """)
         conn.commit()
 
     # Lightweight migration: a database created before monthly_voice_cap_usd
-    # existed won't have it — CREATE TABLE IF NOT EXISTS above doesn't add
+    # (and the two generation-related columns added alongside it) existed
+    # won't have them — CREATE TABLE IF NOT EXISTS above doesn't add
     # columns to an already-existing table. Wrapped in try/except since
     # SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS.
     with closing(get_db()) as conn:
-        try:
-            conn.execute("ALTER TABLE customers ADD COLUMN monthly_voice_cap_usd REAL")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
+        for column, coltype in [
+            ("monthly_voice_cap_usd", "REAL"),
+            ("encrypted_generation_keys", "TEXT"),
+            ("monthly_generation_cap_usd", "REAL"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {coltype}")
+                conn.commit()
+            except Exception:
+                pass  # column already exists
 
 
 def _check_rate(key: str, max_req: int, window_sec: int) -> bool:
@@ -351,6 +385,29 @@ def get_customer(customer_id: str):
             "SELECT * FROM customers WHERE id = ?", (customer_id,)
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_unlocked_addons(customer: dict) -> list[str]:
+    """
+    unlocked_addons is stored as a raw JSON TEXT column, not a Python
+    list — a customer dict pulled straight from the DB has a JSON
+    STRING in this field (e.g. '["august"]'), not an actual list. Doing
+    `"august" in customer.get("unlocked_addons")` does a raw substring
+    search across that whole JSON string, which happens to give the
+    right answer today (no addon id is currently a substring of
+    another) but is fragile and wrong in principle — this parses it
+    properly instead. Returns [] on missing/malformed data rather than
+    raising, since a broken addon list should mean "nothing unlocked,"
+    not a 500 error.
+    """
+    raw = customer.get("unlocked_addons")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
 
 
 def get_customer_by_phone(phone_number: str):
@@ -646,6 +703,227 @@ def is_over_voice_cap(customer: dict) -> tuple[bool, float, float | None]:
         return False, 0.0, None
     spend = get_monthly_voice_spend(customer["id"])
     return spend >= cap, spend, cap
+
+
+# ── August's generation services — key storage, cost tracking, spend cap ────
+# Same BYOK model as Home: each customer supplies their own key per
+# service. Stored server-side only (no Option B browser-held variant —
+# see the encrypted_generation_keys column comment for why), as one
+# Fernet-encrypted JSON blob rather than four separate encrypted columns.
+
+def get_generation_api_key(customer: dict, service: str) -> str | None:
+    if not _fernet or not customer.get("encrypted_generation_keys"):
+        return None
+    try:
+        decrypted = _fernet.decrypt(customer["encrypted_generation_keys"].encode()).decode()
+        keys = json.loads(decrypted)
+        return keys.get(service)
+    except Exception:
+        return None
+
+
+def set_generation_api_key(customer_id: str, service: str, api_key: str):
+    """Merges into the existing blob rather than overwriting it — setting
+    a FLUX key shouldn't wipe out an already-configured Veo key."""
+    if not _fernet:
+        raise RuntimeError("CLOUD_ENCRYPTION_KEY not configured")
+    customer = get_customer(customer_id)
+    existing = {}
+    if customer and customer.get("encrypted_generation_keys"):
+        try:
+            existing = json.loads(_fernet.decrypt(customer["encrypted_generation_keys"].encode()).decode())
+        except Exception:
+            existing = {}
+    existing[service] = api_key
+    encrypted = _fernet.encrypt(json.dumps(existing).encode()).decode()
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE customers SET encrypted_generation_keys=? WHERE id=?",
+            (encrypted, customer_id),
+        )
+        conn.commit()
+
+
+def has_generation_key(customer: dict, service: str) -> bool:
+    return get_generation_api_key(customer, service) is not None
+
+
+# Same estimates as Home, kept numerically consistent rather than
+# re-derived — see Home's ESTIMATED_COST_USD for the sourcing notes on
+# each (FLUX confirmed against BFL's stated pricing; Ideogram/ElevenLabs
+# are rough estimates; Veo confirmed against Google's stated per-second
+# rate for a typical 8-second clip).
+GENERATION_ESTIMATED_COST_USD = {
+    "flux": 0.04,
+    "ideogram": 0.08,
+    "elevenlabs": 0.02,
+    "veo": 3.20,
+}
+
+DEFAULT_MONTHLY_GENERATION_CAP_USD = 25.0  # same default as Home, for the
+                                             # same reasoning — see Home's
+                                             # DEFAULT_MONTHLY_SPEND_CAP_USD
+
+
+def log_generation_cost(customer_id: str, service: str):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO generation_costs (customer_id, service, estimated_cost_usd) VALUES (?, ?, ?)",
+            (customer_id, service, GENERATION_ESTIMATED_COST_USD.get(service, 0.0)),
+        )
+        conn.commit()
+
+
+def get_monthly_generation_spend(customer_id: str) -> float:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT SUM(estimated_cost_usd) as total FROM generation_costs "
+            "WHERE customer_id=? AND created_at >= date('now', 'start of month')",
+            (customer_id,),
+        ).fetchone()
+        return row["total"] or 0.0
+
+
+def get_generation_cap(customer: dict):
+    """Same NULL-means-default / -1-means-uncapped sentinel as get_voice_cap."""
+    raw = customer.get("monthly_generation_cap_usd")
+    if raw is None:
+        return DEFAULT_MONTHLY_GENERATION_CAP_USD
+    if raw == -1:
+        return None
+    return raw
+
+
+def check_generation_cap(customer: dict, service: str) -> tuple[bool, str | None]:
+    """Checked BEFORE a paid generation call fires — mirrors Home's
+    check_spend_cap exactly. Returns (ok, message)."""
+    cap = get_generation_cap(customer)
+    if cap is None:
+        return True, None
+    current = get_monthly_generation_spend(customer["id"])
+    projected = current + GENERATION_ESTIMATED_COST_USD.get(service, 0.0)
+    if projected > cap:
+        return False, (
+            f"This would put this month's generation spend at an estimated ${projected:.2f}, "
+            f"over the ${cap:.2f} monthly cap currently set. Nothing was generated. Raise or "
+            f"remove this cap from the Cloud dashboard."
+        )
+    return True, None
+
+
+def _download_generation_bytes(url: str) -> bytes:
+    resp = http.get(url, timeout=60)
+    resp.raise_for_status()
+    return resp.content
+
+
+def generate_image_flux(prompt: str, api_key: str) -> tuple[bytes | None, str | None]:
+    """Ported from Home's generate_image_flux — same verified endpoint
+    and submit/poll shape (api.bfl.ai, polling_url from the submit
+    response). Returns raw bytes instead of a local file path — Cloud
+    never writes generated content to its own disk."""
+    try:
+        submit = http.post(
+            "https://api.bfl.ai/v1/flux-pro-1.1",
+            headers={"accept": "application/json", "x-key": api_key, "Content-Type": "application/json"},
+            json={"prompt": prompt, "width": 1024, "height": 1024},
+            timeout=30,
+        )
+        submit.raise_for_status()
+        submit_data = submit.json()
+        task_id = submit_data.get("id")
+        polling_url = submit_data.get("polling_url")
+        if not task_id or not polling_url:
+            return None, "FLUX didn't return an id/polling_url — the API shape may have changed since this was written."
+        for _ in range(60):
+            time.sleep(0.5)
+            result = http.get(
+                polling_url, params={"id": task_id},
+                headers={"accept": "application/json", "x-key": api_key}, timeout=15,
+            )
+            result.raise_for_status()
+            data = result.json()
+            status = data.get("status")
+            if status == "Ready":
+                image_url = (data.get("result") or {}).get("sample")
+                if not image_url:
+                    return None, "FLUX reported ready but returned no image URL."
+                return _download_generation_bytes(image_url), None
+            if status in ("Error", "Failed"):
+                return None, f"FLUX generation failed (status: {status})."
+        return None, "FLUX generation timed out waiting for a result."
+    except Exception as e:
+        return None, f"FLUX call failed: {e}"
+
+
+def generate_image_ideogram(prompt: str, api_key: str) -> tuple[bytes | None, str | None]:
+    """Ported from Home — used when the image needs clean, legible
+    rendered text (logos, posters)."""
+    try:
+        resp = http.post(
+            "https://api.ideogram.ai/v1/ideogram-v4/generate",
+            headers={"Api-Key": api_key, "Content-Type": "application/json"},
+            json={"prompt": prompt},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("data") or []
+        image_url = items[0].get("url") if items else None
+        if not image_url:
+            return None, "Ideogram didn't return an image URL."
+        return _download_generation_bytes(image_url), None
+    except Exception as e:
+        return None, f"Ideogram call failed: {e}"
+
+
+def generate_voice_elevenlabs(text: str, api_key: str, voice_id: str = "21m00Tcm4TlvDq8ikWAM") -> tuple[bytes | None, str | None]:
+    """Ported from Home. voice_id defaults to the same generic voice Home
+    uses — Cloud's per-persona ElevenLabs voice IDs (PERSONA_VOICE_IDS)
+    already exist for Vapi calls, reused here so a generated voice clip
+    matches whichever persona the customer is talking to."""
+    try:
+        resp = http.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={"text": text, "model_id": "eleven_multilingual_v2"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.content, None
+    except Exception as e:
+        return None, f"ElevenLabs call failed: {e}"
+
+
+def generate_video_veo_sync(prompt: str, api_key: str) -> tuple[bytes | None, str | None]:
+    """
+    Ported from Home's _generate_video_veo_sync — same verified model
+    (veo-3.1-generate-preview via the Gemini API, not the heavier Vertex
+    AI path) and submit/poll shape. Always slow (several minutes) —
+    meant to run inside a background thread, never inline in a request
+    handler, same as Home never runs this inline in relay().
+    """
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        operation = client.models.generate_videos(
+            model="veo-3.1-generate-preview",
+            prompt=prompt,
+        )
+        for _ in range(60):  # up to ~10 minutes
+            time.sleep(10)
+            operation = client.operations.get(operation)
+            if operation.done:
+                break
+        else:
+            return None, "Video generation timed out waiting for a result."
+
+        if not operation.response or not operation.response.generated_videos:
+            return None, "Veo reported done but returned no video."
+
+        video = operation.response.generated_videos[0]
+        return client.files.download(file=video.video), None
+    except Exception as e:
+        return None, f"Veo call failed: {e}"
 
 
 # ElevenLabs voice IDs per persona, so a phone call actually sounds like
@@ -992,6 +1270,282 @@ def build_grading_calibration_context(customer_id: str, assignment_name: str):
     return "\n".join(parts)
 
 
+# ── Browser automation — ported from Home's curant-cli, adapted for ────────
+# Cloud's architecture. Same capability, same hard rails, different
+# delivery mechanism underneath:
+#   - browse_page(): read-only, no side effect, runs freely.
+#   - fill_and_submit_form(): the real external-effect action. Requires
+#     confirmed=true (enforced in code, not just prompt instruction — see
+#     execute_cloud_tool_call below), AND hard-blocked from ever touching
+#     a payment/sensitive-ID field regardless of confirmation, exactly
+#     the same PAYMENT_FIELD_KEYWORDS logic as Home, ported verbatim
+#     rather than re-derived, so the two implementations can't quietly
+#     drift apart on what counts as a sensitive field.
+#
+# THE REAL ARCHITECTURAL DIFFERENCE FROM HOME: Home has a persistent
+# local watcher process that can poll a background job indefinitely and
+# deliver results whenever they're ready. Cloud has no such process —
+# it's a stateless webhook handler. So the "exactly once, poll or
+# fall back" pattern Home uses (a detached subprocess, polled by the
+# request handler) is reimplemented here with a daemon thread plus an
+# in-memory job dict (same pattern already used for Option B's
+# _session_keys above) instead of a subprocess: the actual browser work
+# starts in a background thread exactly once; the request handler polls
+# that thread's result for a bounded window, and if it's still running
+# when that window closes, the SAME thread (not a new one) sends a
+# follow-up SMS with the result once it finishes — so there's still only
+# ever one execution of the actual submission, never a risk of double-
+# submitting a form.
+
+PAYMENT_FIELD_KEYWORDS = (
+    "card", "cvv", "cvc", "ccnum", "cardnumber", "security-code",
+    "securitycode", "expiry", "exp-date", "expdate", "ssn", "social-security",
+    "socialsecurity", "routing-number", "routingnumber", "account-number", "accountnumber",
+)
+
+
+def _is_sensitive_field(field_name: str) -> bool:
+    """Ported verbatim from Home — normalizes separators out of both the
+    field name and keyword list before comparing, so 'cc_number' still
+    matches the 'ccnum' keyword despite the underscore."""
+    if not field_name:
+        return False
+    normalized = re.sub(r"[^a-z0-9]", "", field_name.lower())
+    normalized_keywords = [re.sub(r"[^a-z0-9]", "", kw) for kw in PAYMENT_FIELD_KEYWORDS]
+    return any(kw in normalized for kw in normalized_keywords)
+
+
+BROWSER_TIMEOUT_MS = 15000
+BROWSER_SYNC_WAIT_SECONDS = 8  # same value as Home — most form submissions
+                                 # are fast enough to answer in the same
+                                 # SMS reply rather than always needing a
+                                 # separate follow-up text
+
+
+def browse_page(url: str):
+    """Read-only — see what's on a page and what fields exist, so the
+    model knows what a subsequent fill_and_submit_form() call could
+    target. No side effect, no confirmation needed."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=BROWSER_TIMEOUT_MS)
+                page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+                text_content = page.inner_text("body")
+                fields = page.eval_on_selector_all(
+                    "input, select, textarea",
+                    """els => els.map(el => ({
+                        name: el.name || el.id || '',
+                        type: el.type || el.tagName.toLowerCase(),
+                        label: (el.labels && el.labels[0]) ? el.labels[0].innerText : ''
+                    }))""",
+                )
+                return {"text": text_content[:3000], "fields": fields}, None
+            finally:
+                browser.close()
+    except Exception as e:
+        return None, f"Could not load that page: {e}"
+
+
+def fill_and_submit_form(url: str, field_values: dict, submit_selector: str, confirmed: bool = False):
+    """
+    The real external-effect action. confirmed is checked here in code —
+    same structural pattern as gmail_send/drive_share/calendar_delete_event
+    above, not just requested via system prompt. Hard-blocked, regardless
+    of confirmation, from touching anything that looks like a payment or
+    sensitive-ID field.
+    """
+    if not confirmed:
+        return None, (
+            "Not submitted — this action requires explicit customer confirmation first. "
+            "Ask the customer to confirm, wait for their reply, then call this again with "
+            "confirmed=true."
+        )
+
+    blocked = [k for k in field_values if _is_sensitive_field(k)]
+    if blocked:
+        return None, (
+            f"Refusing to auto-fill these fields — they look like payment or sensitive-ID "
+            f"fields ({', '.join(blocked)}). That needs a person to enter directly, never "
+            f"automated, regardless of confirmation."
+        )
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.goto(url, timeout=BROWSER_TIMEOUT_MS)
+                for field_name, value in field_values.items():
+                    el = page.query_selector(f"#{field_name}, [name='{field_name}']")
+                    if not el:
+                        return None, f"Could not find a field matching '{field_name}' on this page."
+                    tag = el.evaluate("el => el.tagName.toLowerCase()")
+                    el_type = el.evaluate("el => el.type || ''")
+                    if tag == "select":
+                        el.select_option(str(value))
+                    elif el_type == "checkbox":
+                        if str(value).lower() in ("true", "1", "yes"):
+                            el.check()
+                    else:
+                        el.fill(str(value))
+
+                page.click(submit_selector, timeout=BROWSER_TIMEOUT_MS)
+                page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+                result_text = page.inner_text("body")
+                return {"result_text": result_text[:2000]}, None
+            finally:
+                browser.close()
+    except Exception as e:
+        return None, f"Browser automation failed: {e}"
+
+
+# In-memory job tracking for the hybrid sync/async pattern — same shape
+# and same reasoning as _session_keys above (a single Cloud process is
+# the deployment target per docker-compose.yml; move to Redis if this
+# ever runs as multiple worker processes, same caveat already noted on
+# _check_rate before it was made DB-backed).
+_browser_jobs: dict[str, dict] = {}
+_browser_jobs_lock = threading.Lock()
+
+
+def _run_form_submission(job_id: str, url: str, field_values: dict, submit_selector: str,
+                         confirmed: bool, sms_reply_to: str, sms_reply_from: str):
+    """
+    Runs in a daemon thread, started exactly once per job_id. Updates
+    the shared job dict when done. If this finishes AFTER the request
+    handler already gave up waiting and replied with "still working",
+    this is what sends the actual follow-up SMS — the customer always
+    gets a real answer, just not always in the first reply.
+
+    sms_reply_to/sms_reply_from are the ORIGINAL webhook's from_number/
+    to_number (customer's real phone, our assigned DID) — deliberately
+    not customer["phone_number"], whose exact meaning is ambiguous
+    against how phone_routing is actually queried elsewhere in this
+    file (see the comment on generate_reply). Using the same values the
+    webhook itself already used for its own reply sidesteps that
+    ambiguity entirely rather than risk sending to the wrong number.
+    """
+    result, error = fill_and_submit_form(url, field_values, submit_selector, confirmed=confirmed)
+    with _browser_jobs_lock:
+        job = _browser_jobs.get(job_id, {})
+        job["done"] = True
+        job["result"] = result
+        job["error"] = error
+        already_answered_sync = job.get("answered_sync", False)
+        _browser_jobs[job_id] = job
+
+    if already_answered_sync and sms_reply_to and sms_reply_from:
+        # The synchronous path already gave up and told the customer
+        # "still working" — this follow-up SMS is the only way they
+        # actually learn what happened.
+        if error:
+            send_sms(sms_reply_to, sms_reply_from, f"[Form submission update] {error}")
+        else:
+            text = (result or {}).get("result_text", "")
+            send_sms(sms_reply_to, sms_reply_from,
+                     f"[Form submission complete] {text[:500] if text else 'Done, but no page content came back.'}")
+
+
+def fill_and_submit_form_hybrid(url: str, field_values: dict, submit_selector: str,
+                                confirmed: bool, customer: dict, sms_reply_from: str,
+                                sms_reply_to: str | None = None) -> str:
+    """
+    Starts the actual submission in a background thread exactly once,
+    then waits up to BROWSER_SYNC_WAIT_SECONDS for it to finish so the
+    common case (a fast site) gets a real answer in the same SMS reply.
+    If it's still running past that window, tells the customer it's
+    still working — _run_form_submission (already in flight) is what
+    sends the real follow-up once it completes, not a second call to
+    this function or to fill_and_submit_form itself.
+
+    If sms_reply_to isn't available (e.g. this ever gets called from a
+    non-SMS channel), the async follow-up simply can't be sent — that's
+    handled explicitly in _run_form_submission (checks both values are
+    truthy) rather than guessing a destination.
+    """
+    if not confirmed:
+        return (
+            "Not submitted — this action requires explicit customer confirmation first. "
+            "Ask the customer to confirm, wait for their reply, then call this again with "
+            "confirmed=true."
+        )
+
+    job_id = secrets.token_hex(8)
+    with _browser_jobs_lock:
+        _browser_jobs[job_id] = {"done": False, "answered_sync": False}
+
+    thread = threading.Thread(
+        target=_run_form_submission,
+        args=(job_id, url, field_values, submit_selector, confirmed,
+              sms_reply_to, sms_reply_from),
+        daemon=True,
+    )
+    thread.start()
+
+    deadline = time.time() + BROWSER_SYNC_WAIT_SECONDS
+    while time.time() < deadline:
+        time.sleep(0.5)
+        with _browser_jobs_lock:
+            job = _browser_jobs.get(job_id, {})
+            if job.get("done"):
+                result, error = job.get("result"), job.get("error")
+                del _browser_jobs[job_id]
+                if error:
+                    return f"[Form submission failed: {error}]"
+                return (result or {}).get("result_text") or "(Form submitted, but no page content came back.)"
+
+    # Still running — mark it so the background thread knows to send a
+    # follow-up SMS once it finishes, instead of the result being
+    # silently dropped since nothing is polling for it anymore.
+    with _browser_jobs_lock:
+        if job_id in _browser_jobs:
+            _browser_jobs[job_id]["answered_sync"] = True
+
+    return ("Still working on that one — the site's taking a bit longer than usual. "
+            "I'll text an update as soon as it's done.")
+
+
+def get_browser_automation_tools(customer: dict) -> list[dict]:
+    """
+    Gated on the 'browser_automation' addon, independent of persona —
+    same as Home. Deliberately its own gate, not bundled with August,
+    since filling out a form isn't a creative capability.
+    """
+    if "browser_automation" not in get_unlocked_addons(customer):
+        return []
+    return [
+        {"qualified_name": "browse_page", "raw_name": "browse_page",
+         "description": "Load a webpage and see its text content and any fillable form "
+                         "fields (name, type, label). Read-only, no confirmation needed — "
+                         "use this to see what's on a signup page before filling it in.",
+         "input_schema": {"type": "object", "properties": {
+             "url": {"type": "string"}}, "required": ["url"]}},
+        {"qualified_name": "fill_and_submit_form", "raw_name": "fill_and_submit_form",
+         "description": "Fill in a webpage's form fields and submit it — actually "
+                         "completes a signup, not just looks at it. Requires `confirmed: "
+                         "true` in the call itself — set this ONLY after the customer has "
+                         "explicitly confirmed in a PRIOR message, never in the same turn "
+                         "you first mention it. Enforced in code: a call with "
+                         "confirmed=false or omitted will be rejected. Will always refuse "
+                         "to touch payment or sensitive-ID fields (card numbers, CVV, SSN) "
+                         "no matter what, regardless of confirmation — those need a person "
+                         "to enter directly. Most submissions answer immediately; a slow "
+                         "site may instead say it's still working and follow up by text "
+                         "once it's actually done.",
+         "input_schema": {"type": "object", "properties": {
+             "url": {"type": "string"},
+             "field_values": {"type": "object", "description": "Field name/id -> value to fill in"},
+             "submit_selector": {"type": "string", "description": "CSS selector for the submit button, e.g. '#submit-btn'"},
+             "confirmed": {"type": "boolean", "description": "Must be true — set only after the customer has explicitly confirmed in a prior message."}},
+             "required": ["url", "field_values", "submit_selector", "confirmed"]}},
+    ]
+
+
 def get_grading_tools(customer: dict) -> list[dict]:
     """
     Aaron's grading calibration tools — gated to persona == 'aaron'
@@ -1041,6 +1595,145 @@ def get_grading_tools(customer: dict) -> list[dict]:
          "description": "List assignments that have grading calibration set up, with how many "
                          "examples each has on file.",
          "input_schema": {"type": "object", "properties": {}}},
+    ]
+
+
+def _email_generated_file(customer: dict, service: str, file_bytes: bytes,
+                          filename: str, mime_type: str, description: str) -> str:
+    """
+    Shared delivery step for FLUX/Ideogram/ElevenLabs (the fast path) and
+    Veo (the async path, called from _run_video_generation below). This
+    is NOT gated by the confirmed=true pattern used for gmail_send —
+    emailing the customer their own requested generation result is the
+    delivery mechanism for a tool result, not a third-party-affecting
+    action, same reasoning as Home handing a generated file to iMessage
+    without asking permission first.
+    """
+    success, msg = send_email(
+        customer["workspace_email"], customer["email"],
+        subject=f"Your generated {description}",
+        body=f"Here's the {description} you asked for.",
+        attachment_bytes=file_bytes, attachment_filename=filename, attachment_mime_type=mime_type,
+    )
+    if not success:
+        return f"Generated successfully, but couldn't email it: {msg}"
+    return f"Generated and emailed to {customer['email']}."
+
+
+def generate_image_tool(customer: dict, prompt: str, use_ideogram: bool = False) -> str:
+    service = "ideogram" if use_ideogram else "flux"
+    api_key = get_generation_api_key(customer, service)
+    if not api_key:
+        return (f"No {service.title()} API key on file for this customer — add one from the "
+                f"Cloud dashboard before generating images{' with rendered text' if use_ideogram else ''}.")
+
+    ok, cap_message = check_generation_cap(customer, service)
+    if not ok:
+        return cap_message
+
+    if use_ideogram:
+        file_bytes, error = generate_image_ideogram(prompt, api_key)
+    else:
+        file_bytes, error = generate_image_flux(prompt, api_key)
+    if error:
+        return f"[{service} failed: {error}]"
+
+    log_generation_cost(customer["id"], service)
+    return _email_generated_file(customer, service, file_bytes, "generated_image.png", "image/png", "image")
+
+
+def generate_voice_tool(customer: dict, text: str) -> str:
+    api_key = get_generation_api_key(customer, "elevenlabs")
+    if not api_key:
+        return "No ElevenLabs API key on file for this customer — add one from the Cloud dashboard before generating voice clips."
+
+    ok, cap_message = check_generation_cap(customer, "elevenlabs")
+    if not ok:
+        return cap_message
+
+    voice_id = PERSONA_VOICE_IDS.get(customer.get("persona", "curant"), PERSONA_VOICE_IDS["curant"])
+    file_bytes, error = generate_voice_elevenlabs(text, api_key, voice_id=voice_id)
+    if error:
+        return f"[elevenlabs failed: {error}]"
+
+    log_generation_cost(customer["id"], "elevenlabs")
+    return _email_generated_file(customer, "elevenlabs", file_bytes, "generated_voice.mp3", "audio/mpeg", "voice clip")
+
+
+# ── Veo — always async, same in-memory job-tracking pattern as browser ─────
+# automation's _browser_jobs. Never attempts a synchronous wait at all —
+# unlike form submissions (usually fast, occasionally slow), Veo is
+# ALWAYS slow (several minutes), so there's no fast-path worth trying.
+
+def _run_video_generation(customer: dict, prompt: str, api_key: str):
+    """Runs in a daemon thread. Always emails the result (or the error)
+    when done — there's no synchronous caller waiting on this the way
+    there is for browser automation's hybrid wrapper, so there's no
+    'answered_sync' branching needed here at all."""
+    file_bytes, error = generate_video_veo_sync(prompt, api_key)
+    if error:
+        send_email(customer["workspace_email"], customer["email"],
+                  subject="Your video generation failed",
+                  body=f"Sorry — the video generation didn't complete: {error}")
+        return
+    log_generation_cost(customer["id"], "veo")
+    _email_generated_file(customer, "veo", file_bytes, "generated_video.mp4", "video/mp4", "video")
+
+
+def generate_video_tool(customer: dict, prompt: str) -> str:
+    api_key = get_generation_api_key(customer, "veo")
+    if not api_key:
+        return "No Gemini/Veo API key on file for this customer — add one from the Cloud dashboard before generating video."
+
+    ok, cap_message = check_generation_cap(customer, "veo")
+    if not ok:
+        return cap_message
+
+    thread = threading.Thread(target=_run_video_generation, args=(customer, prompt, api_key), daemon=True)
+    thread.start()
+    return "Started generating your video — this takes several minutes, I'll email it to you as soon as it's ready."
+
+
+def get_august_tools(customer: dict) -> list[dict]:
+    """
+    Gated on the 'august' addon AND a provisioned Workspace utility
+    email — generation without a way to deliver the result isn't useful,
+    so rather than silently fail mid-conversation, these tools simply
+    aren't offered to a customer without Workspace. build_system_prompt
+    already tells the model to mention what's actually available; a
+    customer missing Workspace who asks for an image gets a plain
+    explanation instead of a tool call that would fail.
+    """
+    if "august" not in get_unlocked_addons(customer) or not customer.get("workspace_email"):
+        return []
+    return [
+        {"qualified_name": "generate_image", "raw_name": "generate_image",
+         "description": "Generate an image with FLUX and email it to the customer. No "
+                         "confirmation needed — this is the delivery mechanism for a "
+                         "result they asked for, not an action affecting anyone else.",
+         "input_schema": {"type": "object", "properties": {
+             "prompt": {"type": "string"}}, "required": ["prompt"]}},
+        {"qualified_name": "generate_image_with_text", "raw_name": "generate_image_with_text",
+         "description": "Generate an image with Ideogram — use this specifically when the "
+                         "image needs clean, legible rendered text in it (logos, posters), "
+                         "since Ideogram is meaningfully stronger at that than FLUX.",
+         "input_schema": {"type": "object", "properties": {
+             "prompt": {"type": "string"}}, "required": ["prompt"]}},
+        {"qualified_name": "generate_voice", "raw_name": "generate_voice",
+         "description": "Generate a voice clip with ElevenLabs, using this persona's own "
+                         "voice, and email it to the customer.",
+         "input_schema": {"type": "object", "properties": {
+             "text": {"type": "string"}}, "required": ["text"]}},
+        {"qualified_name": "generate_video", "raw_name": "generate_video",
+         "description": "Generate a video with Veo and email it to the customer. Always "
+                         "takes several minutes — tell the customer it's started and "
+                         "they'll get it by email, don't make them wait in this reply.",
+         "input_schema": {"type": "object", "properties": {
+             "prompt": {"type": "string"}}, "required": ["prompt"]}},
+        {"qualified_name": "get_spending_summary", "raw_name": "get_spending_summary",
+         "description": "Show this month's generation spend so far and the remaining "
+                         "budget under the monthly cap.",
+         "input_schema": {"type": "object", "properties": {}, "required": []}},
     ]
 
 
@@ -1219,19 +1912,24 @@ def get_workspace_tools(customer: dict) -> list[dict]:
     ]
 
 
-def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> str:
+def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict,
+                            sms_reply_to: str | None = None, sms_reply_from: str | None = None) -> str:
     """Dispatches a tool call to the right function. Never raises — a
     failure becomes a text result the model can react to, same
     principle as Home's execute_tool_call.
 
-    Grading tools are dispatched first, deliberately BEFORE the
-    workspace_email check below — they have nothing to do with the
-    Workspace utility account, and a teacher without one shouldn't get
-    a nonsensical "no utility email" error when trying to use grading
-    calibration. This was a real bug caught while wiring this in, not
-    a hypothetical: the original version checked workspace_email first
-    for every tool, which would have incorrectly blocked grading tools
-    for any customer who hadn't set up Workspace.
+    Grading tools and browser automation are dispatched first,
+    deliberately BEFORE the workspace_email check below — neither has
+    anything to do with the Workspace utility account, and a customer
+    without one shouldn't get a nonsensical "no utility email" error
+    trying to use them. This was a real bug caught while wiring grading
+    in originally, not a hypothetical: the original version checked
+    workspace_email first for every tool, which would have incorrectly
+    blocked these for any customer who hadn't set up Workspace.
+
+    sms_reply_to/sms_reply_from: passed through from generate_reply,
+    used only by fill_and_submit_form's async follow-up path (see
+    fill_and_submit_form_hybrid) — every other tool ignores them.
     """
     cid = customer.get("id", "")
 
@@ -1273,11 +1971,51 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
             return "No assignments set up yet."
         return "\n".join(f"{a['assignment_name']} — {a['example_count']} example(s)" for a in assignments)
 
+    if tool_name == "browse_page":
+        result, error = browse_page(arguments.get("url", ""))
+        if error:
+            return f"[browse_page failed: {error}]"
+        fields_summary = "\n".join(
+            f"  - {f['name']} ({f['type']}){': ' + f['label'] if f['label'] else ''}"
+            for f in result["fields"]
+        ) or "  (no fillable fields found)"
+        return f"Page content:\n{result['text']}\n\nFillable fields:\n{fields_summary}"
+
+    if tool_name == "fill_and_submit_form":
+        if not arguments.get("confirmed"):
+            return ("Not submitted — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
+        return fill_and_submit_form_hybrid(
+            arguments.get("url", ""), arguments.get("field_values", {}),
+            arguments.get("submit_selector", ""), True, customer,
+            sms_reply_from or "", sms_reply_to=sms_reply_to,
+        )
+
     # Everything below this point is Gmail/Workspace-family and genuinely
     # does need the utility email to exist.
     email = customer.get("workspace_email")
     if not email:
         return "[No utility email provisioned for this customer.]"
+
+    if tool_name == "generate_image":
+        return generate_image_tool(customer, arguments.get("prompt", ""), use_ideogram=False)
+
+    if tool_name == "generate_image_with_text":
+        return generate_image_tool(customer, arguments.get("prompt", ""), use_ideogram=True)
+
+    if tool_name == "generate_voice":
+        return generate_voice_tool(customer, arguments.get("text", ""))
+
+    if tool_name == "generate_video":
+        return generate_video_tool(customer, arguments.get("prompt", ""))
+
+    if tool_name == "get_spending_summary":
+        monthly_spend = get_monthly_generation_spend(cid)
+        cap = get_generation_cap(customer)
+        cap_line = ("No monthly cap set." if cap is None else
+                    f"Monthly cap: ${cap:.2f} — ~${max(cap - monthly_spend, 0):.2f} remaining this month.")
+        return f"This month's generation spend: ~${monthly_spend:.2f}. {cap_line}"
 
     if tool_name == "gmail_search":
         results = search_emails(email, query=arguments.get("query", ""))
@@ -1427,7 +2165,8 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
     return f"[Unknown tool: {tool_name}]"
 
 
-def _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer):
+def _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                               sms_reply_to=None, sms_reply_from=None):
     import anthropic
     client = anthropic.Anthropic(api_key=api_key)
     anthropic_tools = [
@@ -1447,13 +2186,15 @@ def _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, cus
         conversation.append({"role": "assistant", "content": response.content})
         tool_results = []
         for tu in tool_uses:
-            result_text = execute_cloud_tool_call(tu.name, tu.input, customer)
+            result_text = execute_cloud_tool_call(tu.name, tu.input, customer,
+                                                   sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
             tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result_text})
         conversation.append({"role": "user", "content": tool_results})
     return "(I tried a few tool calls but couldn't reach a final answer.)"
 
 
-def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer):
+def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                            sms_reply_to=None, sms_reply_from=None):
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
     openai_tools = [
@@ -1479,17 +2220,21 @@ def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, custom
                 args = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 args = {}
-            result_text = execute_cloud_tool_call(tc.function.name, args, customer)
+            result_text = execute_cloud_tool_call(tc.function.name, args, customer,
+                                                   sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
             conversation.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
     return "(I tried a few tool calls but couldn't reach a final answer.)"
 
 
 def call_llm_with_tools(provider: str, api_key: str, system: str, messages: list,
-                        tools: list, customer: dict, max_tokens: int = 800) -> str:
+                        tools: list, customer: dict, max_tokens: int = 800,
+                        sms_reply_to: str | None = None, sms_reply_from: str | None = None) -> str:
     if provider == "anthropic":
-        return _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer)
+        return _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                                          sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
     elif provider == "openai":
-        return _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer)
+        return _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                                       sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -1520,10 +2265,18 @@ def extract_memories_async(customer_id: str, provider: str, api_key: str,
 
 
 def generate_reply(customer: dict, user_message: str,
-                   session_api_key: str | None = None) -> str | None:
+                   session_api_key: str | None = None,
+                   sms_reply_to: str | None = None, sms_reply_from: str | None = None) -> str | None:
     """
     Core brain function. Returns the reply text, or None if no API key
     is available (customer needs to unlock first).
+
+    sms_reply_to/sms_reply_from: the webhook's own from_number/to_number
+    (the customer's real phone and our assigned DID, respectively) —
+    threaded through to tools that may need to send a follow-up message
+    later (currently just fill_and_submit_form's async path). Only SMS
+    calls this today; voice calls pass neither, and any tool that needs
+    them handles that absence explicitly rather than guessing a number.
     """
     api_key = get_active_api_key(customer, session_api_key)
     if not api_key:
@@ -1540,11 +2293,13 @@ def generate_reply(customer: dict, user_message: str,
                                      is_first_message=is_first_message, urgency=urgency)
     history.append({"role": "user", "content": user_message})
 
-    tools = get_workspace_tools(customer) + get_grading_tools(customer)
+    tools = (get_workspace_tools(customer) + get_grading_tools(customer)
+             + get_browser_automation_tools(customer) + get_august_tools(customer))
 
     try:
         if tools:
-            reply = call_llm_with_tools(provider, api_key, system, history, tools, customer)
+            reply = call_llm_with_tools(provider, api_key, system, history, tools, customer,
+                                        sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
         else:
             reply = call_llm(provider, api_key, system, history)
     except Exception as e:
@@ -1788,20 +2543,44 @@ def read_email(customer_email: str, message_id: str) -> dict | None:
         return None
 
 
-def send_email(customer_email: str, to: str, subject: str, body: str) -> tuple[bool, str]:
+def send_email(customer_email: str, to: str, subject: str, body: str,
+               attachment_bytes: bytes | None = None, attachment_filename: str | None = None,
+               attachment_mime_type: str = "application/octet-stream") -> tuple[bool, str]:
     """
     Sends a real email from the utility account. ONLY call this after
     the customer has explicitly confirmed — enforced via system prompt
     instruction (see build_system_prompt), same standing rule as every
     other outbound action in this product. Returns (success, message).
+
+    attachment_bytes, if given, is attached directly — never written to
+    Cloud's own disk first. This is deliberate: a generated image/audio/
+    video file exists only in memory for the lifetime of the request (or
+    background thread, for Veo), gets attached, and is discarded —
+    stricter than Home's local-encrypted-then-pruned-after-24h approach,
+    since there's simply nothing on disk to prune in the first place.
     """
     import base64
     from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
     try:
         service = _gmail_service_for(customer_email)
-        message = MIMEText(body)
-        message["to"] = to
-        message["subject"] = subject
+        if attachment_bytes is not None:
+            message = MIMEMultipart()
+            message["to"] = to
+            message["subject"] = subject
+            message.attach(MIMEText(body))
+            part = MIMEBase(*attachment_mime_type.split("/", 1)) if "/" in attachment_mime_type \
+                else MIMEBase("application", "octet-stream")
+            part.set_payload(attachment_bytes)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{attachment_filename or "file"}"')
+            message.attach(part)
+        else:
+            message = MIMEText(body)
+            message["to"] = to
+            message["subject"] = subject
         raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
         service.users().messages().send(userId="me", body={"raw": raw}).execute()
         return True, f"Email sent to {to}."
@@ -2313,7 +3092,8 @@ def sms_webhook():
 
     # Get API key — either from server storage or in-memory session (Option B)
     session_key = get_session_key(customer["id"])
-    reply = generate_reply(customer, user_text, session_api_key=session_key)
+    reply = generate_reply(customer, user_text, session_api_key=session_key,
+                           sms_reply_to=from_number, sms_reply_from=to_number)
 
     if reply is None:
         # Option B customer with no active session — send unlock link
@@ -3160,6 +3940,28 @@ def cloud_dashboard():
                     )
                     conn.commit()
                 message = "Settings saved."
+            elif action == "update_generation_keys":
+                for service in ("flux", "ideogram", "elevenlabs", "veo"):
+                    key_value = request.form.get(f"key_{service}", "").strip()
+                    if key_value:  # blank field = leave that service's stored key untouched
+                        set_generation_api_key(cid, service, key_value)
+                cap_raw = request.form.get("generation_cap", "").strip()
+                if cap_raw:
+                    if cap_raw.lower() == "none":
+                        new_cap = -1
+                    else:
+                        try:
+                            new_cap = float(cap_raw)
+                        except ValueError:
+                            new_cap = None
+                    if new_cap is not None:
+                        with closing(get_db()) as conn:
+                            conn.execute(
+                                "UPDATE customers SET monthly_generation_cap_usd=? WHERE id=?",
+                                (new_cap, cid),
+                            )
+                            conn.commit()
+                message = "Generation settings saved. Keys aren't shown again for security — leave a field blank to keep the existing key."
             elif action == "cancel":
                 return redirect(url_for("cloud_cancel"))
 
@@ -3215,6 +4017,35 @@ def cloud_dashboard():
     <p class="muted">None yet — tell Curant who matters to you in a text.</p>
     {% endif %}
 
+    {% if 'august' in unlocked_addons %}
+    <h2>August's generation keys</h2>
+    {% if not customer.workspace_email %}
+    <p class="muted">A Workspace utility email isn't provisioned for this account yet —
+       generation results are delivered by email, so this won't work until that's set up.
+       Contact support.</p>
+    {% else %}
+    <p class="muted">Bring your own key per service — never shown again after saving, only
+       whether one's on file. Leave a field blank to keep whatever's already stored.</p>
+    <form method="post">
+      {{ csrf }}
+      <input type="hidden" name="action" value="update_generation_keys">
+      <label>FLUX (image) {% if generation_keys_set.flux %}<span class="muted">— key on file</span>{% endif %}</label>
+      <input type="password" name="key_flux" placeholder="{% if generation_keys_set.flux %}(unchanged){% else %}sk-...{% endif %}" autocomplete="off">
+      <label>Ideogram (image w/ text) {% if generation_keys_set.ideogram %}<span class="muted">— key on file</span>{% endif %}</label>
+      <input type="password" name="key_ideogram" placeholder="{% if generation_keys_set.ideogram %}(unchanged){% else %}...{% endif %}" autocomplete="off">
+      <label>ElevenLabs (voice) {% if generation_keys_set.elevenlabs %}<span class="muted">— key on file</span>{% endif %}</label>
+      <input type="password" name="key_elevenlabs" placeholder="{% if generation_keys_set.elevenlabs %}(unchanged){% else %}...{% endif %}" autocomplete="off">
+      <label>Gemini/Veo (video) {% if generation_keys_set.veo %}<span class="muted">— key on file</span>{% endif %}</label>
+      <input type="password" name="key_veo" placeholder="{% if generation_keys_set.veo %}(unchanged){% else %}...{% endif %}" autocomplete="off">
+      <label>Monthly spend cap <span class="muted">(across all generation services — leave blank to keep current, type 'none' to remove)</span></label>
+      <input type="text" name="generation_cap" placeholder="e.g. 25, or 'none'">
+      <p class="muted">This month's generation spend: ~${{ "%.2f"|format(monthly_generation_spend) }}
+         {% if generation_cap is not none %}(cap: ${{ "%.2f"|format(generation_cap) }}){% else %}(no cap set){% endif %}</p>
+      <button class="btn" type="submit">Save</button>
+    </form>
+    {% endif %}
+    {% endif %}
+
     <div style="margin-top:40px;padding-top:20px;border-top:1px solid #eee">
       <form method="post">
         {{ csrf }}
@@ -3227,6 +4058,10 @@ def cloud_dashboard():
     """,
     customer=customer, memories=memories, people=people,
     personas=list(PERSONAS.keys()),
+    generation_keys_set={s: has_generation_key(customer, s) for s in ("flux", "ideogram", "elevenlabs", "veo")},
+    monthly_generation_spend=get_monthly_generation_spend(cid),
+    generation_cap=get_generation_cap(customer),
+    unlocked_addons=get_unlocked_addons(customer),
     csrf=CSRF_FIELD.format(get_csrf()))
 
 

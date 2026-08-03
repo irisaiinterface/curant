@@ -114,10 +114,11 @@ verification email or confirmation code when Curant signs the customer
 up for something online.
 
 **Scope, stated plainly:** this solves *receiving* a verification email.
-It does **not** solve *filling out a signup form* on some arbitrary
-third-party website — that's browser automation, a separate, unbuilt
-capability. Having the inbox is half of "make accounts on websites,"
-not the whole thing.
+It does **not** by itself solve *filling out a signup form* on some
+arbitrary third-party website — that's the separate browser automation
+capability (see below), which now exists on Cloud too. Having the inbox
+is half of "make accounts on websites"; browser automation is the other
+half — together they cover the full flow.
 
 **Why Workspace and not just a plain Gmail account:** creating raw
 consumer Gmail accounts programmatically at scale is exactly the
@@ -189,10 +190,22 @@ creating your own docs/sheets/tasks/contacts, listing, labeling,
 trashing — is the customer's own private data with no effect on anyone
 else, and runs freely.
 
-**Still not built:** anything involving a third-party website's own
-UI — filling out a signup form, clicking a confirmation link on some
-external page. That's browser automation, a separate and much larger
-capability, deliberately not conflated with "full Workspace control" here.
+**Browser automation** (`browse_page`, `fill_and_submit_form`) — filling
+out a signup form or clicking through a flow on some arbitrary
+third-party website's own UI, not just a Curant-controlled API. Ported
+from Home, with the same hard rails: `fill_and_submit_form` requires
+`confirmed: true`, enforced in code, and refuses to touch anything that
+looks like a payment or sensitive-ID field regardless of confirmation.
+Gated on its own `browser_automation` addon, independent of persona,
+same as Home.
+
+**Architectural note specific to Cloud:** Home has a persistent local
+watcher process that can poll a background job indefinitely. Cloud is a
+stateless webhook handler, so there's no equivalent process to poll —
+instead, a slow form submission runs in a background thread started
+exactly once, and if it's not done within a short synchronous window,
+the customer gets a "still working" reply now and a follow-up SMS once
+it actually finishes, rather than the result being silently dropped.
 
 ## Voice — Vapi prototype
 
@@ -353,3 +366,10 @@ signup now actually names real capabilities instead of a generic
 - **DB encryption at rest** ✓ — implemented with SQLCipher (AES-256). Set
   `CLOUD_DB_KEY` in your `.env` before storing any real customer data.
   See `.env.example` for the generate command.
+- **Browser automation job tracking** — the in-memory `_browser_jobs` dict
+  (and `_session_keys` for Option B unlock, same underlying pattern) only
+  works correctly on a single process. Fine for now; if this ever runs
+  behind multiple gunicorn workers, the same fix already applied to rate
+  limiting (move to the shared SQLite database, or Redis) needs to happen
+  here too — a form submission started on one worker won't be visible to
+  a poll that lands on a different worker.
