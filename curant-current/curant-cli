@@ -196,7 +196,13 @@ PERSONAS = {
              "(Clio, MyCase, PracticePanther) and standard accounting platforms (QuickBooks, Xero). "
              "Concrete things you're good at: drafting engagement letters, organizing case/matter file "
              "checklists, tracking filing and billing deadlines precisely, structuring client intake forms, "
-             "and billable-hours summaries — all handled with the same discretion the persona is built around.",
+             "and billable-hours summaries — all handled with the same discretion the persona is built "
+             "around. Deliberately scoped to administrative and organizational support only — never legal "
+             "advice, case strategy, or financial/investment judgment calls. You handle the paperwork and "
+             "scheduling around a legal or financial matter; you never tell the customer what to do about "
+             "the matter itself. State that boundary plainly when a request crosses into it, the same way "
+             "Leo does for clinical questions — don't let precision in how you phrase things imply an "
+             "opinion you're not actually qualified or positioned to give.",
     "jane": "You are Jane, an organizer-style AI Secretary — precise, structured, never lets a detail "
             "slip. Personality basis: ISFJ-leaning (Defender) — structured like Miles, but the underlying "
             "motivation is protective/in-service-of-others rather than pure precision for its own sake, "
@@ -1238,19 +1244,23 @@ def get_all_available_tools(config):
         tools.append({
             "qualified_name": "fill_and_submit_form",
             "description": "Fill in a webpage's form fields and submit it — actually "
-                            "completes a signup, not just looks at it. ONLY call this after "
-                            "explicit customer confirmation, never in the same turn you first "
-                            "mention it: this creates a real account or submits real data "
-                            "somewhere. Will always refuse to touch payment or sensitive-ID "
-                            "fields (card numbers, CVV, SSN) no matter what, regardless of "
-                            "confirmation — those need a person to enter directly. Most "
-                            "submissions answer immediately; a slow site may instead say "
-                            "it's still working and follow up once it's actually done.",
+                            "completes a signup, not just looks at it. Requires `confirmed: "
+                            "true` in the call itself — set this ONLY after the customer has "
+                            "explicitly confirmed in a PRIOR message, never in the same turn "
+                            "you first mention it. This is enforced in code, not just by this "
+                            "instruction: calling with confirmed=false or omitted will be "
+                            "rejected and nothing will be submitted. Will always refuse to "
+                            "touch payment or sensitive-ID fields (card numbers, CVV, SSN) no "
+                            "matter what, regardless of confirmation — those need a person to "
+                            "enter directly. Most submissions answer immediately; a slow site "
+                            "may instead say it's still working and follow up once it's "
+                            "actually done.",
             "input_schema": {"type": "object", "properties": {
                 "url": {"type": "string"},
                 "field_values": {"type": "object", "description": "Field name/id -> value to fill in"},
-                "submit_selector": {"type": "string", "description": "CSS selector for the submit button, e.g. '#submit-btn'"}},
-                "required": ["url", "field_values", "submit_selector"]},
+                "submit_selector": {"type": "string", "description": "CSS selector for the submit button, e.g. '#submit-btn'"},
+                "confirmed": {"type": "boolean", "description": "Must be true — set only after the customer has explicitly confirmed in a prior message."}},
+                "required": ["url", "field_values", "submit_selector", "confirmed"]},
             "server_command": None, "raw_name": "fill_and_submit_form", "builtin": True,
         })
 
@@ -1395,6 +1405,64 @@ def get_total_estimated_spend():
     with closing(get_local_db()) as conn:
         row = conn.execute("SELECT SUM(estimated_cost_usd) as total FROM generation_costs").fetchone()
         return row["total"] or 0.0
+
+
+# Default monthly cap on August's paid generation tools (FLUX/Ideogram/
+# ElevenLabs/Veo) — applied to a fresh config that hasn't set one
+# explicitly. Deliberately conservative: at Veo's ~$3.20/generation, this
+# still allows real use (dozens of images, several videos) while putting
+# a real ceiling on a runaway-loop scenario, which is a documented real
+# risk category for AI agent products (not hypothetical — a misconfigured
+# loop has produced a $34,000 bill in 8 days for another product, from a
+# lack of exactly this kind of safeguard). The customer can raise or
+# remove this themselves at any time via `curant-cli set-spend-cap` —
+# this is a safety default, not a hard business limit imposed on them.
+DEFAULT_MONTHLY_SPEND_CAP_USD = 25.0
+
+
+def get_monthly_estimated_spend():
+    """Spend from generation_costs within the current calendar month only —
+    the cap resets monthly rather than being a lifetime ceiling, since a
+    lifetime cap would eventually block a long-time customer from ever
+    generating anything again regardless of how reasonably they're using it."""
+    with closing(get_local_db()) as conn:
+        row = conn.execute(
+            "SELECT SUM(estimated_cost_usd) as total FROM generation_costs "
+            "WHERE created_at >= date('now', 'start of month')"
+        ).fetchone()
+        return row["total"] or 0.0
+
+
+def get_monthly_spend_cap(config):
+    """None means uncapped — an explicit customer choice (set-spend-cap
+    with no amount, or a negative/zero value), not the default state."""
+    if "monthly_spend_cap_usd" not in config:
+        return DEFAULT_MONTHLY_SPEND_CAP_USD
+    return config["monthly_spend_cap_usd"]  # may be None (uncapped)
+
+
+def check_spend_cap(config, service):
+    """
+    Returns (ok: bool, message: str | None). Checked BEFORE a paid
+    generation call fires, not after — the whole point of a cap is
+    preventing the spend, not just recording it afterward. Compares
+    current month-to-date spend PLUS this generation's estimated cost
+    against the cap, so the generation that would cross the line is the
+    one that gets blocked, not the one after it.
+    """
+    cap = get_monthly_spend_cap(config)
+    if cap is None:
+        return True, None
+    current = get_monthly_estimated_spend()
+    projected = current + ESTIMATED_COST_USD.get(service, 0.0)
+    if projected > cap:
+        return False, (
+            f"This would put this month's generation spend at an estimated ${projected:.2f}, "
+            f"over the ${cap:.2f} monthly cap currently set. Nothing was generated. The "
+            f"customer can raise this cap themselves anytime with `curant-cli set-spend-cap "
+            f"<amount>`, or remove it entirely with `curant-cli set-spend-cap none`."
+        )
+    return True, None
 
 # Reset at the start of each relay() call, appended to by successful
 # generation tool calls during that turn — lets relay() know what to
@@ -1729,6 +1797,7 @@ def run_background_job_cmd(job_id):
         # slow site).
         result, error = fill_and_submit_form(
             arguments.get("url", ""), arguments.get("field_values", {}), arguments.get("submit_selector", ""),
+            confirmed=arguments.get("confirmed", False),
         )
         if error:
             _update_background_job(job_id, "failed", error=error)
@@ -2099,15 +2168,29 @@ def browse_page(url):
         return None, f"Could not load that page: {e}"
 
 
-def fill_and_submit_form(url, field_values, submit_selector):
+def fill_and_submit_form(url, field_values, submit_selector, confirmed=False):
     """
-    The real external-effect action — ONLY call after explicit customer
-    confirmation (enforced via system prompt instruction). Hard-blocked
-    in code, not just by instruction, from touching anything that looks
-    like a payment or sensitive-ID field — that block applies regardless
-    of confirmation, since payment/identity data is a categorically
+    The real external-effect action. `confirmed` is now checked here in
+    code, not just requested via system prompt instruction — a model
+    that calls this without confirmed=True gets refused outright, the
+    same structural pattern already used for the sensitive-field block
+    below. Belt-and-suspenders on purpose: the schema marks `confirmed`
+    required so a well-behaved model can't omit it, and this check
+    catches the case where it's present but false anyway (a model
+    calling ahead of actual customer confirmation, or a malformed call).
+
+    Also hard-blocked in code from touching anything that looks like a
+    payment or sensitive-ID field — that block applies regardless of
+    confirmation, since payment/identity data is a categorically
     different risk than a newsletter signup.
     """
+    if not confirmed:
+        return None, (
+            "Not submitted — this action requires explicit customer confirmation first. "
+            "Ask the customer to confirm, wait for their reply, then call this again with "
+            "confirmed=true."
+        )
+
     blocked = [k for k in field_values if _is_sensitive_field(k)]
     if blocked:
         return None, (
@@ -2153,7 +2236,7 @@ BROWSER_SYNC_WAIT_SECONDS = 8  # most form submissions are fast (a few seconds) 
                                 # Veo needs, since Veo is *always* slow and forms usually aren't
 
 
-def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id):
+def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id, confirmed=False):
     """
     The safety property that matters most here: the actual browser work
     runs EXACTLY ONCE, inside the detached background job subprocess
@@ -2163,6 +2246,11 @@ def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id):
     to poll-then-give-up without any risk of the form getting submitted
     twice, which matters here in a way it wouldn't for read-only actions.
 
+    `confirmed` is checked HERE, before even creating the background
+    job — an unconfirmed call never reaches the subprocess at all, so
+    there's no path where a slow/async submission slips past the same
+    check a synchronous call would hit.
+
     Most submissions finish within BROWSER_SYNC_WAIT_SECONDS, so the
     common case gets a real, same-turn answer. If a site is slow enough
     to still be running past that window, this hands off to the same
@@ -2170,9 +2258,16 @@ def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id):
     picks it up once it actually finishes) rather than blocking relay()
     for however long that slow site takes.
     """
+    if not confirmed:
+        return (
+            "Not submitted — this action requires explicit customer confirmation first. "
+            "Ask the customer to confirm, wait for their reply, then call this again with "
+            "confirmed=true."
+        )
+
     job_id = _create_background_job(
         "fill_and_submit_form",
-        {"url": url, "field_values": field_values, "submit_selector": submit_selector},
+        {"url": url, "field_values": field_values, "submit_selector": submit_selector, "confirmed": True},
         apple_id,
     )
     try:
@@ -2225,6 +2320,11 @@ def execute_tool_call(tool_name, arguments, available_tools):
             "generate_voice": "elevenlabs", "edit_media": "descript",
         }
         service = service_map[tool_name]
+
+        ok, cap_message = check_spend_cap(config, service)
+        if not ok:
+            return cap_message
+
         if tool_name == "generate_image":
             path, error = generate_image_flux(arguments.get("prompt", ""), config)
         elif tool_name == "generate_image_with_text":
@@ -2249,17 +2349,32 @@ def execute_tool_call(tool_name, arguments, available_tools):
         # generate_video_veo_async's docstring. Cost is logged once the
         # background job actually completes (run_background_job_cmd),
         # not here, since nothing has happened yet at this point.
+        #
+        # The cap check happens BEFORE the job starts, not after it
+        # completes — Veo is the most expensive single generation
+        # (~$3.20), and checking only post-completion would let several
+        # video jobs get kicked off in flight before any of them
+        # actually counted against the cap.
         config = load_config()
+        ok, cap_message = check_spend_cap(config, "veo")
+        if not ok:
+            return cap_message
         return generate_video_veo_async(arguments.get("prompt", ""), config, _current_apple_id)
 
     if match["builtin"] and tool_name == "get_spending_summary":
         summary = get_generation_cost_summary()
         total = get_total_estimated_spend()
+        config = load_config()
+        monthly_spend = get_monthly_estimated_spend()
+        cap = get_monthly_spend_cap(config)
+        cap_line = (f"No monthly cap set." if cap is None else
+                    f"Monthly cap: ${cap:.2f} — ~${max(cap - monthly_spend, 0):.2f} remaining this month.")
         if not summary:
-            return "No generation spend yet this account."
+            return f"No generation spend yet this account. {cap_line}"
         lines = [f"{row['service']}: {row['count']} generation(s), ~${row['total']:.2f}" for row in summary]
-        return f"Estimated spend so far: ~${total:.2f} total.\n" + "\n".join(lines) + \
-               "\n(These are estimates for a general sense of spend, not exact billing — check your own account with each provider for the real number.)"
+        return (f"Estimated spend so far: ~${total:.2f} total (~${monthly_spend:.2f} this month). {cap_line}\n"
+                + "\n".join(lines) +
+                "\n(These are estimates for a general sense of spend, not exact billing — check your own account with each provider for the real number.)")
 
     if match["builtin"] and tool_name == "browse_page":
         result, error = browse_page(arguments.get("url", ""))
@@ -2278,6 +2393,7 @@ def execute_tool_call(tool_name, arguments, available_tools):
         return fill_and_submit_form_hybrid(
             arguments.get("url", ""), arguments.get("field_values", {}),
             arguments.get("submit_selector", ""), _current_apple_id,
+            confirmed=arguments.get("confirmed", False),
         )
 
     if match["builtin"] and tool_name == "setup_grading_assignment":
@@ -2820,6 +2936,51 @@ def status():
         print("Inactive — subscription may have lapsed. Check curant.app/billing.")
 
 
+def set_spend_cap_cmd(amount):
+    """
+    Self-serve — this is the customer's own spend limit on their own API
+    key, so no admin gate belongs here, unlike device-release requests
+    which deliberately do require review. Three modes:
+      - no argument: just show the current cap and this month's spend
+      - a number: set the cap to that amount
+      - 'none': remove the cap entirely (explicit, not the accidental
+        default — get_monthly_spend_cap() treats "never set" as the
+        conservative $25 default specifically so a customer can't end
+        up uncapped just by never having touched this).
+    """
+    config = load_config()
+    current_spend = get_monthly_estimated_spend()
+    current_cap = get_monthly_spend_cap(config)
+
+    if amount is None:
+        cap_str = "no cap set" if current_cap is None else f"${current_cap:.2f}/month"
+        print(f"This month's generation spend so far: ~${current_spend:.2f}")
+        print(f"Current cap: {cap_str}")
+        return
+
+    if amount.strip().lower() == "none":
+        config["monthly_spend_cap_usd"] = None
+        save_config(config)
+        print("Spend cap removed — August's generation tools are now uncapped. "
+              "You can set a new cap anytime with `curant-cli set-spend-cap <amount>`.")
+        return
+
+    try:
+        new_cap = float(amount)
+        if new_cap < 0:
+            raise ValueError
+    except ValueError:
+        print(f"'{amount}' isn't a valid dollar amount. Use a number like 25 or 25.00, or 'none' to remove the cap.")
+        sys.exit(1)
+
+    config["monthly_spend_cap_usd"] = new_cap
+    save_config(config)
+    print(f"Monthly spend cap set to ${new_cap:.2f}. This month's spend so far: ~${current_spend:.2f}.")
+    if current_spend >= new_cap:
+        print("Note: this month's spend already meets or exceeds this cap — generation tools "
+              "will be blocked until next month or until you raise the cap.")
+
+
 def routing_rules_cmd(remove=None):
     """
     Shows the standing routing rules currently in effect, or removes one
@@ -3012,6 +3173,16 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
     system_parts.append(
         "You never send anything (email, messages) without explicit confirmation from the customer first, "
         "unless they've specifically set up an approved recurring auto-send task."
+    )
+    system_parts.append(
+        "Know the difference between a decision you should make and one that belongs to the customer. "
+        "If a request calls for real judgment outside what you should decide unilaterally — a legal, "
+        "medical, financial, or otherwise high-stakes call; something you're genuinely unsure about; "
+        "or anything where being wrong would be costly or hard to undo — say so plainly and hand the "
+        "decision back to them, rather than answering confidently anyway. This isn't the same as the "
+        "capability-gap case below (something no tool or reasoning covers at all) — this is about "
+        "things you technically COULD answer but shouldn't decide on someone's behalf. A brief, honest "
+        "'this one's your call, here's what I'd weigh' beats a confident guess every time."
     )
     if "browser_automation" in addons:
         system_parts.append(
@@ -4209,6 +4380,10 @@ def main():
 
     sub.add_parser("status", help="Check activation status")
 
+    p_spend_cap = sub.add_parser("set-spend-cap", help="Set (or view, or remove) your monthly cap on August's paid generation tools (image/voice/video)")
+    p_spend_cap.add_argument("amount", nargs="?", default=None,
+                              help="Dollar amount, e.g. '25' or '25.00'. Use 'none' to remove the cap entirely. Omit to just view the current cap and this month's spend.")
+
     p_routing_rules = sub.add_parser("routing-rules", help="Show (or remove) standing rules for which AI handles which kind of task")
     p_routing_rules.add_argument("--remove", default=None, metavar="CATEGORY", help="Remove the standing rule for this category")
 
@@ -4308,6 +4483,8 @@ def main():
         set_provider(args.provider)
     elif args.command == "status":
         status()
+    elif args.command == "set-spend-cap":
+        set_spend_cap_cmd(args.amount)
     elif args.command == "routing-rules":
         routing_rules_cmd(remove=args.remove)
     elif args.command == "routing-log":

@@ -164,6 +164,14 @@ def init_db():
             session_token   TEXT,
             session_expires_at REAL,
 
+            -- Monthly voice-spend cap (Vapi minutes). NULL means "use
+            -- the business-wide default" (see DEFAULT_MONTHLY_VOICE_CAP_USD),
+            -- not "uncapped" — an explicit uncap is a negative sentinel
+            -- (-1), same reasoning as Home's cap: a customer shouldn't
+            -- end up silently uncapped just from never having touched
+            -- this setting.
+            monthly_voice_cap_usd REAL,
+
             created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -273,6 +281,20 @@ def init_db():
             FOREIGN KEY (assignment_id) REFERENCES grading_assignments(id)
         );
 
+        -- Voice call usage, one row per completed call, logged from
+        -- Vapi's end-of-call-report webhook. This is what a monthly
+        -- voice spend cap is actually computed from — previously
+        -- nothing tracked voice usage at all, so there was no way to
+        -- know spend without checking Vapi's own dashboard by hand.
+        CREATE TABLE IF NOT EXISTS call_usage (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id         TEXT,
+            duration_seconds    REAL,
+            estimated_cost_usd  REAL,
+            created_at          TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_customer
             ON messages(customer_id, id);
         CREATE INDEX IF NOT EXISTS idx_memories_customer
@@ -281,8 +303,21 @@ def init_db():
             ON rate_limit_events(rate_key, created_at);
         CREATE INDEX IF NOT EXISTS idx_grading_assignments_customer
             ON grading_assignments(customer_id, assignment_name);
+        CREATE INDEX IF NOT EXISTS idx_call_usage_customer
+            ON call_usage(customer_id, created_at);
         """)
         conn.commit()
+
+    # Lightweight migration: a database created before monthly_voice_cap_usd
+    # existed won't have it — CREATE TABLE IF NOT EXISTS above doesn't add
+    # columns to an already-existing table. Wrapped in try/except since
+    # SQLite has no ALTER TABLE ADD COLUMN IF NOT EXISTS.
+    with closing(get_db()) as conn:
+        try:
+            conn.execute("ALTER TABLE customers ADD COLUMN monthly_voice_cap_usd REAL")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
 
 
 def _check_rate(key: str, max_req: int, window_sec: int) -> bool:
@@ -509,7 +544,10 @@ PERSONAS = {
     "dean":    "You are Dean, a builder's AI Secretary — fast, casual, technical. Talk like a sharp coworker, not staff. (ISTP-leaning)",
     "nora":    "You are Nora, an advisor-style AI Secretary — thoughtful, asks a clarifying question before acting. (INFJ-leaning)",
     "frank":   "You are Frank, an everyday AI Secretary — warm, casual, upbeat, low-pressure. (ESFP-leaning)",
-    "miles":   "You are Miles, a discreet AI Secretary — quiet, minimal, exact. Say only what's needed. (ISTJ-leaning)",
+    "miles":   "You are Miles, a discreet AI Secretary — quiet, minimal, exact. Say only what's needed. "
+               "Scoped to administrative support only — never legal advice, case strategy, or financial/"
+               "investment judgment. You handle the paperwork and scheduling around a matter, never what "
+               "the customer should do about it — say so plainly if a request crosses that line. (ISTJ-leaning)",
     "jane":    "You are Jane, an organizer-style AI Secretary — precise, structured, never lets a detail slip. (ISFJ-leaning)",
     "leo":     "You are Leo, a calm AI Secretary — even-keeled, unhurried, a steady presence under pressure. (ISFP-leaning, Assertive variant)",
     "august":  "You are August, Curant's specialist creative persona — imaginative, hands-on, craft-focused. (ENFP-leaning)",
@@ -537,6 +575,78 @@ PROVIDER_MODELS = {
     "anthropic": "claude-sonnet-4-6",
     "openai":    "gpt-4o",
 }
+
+# ── Voice spend tracking and monthly cap ─────────────────────────────────────
+# Previously nothing tracked voice usage at all — spend was only visible by
+# checking Vapi's own dashboard by hand. This closes that gap: real
+# per-customer usage logging, plus a monthly cap with visibility for the
+# business owner when a customer crosses it.
+#
+# HONEST LIMITATION, stated plainly rather than glossed over: unlike Home's
+# generation-tool cap (which blocks a paid call before it fires), a live
+# voice call is already connecting by the time assistant-request runs, and
+# Vapi bills its own platform/STT/TTS cost per minute regardless of which
+# LLM key is used for that call — swapping to a different key doesn't stop
+# that cost. Cleanly rejecting or ending a call from assistant-request would
+# need a specific Vapi mechanism that hasn't been verified against their
+# current docs (same standard as the "NOT independently re-verified" flag
+# already on this webhook's response shape). Until that's confirmed, this
+# implements what's actually solid: real usage visibility, a soft in-call
+# warning to the model once a customer is over cap, and a flagged alert in
+# the owner dashboard so a person can decide whether to intervene — the same
+# "log it, let a human decide" pattern already used for device-release
+# requests, rather than fabricating a hard stop this codebase can't
+# guarantee actually works.
+VAPI_ESTIMATED_COST_PER_MINUTE_USD = 0.20  # Vapi's platform fee alone is $0.05/min;
+                                             # $0.15-0.33/min all-in with STT/LLM/TTS
+                                             # per Vapi's own published numbers — same
+                                             # estimate already used in the Cloud cost
+                                             # calculator, kept consistent here.
+DEFAULT_MONTHLY_VOICE_CAP_USD = 30.0  # business-wide default when a customer hasn't
+                                        # had one set explicitly — see monthly_voice_cap_usd
+
+
+def log_call_usage(customer_id: str, duration_seconds: float):
+    cost = (duration_seconds / 60.0) * VAPI_ESTIMATED_COST_PER_MINUTE_USD
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO call_usage (customer_id, duration_seconds, estimated_cost_usd) VALUES (?, ?, ?)",
+            (customer_id, duration_seconds, cost),
+        )
+        conn.commit()
+
+
+def get_monthly_voice_spend(customer_id: str) -> float:
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT SUM(estimated_cost_usd) as total FROM call_usage "
+            "WHERE customer_id=? AND created_at >= date('now', 'start of month')",
+            (customer_id,),
+        ).fetchone()
+        return row["total"] or 0.0
+
+
+def get_voice_cap(customer: dict):
+    """None (the DB default) means 'use the business-wide default cap'.
+    -1 is the explicit uncap sentinel, set only via a deliberate action —
+    same reasoning as Home's cap: never silently uncapped just because a
+    customer never touched this setting."""
+    raw = customer.get("monthly_voice_cap_usd")
+    if raw is None:
+        return DEFAULT_MONTHLY_VOICE_CAP_USD
+    if raw == -1:
+        return None
+    return raw
+
+
+def is_over_voice_cap(customer: dict) -> tuple[bool, float, float | None]:
+    """Returns (over_cap, current_monthly_spend, cap). cap is None if uncapped."""
+    cap = get_voice_cap(customer)
+    if cap is None:
+        return False, 0.0, None
+    spend = get_monthly_voice_spend(customer["id"])
+    return spend >= cap, spend, cap
+
 
 # ElevenLabs voice IDs per persona, so a phone call actually sounds like
 # the persona the customer chose instead of one generic voice for
@@ -589,6 +699,15 @@ def build_system_prompt(customer: dict, memories: list, people: list, channel: s
         "and life admin, home and family logistics, career development, trades and real "
         "estate questions, event planning, civic/accessibility topics — not a vague 'I can "
         "help with anything.' Mention a couple of concrete examples rather than the whole list."
+    )
+    parts.append(
+        "Know the difference between a decision you should make and one that belongs to the "
+        "customer. If a request calls for real judgment outside what you should decide "
+        "unilaterally — a legal, medical, financial, or otherwise high-stakes call; something "
+        "you're genuinely unsure about; or anything where being wrong would be costly or hard "
+        "to undo — say so plainly and hand the decision back to them, rather than answering "
+        "confidently anyway. A brief, honest 'this one's your call, here's what I'd weigh' "
+        "beats a confident guess every time."
     )
     if customer.get("workspace_email"):
         parts.append(
@@ -949,13 +1068,16 @@ def get_workspace_tools(customer: dict) -> list[dict]:
          "input_schema": {"type": "object", "properties": {
              "message_id": {"type": "string"}}, "required": ["message_id"]}},
         {"qualified_name": "gmail_send", "raw_name": "gmail_send",
-         "description": "Send a real email from the utility account. ONLY call this after "
-                         "the customer has explicitly confirmed in a prior message — never in "
-                         "the same turn you first mention sending something. This has a real "
-                         "external effect (someone receives it, it can't be unsent).",
+         "description": "Send a real email from the utility account. Requires `confirmed: "
+                         "true` — set this ONLY after the customer has explicitly confirmed "
+                         "in a PRIOR message, never in the same turn you first mention "
+                         "sending something. Enforced in code: a call with confirmed=false "
+                         "or omitted will be rejected and nothing will be sent. This has a "
+                         "real external effect (someone receives it, it can't be unsent).",
          "input_schema": {"type": "object", "properties": {
-             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}},
-             "required": ["to", "subject", "body"]}},
+             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
+             "confirmed": {"type": "boolean", "description": "Must be true — set only after explicit prior customer confirmation."}},
+             "required": ["to", "subject", "body", "confirmed"]}},
         {"qualified_name": "gmail_draft", "raw_name": "gmail_draft",
          "description": "Create a draft email without sending it — no confirmation needed, "
                          "nothing is sent to anyone.",
@@ -975,15 +1097,18 @@ def get_workspace_tools(customer: dict) -> list[dict]:
         # --- Calendar ---
         {"qualified_name": "calendar_create_event", "raw_name": "calendar_create_event",
          "description": "Create a calendar event. If attendees are included, this sends "
-                         "real invite emails to those people — ONLY do this after explicit "
-                         "customer confirmation, same rule as sending an email. An event with "
-                         "no attendees (just the customer's own calendar) needs no confirmation.",
+                         "real invite emails to those people — requires `confirmed: true`, "
+                         "set ONLY after explicit prior customer confirmation, same rule as "
+                         "sending an email. Enforced in code: attendees present without "
+                         "confirmed=true will be rejected. An event with no attendees (just "
+                         "the customer's own calendar) needs no confirmation.",
          "input_schema": {"type": "object", "properties": {
              "summary": {"type": "string"}, "start_iso": {"type": "string", "description": "ISO 8601 datetime"},
              "end_iso": {"type": "string", "description": "ISO 8601 datetime"},
              "description": {"type": "string"},
-             "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses to invite — triggers real invites, confirm first"},
-             "add_meet": {"type": "boolean", "description": "Attach a Google Meet link"}},
+             "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses to invite — triggers real invites, requires confirmed=true"},
+             "add_meet": {"type": "boolean", "description": "Attach a Google Meet link"},
+             "confirmed": {"type": "boolean", "description": "Required (must be true) only if attendees is non-empty."}},
              "required": ["summary", "start_iso", "end_iso"]}},
         {"qualified_name": "calendar_list_events", "raw_name": "calendar_list_events",
          "description": "List upcoming events in a time range.",
@@ -991,10 +1116,16 @@ def get_workspace_tools(customer: dict) -> list[dict]:
              "time_min_iso": {"type": "string"}, "time_max_iso": {"type": "string"}},
              "required": ["time_min_iso", "time_max_iso"]}},
         {"qualified_name": "calendar_delete_event", "raw_name": "calendar_delete_event",
-         "description": "Delete a calendar event. If it has attendees, they get notified it "
-                         "was cancelled — confirm first, same as creating one with attendees.",
+         "description": "Delete a calendar event. Requires `confirmed: true` — set ONLY "
+                         "after explicit prior customer confirmation. Enforced in code: a "
+                         "call with confirmed=false or omitted will be rejected. Always "
+                         "required here (not conditional on attendees, since we can't check "
+                         "for attendees without a separate lookup first) — if it has "
+                         "attendees, they get notified it was cancelled.",
          "input_schema": {"type": "object", "properties": {
-             "event_id": {"type": "string"}}, "required": ["event_id"]}},
+             "event_id": {"type": "string"},
+             "confirmed": {"type": "boolean", "description": "Must be true — set only after explicit prior customer confirmation."}},
+             "required": ["event_id", "confirmed"]}},
 
         # --- Drive ---
         {"qualified_name": "drive_upload", "raw_name": "drive_upload",
@@ -1013,12 +1144,15 @@ def get_workspace_tools(customer: dict) -> list[dict]:
              "file_id": {"type": "string"}}, "required": ["file_id"]}},
         {"qualified_name": "drive_share", "raw_name": "drive_share",
          "description": "Share a Drive file with someone — gives them real access and emails "
-                         "them a notification. ONLY do this after explicit customer "
-                         "confirmation, same rule as sending an email.",
+                         "them a notification. Requires `confirmed: true` — set ONLY after "
+                         "explicit prior customer confirmation, same rule as sending an "
+                         "email. Enforced in code: a call with confirmed=false or omitted "
+                         "will be rejected.",
          "input_schema": {"type": "object", "properties": {
              "file_id": {"type": "string"}, "share_with_email": {"type": "string"},
-             "role": {"type": "string", "description": "'reader', 'commenter', or 'writer'"}},
-             "required": ["file_id", "share_with_email"]}},
+             "role": {"type": "string", "description": "'reader', 'commenter', or 'writer'"},
+             "confirmed": {"type": "boolean", "description": "Must be true — set only after explicit prior customer confirmation."}},
+             "required": ["file_id", "share_with_email", "confirmed"]}},
 
         # --- Docs ---
         {"qualified_name": "docs_create", "raw_name": "docs_create",
@@ -1158,6 +1292,10 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
         return f"From: {result['from']}\nSubject: {result['subject']}\nDate: {result['date']}\n\n{result['body']}"
 
     if tool_name == "gmail_send":
+        if not arguments.get("confirmed"):
+            return ("Not sent — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
         success, msg = send_email(email, arguments.get("to", ""), arguments.get("subject", ""), arguments.get("body", ""))
         return msg
 
@@ -1174,10 +1312,15 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
         return msg
 
     if tool_name == "calendar_create_event":
+        attendees = arguments.get("attendees")
+        if attendees and not arguments.get("confirmed"):
+            return ("Not created — inviting attendees requires explicit customer confirmation "
+                     "first. Ask the customer to confirm, wait for their reply, then call this "
+                     "again with confirmed=true. (An event with no attendees doesn't need this.)")
         success, msg = create_calendar_event(
             email, arguments.get("summary", ""), arguments.get("start_iso", ""),
             arguments.get("end_iso", ""), arguments.get("description", ""),
-            arguments.get("attendees"), arguments.get("add_meet", False),
+            attendees, arguments.get("add_meet", False),
         )
         return msg
 
@@ -1188,6 +1331,10 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
         return "\n".join(f"[{e['id']}] {e['summary']}: {e['start']} to {e['end']}" for e in results)
 
     if tool_name == "calendar_delete_event":
+        if not arguments.get("confirmed"):
+            return ("Not deleted — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
         success, msg = delete_calendar_event(email, arguments.get("event_id", ""))
         return msg
 
@@ -1209,6 +1356,10 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict) -> 
         return msg
 
     if tool_name == "drive_share":
+        if not arguments.get("confirmed"):
+            return ("Not shared — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
         success, msg = share_drive_file(
             email, arguments.get("file_id", ""), arguments.get("share_with_email", ""),
             arguments.get("role", "reader"),
@@ -2353,6 +2504,31 @@ def vapi_webhook():
         # — solving the routing problem with no extra metadata mechanism
         # needed. See vapi_custom_llm() below for the actual per-customer
         # key lookup and forwarding.
+        # Voice spend cap check — see the module-level comment above
+        # is_over_voice_cap() for the honest limitation here: this can't
+        # cleanly refuse or end the call itself (unverified Vapi
+        # mechanism), so it does the two things that ARE solid — warns
+        # the model in-system-prompt to keep the call efficient and
+        # suggest switching to text, and logs a flagged alert so a
+        # person can decide whether to intervene, same "log it, human
+        # decides" pattern as device-release requests.
+        if customer:
+            over_cap, monthly_spend, cap = is_over_voice_cap(customer)
+            if over_cap:
+                system += (
+                    f"\n\nThis customer's voice usage is over their monthly budget "
+                    f"(~${monthly_spend:.2f} of a ${cap:.2f} cap). Keep this call efficient "
+                    f"and to the point. If it's a good natural moment, mention you're also "
+                    f"reachable by text, without being abrupt about it — don't refuse to help "
+                    f"or cut the call short artificially."
+                )
+                with closing(get_db()) as conn:
+                    conn.execute(
+                        "INSERT INTO error_reports (customer_id, error_code, component) VALUES (?, ?, ?)",
+                        (customer["id"], "voice_monthly_cap_exceeded", "vapi_webhook"),
+                    )
+                    conn.commit()
+
         if customer:
             model_block = {
                 "provider": "custom-llm",
@@ -2389,6 +2565,31 @@ def vapi_webhook():
         customer   = get_customer_by_phone(caller) if caller else None
         if customer and transcript:
             save_message(customer["id"], "user", f"[Voice call transcript]: {transcript}")
+
+        # Usage logging — NOT independently re-verified against a live
+        # Vapi test call which of these fields is actually present (same
+        # honesty standard as the rest of this webhook): Vapi's docs
+        # describe a top-level "durationSeconds" on end-of-call-report
+        # messages, so that's tried first; falling back to computing it
+        # from startedAt/endedAt timestamps if that field is absent,
+        # since those are more universally present across telephony
+        # webhook payloads. If neither is available, nothing is logged
+        # rather than guessing a duration.
+        if customer:
+            duration = message.get("durationSeconds")
+            if duration is None:
+                started = call_info.get("startedAt")
+                ended = call_info.get("endedAt")
+                if started and ended:
+                    try:
+                        from datetime import datetime
+                        fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+                        duration = (datetime.strptime(ended, fmt) - datetime.strptime(started, fmt)).total_seconds()
+                    except Exception:
+                        duration = None
+            if duration is not None and duration > 0:
+                log_call_usage(customer["id"], float(duration))
+
         return jsonify({"ok": True})
 
     return jsonify({"ok": True})
@@ -3145,8 +3346,40 @@ def owner_dashboard():
                       key_mode, created_at
                FROM customers ORDER BY created_at DESC"""
         ).fetchall()
+        # Customers currently flagged over their monthly voice cap —
+        # distinct customer_ids from unresolved alerts logged this
+        # month, joined with their contact info so the owner can
+        # actually act on it (e.g. reach out, adjust their cap, or
+        # just confirm it's expected usage).
+        voice_alerts = conn.execute(
+            """SELECT DISTINCT c.id, c.name, c.email, c.phone_number
+               FROM error_reports e
+               JOIN customers c ON c.id = e.customer_id
+               WHERE e.error_code = 'voice_monthly_cap_exceeded'
+                 AND e.created_at >= date('now', 'start of month')
+               ORDER BY c.name"""
+        ).fetchall()
     return render_template_string(BASE_STYLE + """
     <h1>Cloud customers</h1>
+
+    {% if voice_alerts %}
+    <div class="card" style="border-color:#e6a23c">
+      <h2 style="font-size:1.1rem;">Over monthly voice budget</h2>
+      <p class="muted">These customers went over their voice cap this month — worth a look,
+         not an automatic cutoff (see the code comment on is_over_voice_cap for why).</p>
+      <table>
+        <tr><th>Name</th><th>Email</th><th>Number</th></tr>
+        {% for a in voice_alerts %}
+        <tr>
+          <td>{{ a.name }}</td>
+          <td>{{ a.email }}</td>
+          <td>{{ a.phone_number or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
+
     <table style="width:100%;border-collapse:collapse;font-size:.85rem">
       <tr style="border-bottom:2px solid #eee">
         <th style="text-align:left;padding:6px">Name</th>
@@ -3167,7 +3400,7 @@ def owner_dashboard():
     </table>
     <p class="muted" style="margin-top:16px">{{ customers|length }} customer(s)</p>
     <p><a href="/owner/logout">Log out</a></p>
-    """, customers=customers)
+    """, customers=customers, voice_alerts=voice_alerts)
 
 
 @app.route("/owner/logout")
