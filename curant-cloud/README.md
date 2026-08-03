@@ -207,6 +207,31 @@ exactly once, and if it's not done within a short synchronous window,
 the customer gets a "still working" reply now and a follow-up SMS once
 it actually finishes, rather than the result being silently dropped.
 
+**August's generation tools** (`generate_image`, `generate_image_with_text`,
+`generate_voice`, `generate_video`) — FLUX, Ideogram, ElevenLabs, and Veo,
+same BYOK model as Home, ported with one real architectural difference:
+Cloud has no iMessage-style attachment channel, so results are **emailed**
+to the customer from their own Workspace utility account, not delivered
+inline. This means August's tools are gated on the customer having a
+Workspace utility email provisioned, in addition to the `august` addon —
+without one, there's no way to hand back a generated file, so the tools
+simply aren't offered rather than failing mid-conversation. Generated
+content is never written to Cloud's own disk — it exists in memory only
+for the length of the request (or background thread, for Veo) and is
+discarded once attached to the outgoing email. Veo always runs async
+(it's always slow, several minutes) with no synchronous-wait attempt at
+all, unlike form submissions which try synchronous first. A per-customer
+monthly spend cap applies, same $25 default and same design as Home's.
+
+**Reading email attachments** — `gmail_read` now lists any attachments
+on a message (filename, type, size, an id to fetch it with);
+`gmail_read_attachment` actually reads one. Real text extraction for
+plain text, CSV, Markdown, JSON, and PDF (via `pypdf`) — anything else
+(images, Word docs, spreadsheets) gets an honest "can't read this type
+yet" instead of fabricated content. This closes a real gap: `read_email`
+previously extracted only the text body and silently dropped anything
+attached.
+
 ## Voice — Vapi prototype
 
 Set `VAPI_API_KEY` in .env and configure Vapi to point incoming calls at:

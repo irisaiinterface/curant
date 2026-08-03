@@ -1757,9 +1757,24 @@ def get_workspace_tools(customer: dict) -> list[dict]:
              "query": {"type": "string", "description": "Gmail search query"}},
              "required": ["query"]}},
         {"qualified_name": "gmail_read", "raw_name": "gmail_read",
-         "description": "Read the full body of a specific email found via gmail_search.",
+         "description": "Read the full body of a specific email found via gmail_search. If "
+                         "the email has attachments, they'll be listed (filename, type, "
+                         "size, and an attachment_id) — use gmail_read_attachment to actually "
+                         "read one.",
          "input_schema": {"type": "object", "properties": {
              "message_id": {"type": "string"}}, "required": ["message_id"]}},
+        {"qualified_name": "gmail_read_attachment", "raw_name": "gmail_read_attachment",
+         "description": "Read the content of an email attachment (from the attachment list "
+                         "gmail_read returns). Currently supports plain text, CSV, Markdown, "
+                         "JSON, and PDF (real text extraction, not just acknowledging the "
+                         "file exists). Other types (images, Word docs, spreadsheets) aren't "
+                         "readable yet — you'll get a plain explanation instead of fabricated "
+                         "content.",
+         "input_schema": {"type": "object", "properties": {
+             "message_id": {"type": "string"}, "attachment_id": {"type": "string"},
+             "filename": {"type": "string", "description": "From gmail_read's attachment list — helps pick the right extraction method"},
+             "mime_type": {"type": "string", "description": "From gmail_read's attachment list"}},
+             "required": ["message_id", "attachment_id"]}},
         {"qualified_name": "gmail_send", "raw_name": "gmail_send",
          "description": "Send a real email from the utility account. Requires `confirmed: "
                          "true` — set this ONLY after the customer has explicitly confirmed "
@@ -2027,7 +2042,23 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict,
         result = read_email(email, arguments.get("message_id", ""))
         if not result:
             return "[Could not read that email — it may not exist or the account may be unreachable.]"
-        return f"From: {result['from']}\nSubject: {result['subject']}\nDate: {result['date']}\n\n{result['body']}"
+        text = f"From: {result['from']}\nSubject: {result['subject']}\nDate: {result['date']}\n\n{result['body']}"
+        if result.get("attachments"):
+            att_lines = "\n".join(
+                f"  - {a['filename']} ({a['mime_type']}, {a['size_bytes']} bytes) — attachment_id: {a['attachment_id']}"
+                for a in result["attachments"]
+            )
+            text += f"\n\nAttachments:\n{att_lines}"
+        return text
+
+    if tool_name == "gmail_read_attachment":
+        extracted_text, error = get_email_attachment(
+            email, arguments.get("message_id", ""), arguments.get("attachment_id", ""),
+            filename=arguments.get("filename", ""), mime_type=arguments.get("mime_type", ""),
+        )
+        if error:
+            return f"[{error}]"
+        return extracted_text
 
     if tool_name == "gmail_send":
         if not arguments.get("confirmed"):
@@ -2510,8 +2541,10 @@ def search_emails(customer_email: str, query: str = "newer_than:1d", max_results
 
 
 def read_email(customer_email: str, message_id: str) -> dict | None:
-    """Full body of a specific message (found via search_emails first).
-    Returns None on failure rather than raising."""
+    """Full body of a specific message (found via search_emails first),
+    plus a list of any attachments (filename, type, size, and an id to
+    fetch the actual content with — see get_email_attachment). Returns
+    None on failure rather than raising."""
     try:
         service = _gmail_service_for(customer_email)
         msg = service.users().messages().get(
@@ -2532,15 +2565,91 @@ def read_email(customer_email: str, message_id: str) -> dict | None:
                     return text
             return ""
 
+        def _collect_attachments(payload, out):
+            body = payload.get("body", {})
+            if payload.get("filename") and body.get("attachmentId"):
+                out.append({
+                    "attachment_id": body["attachmentId"],
+                    "filename": payload["filename"],
+                    "mime_type": payload.get("mimeType", "application/octet-stream"),
+                    "size_bytes": body.get("size", 0),
+                })
+            for part in payload.get("parts", []):
+                _collect_attachments(part, out)
+
+        attachments = []
+        _collect_attachments(msg.get("payload", {}), attachments)
+
         return {
             "subject": headers.get("Subject", ""),
             "from": headers.get("From", ""),
             "date": headers.get("Date", ""),
             "body": _extract_text(msg.get("payload", {})),
+            "attachments": attachments,
         }
     except Exception as e:
         print(f"Gmail read failed (non-fatal): {e}", file=sys.stderr)
         return None
+
+
+# Mime types we can extract readable text from directly, without a
+# specialized library — anything outside this set (images, docx, xlsx,
+# etc.) falls back to "here's the file info, can't read the content yet"
+# rather than pretending to read something it can't. PDF is the one
+# exception with real parsing (via pypdf, pure-Python, no external
+# binary needed) since it's the single most common attachment type
+# worth actually reading.
+PLAIN_TEXT_ATTACHMENT_MIME_TYPES = {
+    "text/plain", "text/csv", "text/markdown", "text/x-markdown",
+    "application/json", "text/tab-separated-values",
+}
+
+
+def get_email_attachment(customer_email: str, message_id: str, attachment_id: str,
+                         filename: str = "", mime_type: str = "") -> tuple[str | None, str | None]:
+    """
+    Downloads an attachment and returns (extracted_text, error).
+    extracted_text is None (with an explanatory error) for file types
+    this can't read yet — never fabricated content for an unsupported
+    type. Currently reads: plain text/CSV/markdown/JSON directly, and
+    PDF via real text extraction (pypdf). Images, Word docs, and
+    spreadsheets are acknowledged (filename/size already visible from
+    read_email) but not yet parsed — flagged honestly rather than
+    silently returning nothing useful.
+    """
+    import base64
+    try:
+        service = _gmail_service_for(customer_email)
+        attachment = service.users().messages().attachments().get(
+            userId="me", messageId=message_id, id=attachment_id,
+        ).execute()
+        raw_bytes = base64.urlsafe_b64decode(attachment["data"])
+    except Exception as e:
+        return None, f"Couldn't download attachment: {e}"
+
+    if mime_type in PLAIN_TEXT_ATTACHMENT_MIME_TYPES:
+        try:
+            return raw_bytes.decode(errors="replace"), None
+        except Exception as e:
+            return None, f"Couldn't decode as text: {e}"
+
+    if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        try:
+            from pypdf import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            pages_text = [page.extract_text() or "" for page in reader.pages]
+            text = "\n".join(pages_text).strip()
+            if not text:
+                return None, ("This PDF has no extractable text — it may be a scanned image "
+                             "rather than real text. Can't read it this way.")
+            return text, None
+        except Exception as e:
+            return None, f"Couldn't extract text from this PDF: {e}"
+
+    return None, (f"Can't read the content of a {mime_type or 'this type of'} file yet "
+                  f"({filename}) — only plain text, CSV, Markdown, JSON, and PDF are "
+                  f"supported right now.")
 
 
 def send_email(customer_email: str, to: str, subject: str, body: str,
