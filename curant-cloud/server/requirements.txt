@@ -1,0 +1,8 @@
+flask>=3.0
+cryptography>=42.0
+requests>=2.31
+anthropic>=0.40
+openai>=1.0
+sqlcipher3>=0.5.0
+google-api-python-client>=2.100.0
+google-auth>=2.23.0

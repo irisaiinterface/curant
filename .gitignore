@@ -1,0 +1,21 @@
+# Real environment files — never commit actual secrets
+.env
+*.env
+!.env.example
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Local Curant config (if ever accidentally staged from a dev machine)
+.curant/

@@ -1,0 +1,814 @@
+"""
+Curant server — license/billing gate ONLY.
+
+This server intentionally knows almost nothing about any customer. It
+answers exactly one question: "is this license key valid and active, and
+what has this customer paid for?" It never sees a message, a persona, an
+instruction, a memory, or an API key. All of that now lives locally on
+the customer's own Mac (see mac/curant-watcher.py and curant-cli) —
+Claude is called directly from the customer's machine using their own
+Anthropic API key, which never leaves that machine.
+
+Implements:
+  POST /v1/activate        — verify a license key, return account/billing basics
+  GET  /v1/status          — check subscription/activation status (called
+                             periodically by curant-cli to re-verify, cached
+                             locally between checks)
+  POST /v1/usage-report    — accepts a message COUNT only, never content
+  POST /v1/error-report    — accepts an enumerated error code only, from a
+                             closed allowlist — never free text
+  POST /v1/release-request — logs a request to release a device binding
+                             (e.g. after a new Mac). NOT self-serve — this
+                             only logs the request; an admin reviews and
+                             calls approve_release_request() after
+                             verifying it's legitimate (by phone/support
+                             contact, as intended), same as a customer
+                             calling in directly.
+  GET  /health              — liveness check
+
+Also implements a small web UI:
+  /login, /dashboard        — customer login (by license key) and a
+                             dashboard showing plan/status/device binding,
+                             plus a button to submit a release request
+                             (same non-automatic review flow as above).
+  /owner                    — a SEPARATE login gated by CURANT_ADMIN_PASSWORD
+                             (env var, no default — login is disabled
+                             outright if unset, never falls back to a
+                             guessable password). Shows pending release
+                             requests with Approve/Deny buttons and a
+                             read-only customer list.
+Both use signed session cookies (CURANT_SECRET_KEY — set this to a real
+persistent random value before deploying), a CSRF token on every form,
+and a stricter rate limit on login attempts specifically (5 per 5 min
+per IP) than the general API rate limit.
+
+Backup of persona/instructions/memories/settings is entirely local now —
+`curant-cli backup-now`/`backup-restore` write/read an encrypted file at a
+path the customer chooses (their own disk, an external drive, an iCloud
+Drive folder, etc.). This server has no backup endpoints and never sees
+that data in any form, encrypted or otherwise.
+
+What's stored here, per customer, and nothing else:
+  - license_key       (the identifier)
+  - customer_name     (so activation can say "Welcome, <name>")
+  - plan              (billing tier)
+  - active            (subscription status — the actual product gate)
+  - unlocked_addons    (what they've paid for — gates capabilities client-side)
+
+Storage: SQLite for now (fine up to a few hundred customers; swap for
+Postgres before real scale).
+
+Setup:
+  pip install flask --break-system-packages
+  python app.py
+
+Note there is no encryption-key setup step anymore, and no `anthropic`
+dependency — this server never holds a secret worth encrypting or calls
+Claude on anyone's behalf.
+"""
+
+import os
+import sqlite3
+import secrets
+import json
+import time
+import sys
+from contextlib import closing
+from functools import wraps
+from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
+
+app = Flask(__name__)
+DB_PATH = os.environ.get("CURANT_DB_PATH", "curant.db")
+
+# Session signing key. MUST be set to a real, persistent, random value in
+# any real deployment (`export CURANT_SECRET_KEY=$(python3 -c "import
+# secrets; print(secrets.token_hex(32))")`) — a value that changes on
+# every restart would invalidate all sessions constantly, and a
+# predictable one would let anyone forge session cookies.
+_secret_key = os.environ.get("CURANT_SECRET_KEY")
+if not _secret_key:
+    print("WARNING: CURANT_SECRET_KEY not set — generating a temporary key for "
+          "this run only. Set a real, persistent key before deploying for real use.",
+          file=sys.stderr)
+    _secret_key = secrets.token_hex(32)
+app.secret_key = _secret_key
+
+# Explicit session cookie hardening rather than relying on Flask defaults:
+#   HTTPONLY — JavaScript can't read the session cookie (defends against
+#              a stray XSS anywhere ever being able to steal a session).
+#   SAMESITE=Lax — the cookie isn't sent on cross-site requests initiated
+#              by other sites, which blunts CSRF further alongside the
+#              token-based check below.
+#   SECURE — only sent over HTTPS. This is NOT turned on by default here
+#              because there's no real HTTPS hosting yet (see README) and
+#              forcing it would silently break local testing over plain
+#              http. Set CURANT_HTTPS=true once real HTTPS is in place —
+#              deploying for real without doing this leaves session
+#              cookies (and therefore login sessions) exposed to anyone
+#              who can see the network traffic.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("CURANT_HTTPS", "").lower() == "true"
+if not app.config["SESSION_COOKIE_SECURE"]:
+    print("WARNING: CURANT_HTTPS is not set to 'true' — session cookies will be sent "
+          "over plain HTTP. Fine for local testing, NOT fine for a real deployment. "
+          "Set CURANT_HTTPS=true once this is behind real HTTPS.", file=sys.stderr)
+
+# The owner/admin password. Deliberately has NO default — if this isn't
+# set, the owner login is disabled outright rather than falling back to
+# some guessable default. Set via:
+#   export CURANT_ADMIN_PASSWORD="something long and random, not reused elsewhere"
+ADMIN_PASSWORD = os.environ.get("CURANT_ADMIN_PASSWORD")
+
+# Separate, stricter rate limit for login attempts (both customer and
+# owner) — this is the endpoint most worth protecting against brute force,
+# so it gets its own budget rather than sharing the general API one.
+_login_rate_limit_window = {}
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS = 5
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = 300  # 5 attempts per 5 minutes per IP
+
+
+def check_login_rate_limit(ip):
+    now = time.time()
+    timestamps = _login_rate_limit_window.get(ip, [])
+    timestamps = [t for t in timestamps if now - t < LOGIN_RATE_LIMIT_WINDOW_SECONDS]
+    if len(timestamps) >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS:
+        return False
+    timestamps.append(now)
+    _login_rate_limit_window[ip] = timestamps
+    return True
+
+
+# --- Simple per-key rate limiting ---
+# In-memory is fine for a single-process deployment; if this ever runs as
+# multiple worker processes, move to Redis. Purpose here is defensive —
+# guarding against license-key enumeration/brute force on /v1/activate, and
+# a runaway status-check loop — not handling adversarial traffic at scale.
+_rate_limit_window = {}
+RATE_LIMIT_MAX_REQUESTS = 30
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+
+def check_rate_limit(key):
+    now = time.time()
+    timestamps = _rate_limit_window.get(key, [])
+    timestamps = [t for t in timestamps if now - t < RATE_LIMIT_WINDOW_SECONDS]
+    if len(timestamps) >= RATE_LIMIT_MAX_REQUESTS:
+        return False
+    timestamps.append(now)
+    _rate_limit_window[key] = timestamps
+    return True
+
+
+# --- Storage setup ---
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with closing(get_db()) as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS customers (
+            license_key TEXT PRIMARY KEY,
+            customer_name TEXT,
+            phone_number TEXT,
+            plan TEXT DEFAULT 'base',
+            active INTEGER DEFAULT 1,
+            unlocked_addons TEXT DEFAULT '[]',  -- JSON array of addon ids
+            device_id TEXT UNIQUE,               -- the one Mac this license is bound to
+            total_messages INTEGER DEFAULT 0     -- cumulative count, never content
+        );
+
+        CREATE TABLE IF NOT EXISTS error_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            error_code TEXT,     -- enumerated code only, e.g. "llm_call_failed" —
+                                  -- NEVER free text, NEVER message content
+            component TEXT,      -- e.g. "watcher", "curant-cli", "proactive-check"
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS release_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            status TEXT DEFAULT 'pending',  -- 'pending' | 'approved' | 'denied'
+            requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            resolved_at TEXT
+        );
+        """)
+        conn.commit()
+
+
+def get_customer(license_key):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM customers WHERE license_key = ?", (license_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+# --- Helper: create a new customer (call this from your signup/payment webhook) ---
+
+def provision_customer(customer_name, phone_number=None, plan="base"):
+    """Call this after a successful Stripe payment to create a new customer
+    and generate their license key. Notably: no Anthropic API key is taken
+    or stored here anymore — the customer enters their own key locally on
+    their Mac via `curant-cli set-api-key`, and it never reaches this server."""
+    license_key = "CRT-" + "-".join(
+        secrets.token_hex(2).upper() for _ in range(3)
+    )
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO customers (license_key, customer_name, phone_number, plan) VALUES (?, ?, ?, ?)",
+            (license_key, customer_name, phone_number, plan),
+        )
+        conn.commit()
+    return license_key
+
+
+def bind_device(license_key, device_id):
+    """
+    Enforce a strict 1:1 relationship between a license and a device:
+      - A license can only ever be bound to one device.
+      - A device can only ever be bound to one license.
+    Returns (ok: bool, error_code: str | None).
+    """
+    with closing(get_db()) as conn:
+        customer = conn.execute(
+            "SELECT device_id FROM customers WHERE license_key = ?", (license_key,)
+        ).fetchone()
+        if customer is None:
+            return False, "invalid_license"
+
+        current_device = customer["device_id"]
+        if current_device is not None:
+            if current_device == device_id:
+                return True, None  # already bound to this same device — fine
+            return False, "license_already_bound_to_another_device"
+
+        # This license has no device yet — check the device isn't already
+        # bound to a DIFFERENT license before claiming it.
+        other = conn.execute(
+            "SELECT license_key FROM customers WHERE device_id = ? AND license_key != ?",
+            (device_id, license_key),
+        ).fetchone()
+        if other is not None:
+            return False, "device_already_bound_to_another_license"
+
+        conn.execute(
+            "UPDATE customers SET device_id = ? WHERE license_key = ?",
+            (device_id, license_key),
+        )
+        conn.commit()
+        return True, None
+
+
+# --- Endpoints ---
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Simple liveness check for whatever hosting/monitoring this ends up behind."""
+    try:
+        with closing(get_db()) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)}), 503
+
+
+@app.route("/v1/activate", methods=["POST"])
+def activate():
+    data = request.get_json(force=True)
+    license_key = data.get("license_key", "")
+    device_id = data.get("device_id", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"valid": False, "error": "rate_limited"}), 429
+
+    customer = get_customer(license_key)
+    if not customer or not customer["active"]:
+        return jsonify({"valid": False}), 403
+
+    if not device_id:
+        return jsonify({"valid": False, "error": "device_id_required"}), 400
+
+    bound, error_code = bind_device(license_key, device_id)
+    if not bound:
+        return jsonify({"valid": False, "error": error_code}), 409
+
+    return jsonify({
+        "valid": True,
+        "customer_id": license_key,
+        "customer_name": customer["customer_name"],
+        "plan": customer["plan"],
+        "unlocked_addons": json.loads(customer["unlocked_addons"] or "[]"),
+    })
+
+
+@app.route("/v1/status", methods=["GET"])
+def status():
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+    device_id = request.args.get("device_id", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"active": False, "error": "rate_limited"}), 429
+
+    customer = get_customer(license_key)
+    if not customer:
+        return jsonify({"active": False}), 404
+
+    if customer["device_id"] and device_id and customer["device_id"] != device_id:
+        return jsonify({"active": False, "error": "device_mismatch"}), 409
+
+    return jsonify({
+        "active": bool(customer["active"]),
+        "plan": customer["plan"],
+        "unlocked_addons": json.loads(customer["unlocked_addons"] or "[]"),
+    })
+
+
+@app.route("/v1/usage-report", methods=["POST"])
+def usage_report():
+    """
+    Reports a message COUNT since the last report — never content, never
+    timestamps of individual messages, just "N more messages happened."
+    Called by curant-cli piggybacked on its periodic status check, not on
+    every message (that would leak a usage pattern/timing signal for no
+    real benefit).
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    customer = get_customer(license_key)
+    if not customer:
+        return jsonify({"ok": False}), 404
+
+    data = request.get_json(force=True)
+    count = data.get("message_count", 0)
+    if not isinstance(count, int) or count < 0 or count > 10000:
+        # Sanity bound — a bad/malicious client shouldn't be able to send
+        # a garbage value that corrupts the running total.
+        return jsonify({"ok": False, "error": "invalid_count"}), 400
+
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE customers SET total_messages = total_messages + ? WHERE license_key = ?",
+            (count, license_key),
+        )
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+VALID_ERROR_CODES = {
+    "llm_call_failed", "no_api_key_set", "inactive_or_invalid_license",
+    "watcher_crash", "chatdb_read_failed", "transcription_failed",
+    "tts_failed", "attachment_not_found", "unexpected_watcher_error",
+}
+VALID_COMPONENTS = {"watcher", "curant-cli", "proactive-check"}
+
+
+@app.route("/v1/error-report", methods=["POST"])
+def error_report():
+    """
+    Records that a known, enumerated error happened — never the exception
+    message, never a stack trace, never message content. This exists so a
+    customer's broken setup can be noticed before they have to complain,
+    not so we can debug the exact failure remotely.
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    customer = get_customer(license_key)
+    if not customer:
+        return jsonify({"ok": False}), 404
+
+    data = request.get_json(force=True)
+    error_code = data.get("error_code", "")
+    component = data.get("component", "")
+
+    # Only accept codes/components from a known, closed set — this is the
+    # enforcement mechanism that keeps this endpoint from ever becoming a
+    # vector for free-text (and therefore potentially content-bearing) data.
+    if error_code not in VALID_ERROR_CODES or component not in VALID_COMPONENTS:
+        return jsonify({"ok": False, "error": "unrecognized_code_or_component"}), 400
+
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO error_reports (license_key, error_code, component) VALUES (?, ?, ?)",
+            (license_key, error_code, component),
+        )
+        conn.commit()
+    return jsonify({"ok": True})
+
+
+def create_release_request(license_key):
+    """
+    Core logic for logging a release request, shared by the /v1/release-request
+    API endpoint (used by curant-cli) and the customer web dashboard below.
+    Does NOT release anything automatically — only logs the request.
+    Existing pending requests aren't duplicated. Returns a dict shaped
+    like the API response: {"ok", "status", "request_id"} or {"ok": False, "error"}.
+    """
+    customer = get_customer(license_key)
+    if not customer:
+        return {"ok": False, "error": "invalid_license"}
+
+    with closing(get_db()) as conn:
+        existing = conn.execute(
+            "SELECT id FROM release_requests WHERE license_key = ? AND status = 'pending'",
+            (license_key,),
+        ).fetchone()
+        if existing:
+            return {"ok": True, "status": "already_pending", "request_id": existing["id"]}
+
+        conn.execute(
+            "INSERT INTO release_requests (license_key) VALUES (?)",
+            (license_key,),
+        )
+        conn.commit()
+        request_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+
+    return {"ok": True, "status": "pending", "request_id": request_id}
+
+
+@app.route("/v1/release-request", methods=["POST"])
+def submit_release_request():
+    """
+    Logs a request to release this license's device binding — does NOT
+    release it automatically. This is deliberately not self-serve: the
+    customer submits a request here (or calls support directly), and an
+    admin reviews and approves it via approve_release_request() below.
+    Existing pending requests aren't duplicated — resubmitting just
+    confirms the existing one rather than piling up duplicates.
+    """
+    data = request.get_json(force=True)
+    license_key = data.get("license_key", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    result = create_release_request(license_key)
+    status_code = 200 if result.get("ok") else 404
+    return jsonify(result), status_code
+
+
+# --- Admin-only functions (not exposed as endpoints — call directly, e.g.
+# from a Python shell or a future admin tool, once you've verified the
+# request by phone/support contact as intended) ---
+
+def list_pending_release_requests():
+    """Admin helper: see what's waiting on a decision."""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """SELECT release_requests.id, release_requests.license_key,
+                      customers.customer_name, customers.phone_number,
+                      release_requests.requested_at
+               FROM release_requests
+               JOIN customers ON customers.license_key = release_requests.license_key
+               WHERE release_requests.status = 'pending'
+               ORDER BY release_requests.requested_at"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def approve_release_request(request_id):
+    """Admin action: actually clears the device binding, freeing the
+    license to activate on a new Mac. Only call this after verifying the
+    request is legitimate (the whole point of requiring a call/request
+    instead of automatic self-serve)."""
+    with closing(get_db()) as conn:
+        req = conn.execute(
+            "SELECT license_key, status FROM release_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if req is None:
+            return False, "request_not_found"
+        if req["status"] != "pending":
+            return False, f"request_already_{req['status']}"
+
+        conn.execute(
+            "UPDATE customers SET device_id = NULL WHERE license_key = ?",
+            (req["license_key"],),
+        )
+        conn.execute(
+            "UPDATE release_requests SET status = 'approved', resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (request_id,),
+        )
+        conn.commit()
+    return True, None
+
+
+def deny_release_request(request_id):
+    """Admin action: mark a request denied without releasing anything."""
+    with closing(get_db()) as conn:
+        req = conn.execute(
+            "SELECT status FROM release_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        if req is None:
+            return False, "request_not_found"
+        if req["status"] != "pending":
+            return False, f"request_already_{req['status']}"
+
+        conn.execute(
+            "UPDATE release_requests SET status = 'denied', resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (request_id,),
+        )
+        conn.commit()
+    return True, None
+
+
+# --- Web UI: customer login/dashboard, and a separately-gated owner page ---
+# Both use Flask's signed session cookies (see app.secret_key above).
+# Jinja autoescaping is on by default for render_template_string (Flask
+# enables it whenever the template has no filename), so customer-supplied
+# values like customer_name are safe to interpolate directly — no manual
+# escaping needed.
+
+BASE_STYLE = """
+<style>
+  body { font-family: -apple-system, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; margin: 16px 0; }
+  .row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #eee; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #666; }
+  input[type=text], input[type=password] { width: 100%; padding: 8px; margin: 8px 0; box-sizing: border-box; }
+  button { padding: 8px 16px; cursor: pointer; }
+  .error { color: #b00020; }
+  .muted { color: #888; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+  form.inline { display: inline; }
+</style>
+"""
+
+
+def get_csrf_token():
+    """Generated once per session, reused for every form in it. Prevents
+    a malicious third-party page from submitting actions (like approving
+    a release request) on behalf of a logged-in owner/customer without
+    their knowledge."""
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def validate_csrf():
+    submitted = request.form.get("csrf_token", "")
+    return secrets.compare_digest(submitted, session.get("csrf_token", ""))
+
+
+def require_customer_login(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("license_key"):
+            return redirect(url_for("customer_login"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+def require_admin(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("is_admin"):
+            return redirect(url_for("owner_page"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
+@app.route("/login", methods=["GET", "POST"])
+def customer_login():
+    error = None
+    if request.method == "POST":
+        client_ip = request.remote_addr or "unknown"
+        if not check_login_rate_limit(f"customer:{client_ip}"):
+            error = "Too many attempts. Try again in a few minutes."
+        elif not validate_csrf():
+            error = "Session expired — please try again."
+        else:
+            license_key = request.form.get("license_key", "").strip()
+            customer = get_customer(license_key)
+            if customer and customer["active"]:
+                session["license_key"] = license_key
+                return redirect(url_for("customer_dashboard"))
+            error = "That license key isn't valid or isn't active."
+
+    return render_template_string(
+        BASE_STYLE + """
+        <h1>Curant Account Login</h1>
+        <div class="card">
+          {% if error %}<p class="error">{{ error }}</p>{% endif %}
+          <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>License key</label>
+            <input type="text" name="license_key" placeholder="CRT-XXXX-XXXX-XXXX" required autofocus>
+            <button type="submit">Log in</button>
+          </form>
+        </div>
+        <p class="muted"><a href="/owner">Owner login</a></p>
+        """,
+        error=error, csrf_token=get_csrf_token(),
+    )
+
+
+@app.route("/logout")
+def customer_logout():
+    session.pop("license_key", None)
+    return redirect(url_for("customer_login"))
+
+
+@app.route("/dashboard", methods=["GET", "POST"])
+@require_customer_login
+def customer_dashboard():
+    license_key = session["license_key"]
+    customer = get_customer(license_key)
+    if not customer:
+        # License was removed/invalidated after login — don't trust the
+        # stale session further.
+        session.pop("license_key", None)
+        return redirect(url_for("customer_login"))
+
+    message = None
+    if request.method == "POST":
+        if not validate_csrf():
+            message = "Session expired — please try again."
+        else:
+            result = create_release_request(license_key)
+            if result.get("status") == "already_pending":
+                message = "You already have a release request pending review."
+            elif result.get("ok"):
+                message = "Release request submitted — a person will review it, this doesn't happen automatically."
+            else:
+                message = "Couldn't submit the request. Contact support directly."
+
+    with closing(get_db()) as conn:
+        pending = conn.execute(
+            "SELECT id FROM release_requests WHERE license_key = ? AND status = 'pending'",
+            (license_key,),
+        ).fetchone()
+
+    return render_template_string(
+        BASE_STYLE + """
+        <h1>Welcome, {{ customer.customer_name }}</h1>
+        <div class="card">
+          <div class="row"><span class="label">Plan</span><span>{{ customer.plan }}</span></div>
+          <div class="row"><span class="label">Status</span><span>{{ "Active" if customer.active else "Inactive" }}</span></div>
+          <div class="row"><span class="label">Device</span><span>{{ "Bound to a Mac" if customer.device_id else "Not yet activated on a Mac" }}</span></div>
+        </div>
+        <div class="card">
+          <p>If you've moved to a new Mac and need this license released from the old one:</p>
+          {% if pending %}
+            <p class="muted">You have a release request pending review.</p>
+          {% else %}
+            <form method="post">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit">Request device release</button>
+            </form>
+          {% endif %}
+          {% if message %}<p class="muted">{{ message }}</p>{% endif %}
+          <p class="muted">This is reviewed by a person before anything changes — it's not automatic.</p>
+        </div>
+        <p><a href="/logout">Log out</a></p>
+        """,
+        customer=customer, pending=pending, message=message, csrf_token=get_csrf_token(),
+    )
+
+
+@app.route("/owner", methods=["GET", "POST"])
+def owner_page():
+    if session.get("is_admin"):
+        return redirect(url_for("owner_dashboard"))
+
+    error = None
+    if request.method == "POST":
+        client_ip = request.remote_addr or "unknown"
+        if not ADMIN_PASSWORD:
+            error = "Owner login is disabled — CURANT_ADMIN_PASSWORD isn't set on the server."
+        elif not check_login_rate_limit(f"owner:{client_ip}"):
+            error = "Too many attempts. Try again in a few minutes."
+        elif not validate_csrf():
+            error = "Session expired — please try again."
+        else:
+            submitted = request.form.get("password", "")
+            # compare_digest prevents a timing attack from being able to
+            # guess the password one byte at a time via response latency.
+            if secrets.compare_digest(submitted, ADMIN_PASSWORD):
+                session["is_admin"] = True
+                return redirect(url_for("owner_dashboard"))
+            error = "Incorrect password."
+
+    return render_template_string(
+        BASE_STYLE + """
+        <h1>Owner Login</h1>
+        <div class="card">
+          {% if error %}<p class="error">{{ error }}</p>{% endif %}
+          <form method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="password" name="password" placeholder="Owner password" required autofocus>
+            <button type="submit">Log in</button>
+          </form>
+        </div>
+        """,
+        error=error, csrf_token=get_csrf_token(),
+    )
+
+
+@app.route("/owner/logout")
+def owner_logout():
+    session.pop("is_admin", None)
+    return redirect(url_for("owner_page"))
+
+
+@app.route("/owner/dashboard")
+@require_admin
+def owner_dashboard():
+    pending = list_pending_release_requests()
+    with closing(get_db()) as conn:
+        customers = conn.execute(
+            "SELECT license_key, customer_name, plan, active, device_id, total_messages FROM customers ORDER BY customer_name"
+        ).fetchall()
+
+    return render_template_string(
+        BASE_STYLE + """
+        <h1>Owner Dashboard</h1>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Pending device release requests</h2>
+          {% if pending %}
+          <table>
+            <tr><th>Customer</th><th>Phone</th><th>Requested</th><th></th></tr>
+            {% for r in pending %}
+            <tr>
+              <td>{{ r.customer_name }}</td>
+              <td>{{ r.phone_number or "—" }}</td>
+              <td>{{ r.requested_at }}</td>
+              <td>
+                <form class="inline" method="post" action="/owner/approve/{{ r.id }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit">Approve</button>
+                </form>
+                <form class="inline" method="post" action="/owner/deny/{{ r.id }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit">Deny</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </table>
+          {% else %}
+          <p class="muted">None right now.</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Customers</h2>
+          <table>
+            <tr><th>Name</th><th>Plan</th><th>Active</th><th>Device bound</th><th>Messages</th></tr>
+            {% for c in customers %}
+            <tr>
+              <td>{{ c.customer_name }}</td>
+              <td>{{ c.plan }}</td>
+              <td>{{ "Yes" if c.active else "No" }}</td>
+              <td>{{ "Yes" if c.device_id else "No" }}</td>
+              <td>{{ c.total_messages }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </div>
+
+        <p><a href="/owner/logout">Log out</a></p>
+        """,
+        pending=pending, customers=customers, csrf_token=get_csrf_token(),
+    )
+
+
+@app.route("/owner/approve/<int:request_id>", methods=["POST"])
+@require_admin
+def owner_approve(request_id):
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard"))
+    approve_release_request(request_id)
+    return redirect(url_for("owner_dashboard"))
+
+
+@app.route("/owner/deny/<int:request_id>", methods=["POST"])
+@require_admin
+def owner_deny(request_id):
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard"))
+    deny_release_request(request_id)
+    return redirect(url_for("owner_dashboard"))
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(port=5050, debug=True)

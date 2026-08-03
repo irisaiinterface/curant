@@ -1,0 +1,37 @@
+services:
+  curant-cloud:
+    build:
+      context: ../server
+      dockerfile: ../docker/Dockerfile
+    ports:
+      - "5051:5051"
+    volumes:
+      - curant_data:/data
+    environment:
+      # ── Required — set these before starting ──────────────────────────────
+      - CLOUD_DB_KEY=${CLOUD_DB_KEY}
+      - CLOUD_SECRET_KEY=${CLOUD_SECRET_KEY}
+      - CLOUD_ENCRYPTION_KEY=${CLOUD_ENCRYPTION_KEY}
+      - CLOUD_ADMIN_PASSWORD=${CLOUD_ADMIN_PASSWORD}
+      - TELNYX_API_KEY=${TELNYX_API_KEY}
+      - TELNYX_WEBHOOK_SECRET=${TELNYX_WEBHOOK_SECRET}
+
+      # ── Optional ──────────────────────────────────────────────────────────
+      - VAPI_API_KEY=${VAPI_API_KEY:-}
+      - FLASK_DEBUG=${FLASK_DEBUG:-0}
+      - CLOUD_HTTPS=${CLOUD_HTTPS:-false}  # set to "true" when behind real HTTPS
+      - PORT=5051
+
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5051/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  curant_data:
+    # Named volume — data survives container restarts and rebuilds.
+    # For production: consider mounting this to a specific host path for
+    # easier backup: ./data:/data

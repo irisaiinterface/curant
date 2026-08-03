@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-watcher.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-watcher-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp curant-watcher.py /usr/local/bin/curant-watcher.py
+  cp com.curant.watcher.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.watcher.plist
+
+Check it's running:
+  launchctl list | grep curant
+
+Logs land at /tmp/curant-watcher.log and /tmp/curant-watcher-error.log
+while testing — move these somewhere more permanent once stable.
+-->

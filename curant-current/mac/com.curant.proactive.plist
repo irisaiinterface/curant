@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.proactive</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+        <string>--proactive-check</string>
+    </array>
+
+    <!-- Runs once a day at 8:00am. This is a StartCalendarInterval job, not
+         KeepAlive — it should run, exit, and be done, not loop like the
+         message watcher. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-proactive.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-proactive-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.proactive.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.proactive.plist
+
+This is opt in on the server side (customers.proactivity_enabled defaults
+to 0), so loading this job is harmless even for customers who haven't
+turned proactivity on: the server will just say should_send is false.
+
+To test immediately rather than waiting for 8am, run curant-watcher.py
+with the proactive check flag directly (see ProgramArguments above).
+
+Logs land at /tmp/curant-proactive.log and /tmp/curant-proactive-error.log.
+-->

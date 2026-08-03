@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Curant — Your Agent</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #12151c;
+    --ink-2: #1a1f29;
+    --ink-3: #232936;
+    --paper: #f2efe8;
+    --brass: #c98a3e;
+    --brass-dim: #8a6537;
+    --signal: #5fae7f;
+    --slate: #8a93a6;
+    --line: #2c3341;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ink);
+    color: var(--paper);
+    font-family: 'Inter', system-ui, sans-serif;
+    min-height: 100vh;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header {
+    display: flex; align-items: baseline; justify-content: space-between;
+    border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 28px;
+  }
+  .wordmark {
+    font-family: 'Fraunces', serif; font-weight: 700; font-size: 28px;
+    letter-spacing: 0.02em; color: var(--paper);
+  }
+  .wordmark span { color: var(--brass); }
+  .tagline {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--slate);
+    letter-spacing: 0.04em; margin-top: 2px; text-transform: uppercase;
+  }
+  .status-pill {
+    display: flex; align-items: center; gap: 8px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--slate);
+    letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 8px var(--signal); }
+
+  .identity-row {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 28px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--slate);
+  }
+  .identity-row input {
+    background: var(--ink-2); border: 1px solid var(--line); color: var(--paper);
+    padding: 8px 12px; border-radius: 4px; font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+    width: 220px;
+  }
+  .identity-row input:focus { outline: 1px solid var(--brass); border-color: var(--brass); }
+
+  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 24px; }
+  @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--ink-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 22px;
+  }
+  .panel h2 {
+    font-family: 'Fraunces', serif; font-weight: 600; font-size: 17px;
+    margin: 0 0 4px; color: var(--paper);
+  }
+  .panel .sub { color: var(--slate); font-size: 13px; margin: 0 0 18px; }
+
+  /* Chat console — "switchboard ticket" motif */
+  #log {
+    height: 380px; overflow-y: auto; padding-right: 4px; margin-bottom: 14px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .ticket {
+    border-left: 2px solid var(--brass-dim); padding: 8px 0 8px 12px;
+  }
+  .ticket.from-user { border-left-color: var(--slate); }
+  .ticket .meta {
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--slate);
+    text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px;
+  }
+  .ticket .body { font-size: 14px; line-height: 1.5; color: var(--paper); white-space: pre-wrap; }
+  .ticket.from-user .meta { color: var(--slate); }
+
+  .input-row { display: flex; gap: 8px; }
+  .input-row input {
+    flex: 1; background: var(--ink-3); border: 1px solid var(--line); color: var(--paper);
+    padding: 12px 14px; border-radius: 6px; font-size: 14px; font-family: 'Inter', sans-serif;
+  }
+  .input-row input:focus { outline: none; border-color: var(--brass); }
+  .input-row button, .send-btn {
+    background: var(--brass); color: var(--ink); border: none; border-radius: 6px;
+    padding: 0 20px; font-weight: 600; font-size: 14px; cursor: pointer;
+    font-family: 'Inter', sans-serif;
+  }
+  .input-row button:hover { background: #d99a4f; }
+  .input-row button:disabled { opacity: 0.5; cursor: default; }
+
+  /* Instructions */
+  textarea {
+    width: 100%; background: var(--ink-3); border: 1px solid var(--line); color: var(--paper);
+    border-radius: 6px; padding: 12px; font-size: 13px; font-family: 'Inter', sans-serif;
+    resize: vertical; min-height: 70px; margin-bottom: 10px;
+  }
+  textarea:focus { outline: none; border-color: var(--brass); }
+  .save-btn {
+    background: transparent; color: var(--brass); border: 1px solid var(--brass-dim);
+    padding: 8px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; font-family: 'Inter', sans-serif;
+  }
+  .save-btn:hover { border-color: var(--brass); }
+
+  /* Add-ons */
+  .addon {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 0; border-bottom: 1px solid var(--line);
+  }
+  .addon:last-child { border-bottom: none; }
+  .addon-name { font-size: 14px; color: var(--paper); }
+  .addon-price {
+    font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--slate); margin-top: 2px;
+  }
+  .addon-toggle {
+    padding: 7px 14px; border-radius: 20px; font-size: 12px; font-weight: 600;
+    font-family: 'Inter', sans-serif; cursor: pointer; border: 1px solid var(--line);
+    background: transparent; color: var(--slate);
+  }
+  .addon-toggle.unlocked {
+    background: rgba(95, 174, 127, 0.15); border-color: var(--signal); color: var(--signal);
+  }
+  .addon-toggle.locked:hover { border-color: var(--brass); color: var(--brass); }
+
+  .base-note {
+    margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line);
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--slate);
+  }
+
+  .persona-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+  }
+  @media (max-width: 700px) { .persona-grid { grid-template-columns: repeat(2, 1fr); } }
+  .persona-card {
+    background: var(--ink-3); border: 1px solid var(--line); border-radius: 6px;
+    padding: 12px; cursor: pointer; text-align: left;
+  }
+  .persona-card:hover { border-color: var(--brass-dim); }
+  .persona-card.selected { border-color: var(--brass); background: rgba(201, 138, 62, 0.1); }
+  .persona-card .p-name {
+    font-family: 'Fraunces', serif; font-weight: 600; font-size: 15px; color: var(--paper); margin-bottom: 2px;
+  }
+  .persona-card .p-style { font-size: 11px; color: var(--slate); line-height: 1.4; }
+
+  .demo-flag {
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--brass-dim);
+    text-align: center; margin-top: 40px; letter-spacing: 0.04em;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="wordmark">Curant<span>.</span></div>
+      <div class="tagline">More than code. More than people.</div>
+    </div>
+    <div class="status-pill"><span class="dot"></span> line open</div>
+  </header>
+
+  <div class="identity-row">
+    ACCOUNT
+    <input id="customerName" placeholder="e.g. jane@bakery" value="demo-customer" />
+    <span style="color: var(--slate);">— configures and talks to *this* customer's agent</span>
+  </div>
+
+  <div class="panel" style="margin-bottom: 18px;">
+    <h2>Choose your Curant</h2>
+    <p class="sub">Pick a signature, or keep the default. Changes take effect on your next message.</p>
+    <div id="personaList" class="persona-grid"></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Talk to your agent</h2>
+      <p class="sub">This is the same agent reachable by FaceTime or iMessage — talk to it here too.</p>
+      <div id="log"></div>
+      <div class="input-row">
+        <input id="msgInput" placeholder="Ask your agent something..." />
+        <button id="sendBtn">Send</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" style="margin-bottom: 18px;">
+        <h2>Tailor your agent</h2>
+        <p class="sub">Tell it who it's for and how to behave.</p>
+        <textarea id="instructions" placeholder="e.g. You are Jane's assistant. She runs a bakery. Keep replies short and warm."></textarea>
+        <button class="save-btn" id="saveInstructions">Save instructions</button>
+      </div>
+
+      <div class="panel">
+        <h2>Add-ons</h2>
+        <p class="sub">Unlock instantly — takes effect on your next message.</p>
+        <div id="addonList"></div>
+        <div class="base-note">BASE PLAN — $29/mo — active</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="demo-flag">PROTOTYPE — payment shown here is simulated; wire to Stripe for production</div>
+</div>
+
+<script>
+const PERSONAS = [
+  { id: 'curant', name: 'Curant', style: 'All-purpose default — warm, sharp, adaptable' },
+  { id: 'grace', name: 'Grace', style: 'Executive — composed, formal but warm' },
+  { id: 'dean', name: 'Dean', style: 'Builder — fast, casual, technical' },
+  { id: 'nora', name: 'Nora', style: 'Advisor — thoughtful, asks before acting' },
+  { id: 'frank', name: 'Frank', style: 'Everyday — warm, casual, upbeat' },
+  { id: 'miles', name: 'Miles', style: 'Discreet — quiet, minimal, exact' },
+  { id: 'jane', name: 'Jane', style: 'Organizer — precise, structured' },
+  { id: 'leo', name: 'Leo', style: 'Calm — even-keeled, unhurried' },
+];
+
+const ADDONS = [
+  { id: 'email_send', name: 'Autonomous email sending', price: '$7/mo' },
+  { id: 'sms_send', name: 'Text/SMS sending on your behalf', price: '$5/mo' },
+  { id: 'multilang', name: 'Multi-language support', price: '$5/mo' },
+  { id: 'slides', name: 'Presentation/slide creation', price: '$8/mo' },
+  { id: 'calendar', name: 'Full calendar management', price: '$10/mo' },
+  { id: 'memory', name: 'Project memory across sessions', price: '$10/mo' },
+];
+
+function storageKey(name) { return `iris:${name}`; }
+
+async function loadProfile(name) {
+  try {
+    const res = await window.storage.get(storageKey(name));
+    return JSON.parse(res.value);
+  } catch (e) {
+    return { instructions: '', unlocked: [], history: [] };
+  }
+}
+
+async function saveProfile(name, profile) {
+  await window.storage.set(storageKey(name), JSON.stringify(profile));
+}
+
+let profile = { instructions: '', unlocked: [], history: [], persona: 'curant' };
+
+function renderPersonas() {
+  const list = document.getElementById('personaList');
+  list.innerHTML = '';
+  const selected = profile.persona || 'curant';
+  PERSONAS.forEach(p => {
+    const card = document.createElement('div');
+    card.className = 'persona-card' + (p.id === selected ? ' selected' : '');
+    card.innerHTML = `<div class="p-name">${p.name}</div><div class="p-style">${p.style}</div>`;
+    card.addEventListener('click', async () => {
+      profile.persona = p.id;
+      await saveProfile(currentName(), profile);
+      renderPersonas();
+    });
+    list.appendChild(card);
+  });
+}
+
+function renderAddons() {
+  const list = document.getElementById('addonList');
+  list.innerHTML = '';
+  ADDONS.forEach(a => {
+    const unlocked = profile.unlocked.includes(a.id);
+    const row = document.createElement('div');
+    row.className = 'addon';
+    row.innerHTML = `
+      <div>
+        <div class="addon-name">${a.name}</div>
+        <div class="addon-price">${a.price}</div>
+      </div>
+      <button class="addon-toggle ${unlocked ? 'unlocked' : 'locked'}" data-id="${a.id}">
+        ${unlocked ? 'Unlocked' : 'Unlock'}
+      </button>
+    `;
+    list.appendChild(row);
+  });
+  list.querySelectorAll('.addon-toggle').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.id;
+      if (!profile.unlocked.includes(id)) {
+        profile.unlocked.push(id);
+        await saveProfile(currentName(), profile);
+        renderAddons();
+      }
+    });
+  });
+}
+
+function renderLog() {
+  const log = document.getElementById('log');
+  log.innerHTML = '';
+  profile.history.forEach(msg => {
+    const div = document.createElement('div');
+    div.className = `ticket ${msg.role === 'user' ? 'from-user' : ''}`;
+    div.innerHTML = `<div class="meta">${msg.role === 'user' ? 'you' : 'iris'} · ${new Date(msg.time).toLocaleTimeString()}</div>
+                      <div class="body"></div>`;
+    div.querySelector('.body').textContent = msg.content;
+    log.appendChild(div);
+  });
+  log.scrollTop = log.scrollHeight;
+}
+
+function currentName() {
+  return document.getElementById('customerName').value.trim() || 'demo-customer';
+}
+
+async function loadForCurrent() {
+  profile = await loadProfile(currentName());
+  document.getElementById('instructions').value = profile.instructions || '';
+  if (!profile.persona) profile.persona = 'curant';
+  renderPersonas();
+  renderAddons();
+  renderLog();
+}
+
+document.getElementById('customerName').addEventListener('change', loadForCurrent);
+
+document.getElementById('saveInstructions').addEventListener('click', async () => {
+  profile.instructions = document.getElementById('instructions').value;
+  await saveProfile(currentName(), profile);
+});
+
+async function sendMessage() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  document.getElementById('sendBtn').disabled = true;
+
+  profile.history.push({ role: 'user', content: text, time: Date.now() });
+  renderLog();
+
+  const unlockedNames = profile.unlocked
+    .map(id => ADDONS.find(a => a.id === id)?.name)
+    .filter(Boolean);
+
+  const persona = PERSONAS.find(p => p.id === (profile.persona || 'curant'));
+  const systemPrompt = [
+    `You are ${persona.name}, this customer's personal Curant (AI Secretary). Your style: ${persona.style}. Stay in that voice consistently.`,
+    profile.instructions || 'No specific instructions given yet — behave as a capable, honest, helpful personal secretary.',
+    unlockedNames.length ? `This customer has unlocked these add-ons: ${unlockedNames.join(', ')}. You may reference or use these capabilities if relevant.` : 'This customer is on the base plan only — do not offer to send emails/texts autonomously or use locked features; suggest they unlock the relevant add-on instead.'
+  ].join('\n\n');
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system: systemPrompt,
+        messages: profile.history.slice(-20).map(m => ({ role: m.role, content: m.content })),
+      })
+    });
+    const data = await response.json();
+    const reply = data.content.find(c => c.type === 'text')?.text || '(no response)';
+    profile.history.push({ role: 'assistant', content: reply, time: Date.now() });
+  } catch (e) {
+    profile.history.push({ role: 'assistant', content: 'Line dropped — could not reach the agent. Try again.', time: Date.now() });
+  }
+
+  await saveProfile(currentName(), profile);
+  renderLog();
+  document.getElementById('sendBtn').disabled = false;
+}
+
+document.getElementById('sendBtn').addEventListener('click', sendMessage);
+document.getElementById('msgInput').addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+loadForCurrent();
+</script>
+</body>
+</html>
