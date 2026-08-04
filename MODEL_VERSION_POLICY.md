@@ -26,7 +26,7 @@ pattern.
 2. **Never auto-upgrade.** A version change is a deliberate, tracked
    decision — not something that happens because a provider's "latest"
    alias moved underneath us. Home already pins explicit version
-   strings (`claude-sonnet-5`, `claude-haiku-4-5-20251001`, not
+   strings (`claude-sonnet-4-6`, `claude-haiku-4-5-20251001`, not
    `claude-latest` or similar). Cloud does the same
    (`claude-sonnet-4-6`). Keep it that way.
 
@@ -55,20 +55,22 @@ pattern.
 
 | Codebase | Provider | Model string | Constant |
 |---|---|---|---|
-| Home (`curant-cli`) | Anthropic | `claude-sonnet-5` (main), `claude-haiku-4-5-20251001` (fast) | `PROVIDER_MODELS["anthropic"]` |
+| Home (`curant-cli`) | Anthropic | `claude-sonnet-4-6` (main), `claude-haiku-4-5-20251001` (fast) | `PROVIDER_MODELS["anthropic"]` |
 | Home (`curant-cli`) | OpenAI | `gpt-4o` (main), `gpt-4o-mini` (fast) | `PROVIDER_MODELS["openai"]` |
 | Cloud (`server/app.py`) | Anthropic | `claude-sonnet-4-6` | `PROVIDER_MODELS["anthropic"]` |
 | Cloud (`server/app.py`) | OpenAI | `gpt-4o` | `PROVIDER_MODELS["openai"]` |
 
-**Worth noting as a real, unresolved inconsistency:** Home and Cloud
-currently pin *different* Claude versions (`claude-sonnet-5` vs.
-`claude-sonnet-4-6`), and Home has a two-tier main/fast structure that
-Cloud doesn't. Neither of these was addressed as part of this pass —
-this document records the current state honestly rather than silently
-harmonizing them, since that's a product decision (should Home and
-Cloud personas behave identically, or is some divergence acceptable?)
-not a pure code-hygiene one. Flagging for a deliberate decision, not
-fixing by default.
+**Resolved:** Home's main Anthropic model was previously pinned to
+`claude-sonnet-5`, different from Cloud's `claude-sonnet-4-6` — flagged
+as a deliberate, unresolved product decision in the prior version of
+this document. Decided in Cloud's favor: Home's "main" tier now matches
+Cloud exactly, so persona behavior on the primary conversational path
+is consistent across both tiers. **Still not harmonized, and not part
+of this decision:** Home's two-tier main/fast structure itself — Cloud
+has no "fast" tier equivalent, and Home's `fast` model
+(`claude-haiku-4-5-20251001`) is unchanged. Whether Cloud should adopt
+a similar fast-tier split (e.g. for cheap operations like memory
+extraction) is a separate architectural question, not addressed here.
 
 ## Change log
 
@@ -92,3 +94,14 @@ fixing by default.
   not test tool confirmation, since that's code-enforced and can't
   regress from a model change. Full limitations documented honestly in
   `tests/README.md`.
+
+- **Home/Cloud version harmonization decided** — resolved the
+  previously-flagged inconsistency in Cloud's favor. Home's `main`
+  Anthropic model changed from `claude-sonnet-5` to `claude-sonnet-4-6`,
+  matching Cloud exactly. Home's `fast` tier (`claude-haiku-4-5-20251001`)
+  is unchanged — no Cloud equivalent to harmonize against. **Honest
+  gap:** this change was NOT run through `tests/run_persona_regression.py`
+  before landing — no live `ANTHROPIC_API_KEY` was available in the
+  environment this was built in. Per this policy's own rule 3, that
+  regression pass should happen before this version is trusted in front
+  of real customers, even though the suite technically exists now.

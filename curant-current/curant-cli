@@ -826,7 +826,11 @@ def get_feature_requests_local():
 # function below — nothing about persona/memory/system-prompt logic
 # needs to change, by design.
 PROVIDER_MODELS = {
-    "anthropic": {"main": "claude-sonnet-5", "fast": "claude-haiku-4-5-20251001"},
+    # "main" pinned to match Cloud's PROVIDER_MODELS["anthropic"] as of
+    # this change — see MODEL_VERSION_POLICY.md's change log for the
+    # decision record. "fast" has no Cloud equivalent to harmonize
+    # against (Cloud has no main/fast split) and is left as-is.
+    "anthropic": {"main": "claude-sonnet-4-6", "fast": "claude-haiku-4-5-20251001"},
     "openai": {"main": "gpt-4o", "fast": "gpt-4o-mini"},
 }
 
