@@ -31,15 +31,20 @@ pattern.
    (`claude-sonnet-4-6`). Keep it that way.
 
 3. **Regression-test before rolling a version change out to any real
-   customer.** This policy does not yet include an automated
-   regression-test *suite* — that's a separate, larger build (needs
-   defined test cases per persona: does Miles still refuse to give
-   legal advice, does the escalation instruction still fire, does tool
-   confirmation still get enforced, etc.). Until that exists, a model
-   version change requires at minimum:
-   - Manual verification that each persona's core behavioral
-     boundaries still hold (the escalation instruction, the
-     confirmation-gate enforcement, the domain boundaries on Miles/Leo)
+   customer.** `tests/run_persona_regression.py` is the automation for
+   this — run it against a candidate version (`--model claude-opus-4-8`
+   or similar) before putting that version into `PROVIDER_MODELS`. It
+   tests the genuinely model-dependent behaviors (escalation, Miles/Leo's
+   domain boundaries) directly against real API calls using each
+   codebase's actual, imported `build_system_prompt`. It deliberately
+   does NOT test tool confirmation — that's enforced in code
+   (`execute_tool_call`/`execute_cloud_tool_call` reject a call missing
+   `confirmed: true`), not model judgment, so it can't regress from a
+   model change at all. See `tests/README.md` for the real limitation
+   (keyword-heuristic pass/fail, not language understanding — read any
+   FAIL manually) and what's not covered yet (most personas beyond
+   Miles/Leo/Curant, tone-fidelity beyond coarse sanity checks). Even
+   with the suite passing, still do:
    - A staged rollout, not a flip for every customer simultaneously
 
 4. **Document every version change here**, with the date, the reason,
@@ -77,3 +82,13 @@ fixing by default.
   Home's `curant-cli` was already clean (single `PROVIDER_MODELS`
   source, no stray literals found) and needed no code change, only
   this policy document.
+
+- **Regression-test suite built** (`tests/`) — turned "manual
+  verification" from the original policy text into real automation.
+  Imports each codebase's actual `build_system_prompt`/`PERSONAS`
+  directly (no duplicated prompt text to drift), makes real API calls
+  against a target/candidate model, checks escalation and Miles/Leo
+  domain-boundary compliance via keyword heuristics. Deliberately does
+  not test tool confirmation, since that's code-enforced and can't
+  regress from a model change. Full limitations documented honestly in
+  `tests/README.md`.
