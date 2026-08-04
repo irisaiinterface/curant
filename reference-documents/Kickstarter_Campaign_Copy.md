@@ -67,9 +67,11 @@ Legal, compliance, trademark cleanup, and 6 months of Cloud launch runway.
 
 ### $6,500 — Voice Quality Upgrade
 Currently, Cloud voice calls run through Vapi as a prototyping layer. This funds an earlier migration to Telnyx's native Voice AI Agents — lower latency, more natural-sounding calls, from day one instead of waiting for scale to justify the switch.
+**All backers get: 2 free months of Curant Cloud.**
 
 ### $8,500 — Web Dashboard
 Builds the optional Cloud dashboard: conversation history, settings, and billing in one place. Removes the "text-only, no visibility" friction for customers who want to see what their persona has been doing on their behalf.
+**All backers get: 3 free months of Curant Cloud** (up from 2).
 
 ### $11,000 — Deeper Domain Integrations
 Funds verified, live-tested integrations for two more persona domains beyond what's currently scoped — for example, deeper real estate MLS coverage or expanded healthcare-admin tooling — held to the same standard of testing against real, current vendor documentation as everything already built.
@@ -77,7 +79,21 @@ Funds verified, live-tested integrations for two more persona domains beyond wha
 ### $14,000 — Early Backer Creative Bundle
 Curant's creative/generation tier (image, video, voice narration) is normally metered separately from the base subscription. At this tier, early backers get a limited trial of the creative tier included at no extra metered cost for their first few months.
 
-*Note: each stretch tier reflects something built sooner because of backer support — not work already planned regardless of funding.*
+*Note: each stretch tier reflects something built sooner because of backer support — not work already planned regardless of funding. Free-month rewards are only granted if the corresponding stretch goal is actually reached — they don't apply at the base $4,500 goal alone.*
+
+---
+
+## Reward Tiers
+
+**Minimum backer pledge: $5.** Kept intentionally low — Curant has no physical goods to produce or ship, so there's no fulfillment-cost floor pushing this higher. $5 is a genuine, symbolic "count me in," not priced to extract a meaningful contribution on its own.
+
+Every backer at the $5 minimum (or above) gets, regardless of pledge size:
+
+- **Founding Backer credit** — acknowledged as an early supporter (exact placement — campaign page, in-product, etc. — TBD)
+- **50% off August, Curant's creative/generation add-on, for as long as they stay subscribed to Curant Cloud.** Not stretch-gated — this applies simply for backing, at any pledge level.
+- **Free subscription months, IF the corresponding stretch goal is reached** — 2 months at $6,500, 3 months at $8,500 (not additive; the $8,500 tier's 3 months replaces the $6,500 tier's 2, it isn't 2+3=5)
+
+*No separate higher-dollar reward tiers beyond the $5 minimum are defined yet — every backer gets the same rewards regardless of pledge size above that floor. If a scaled structure (e.g., a higher tier for a lifetime discount or a name-in-credits placement) is wanted, that's still open — see below.*
 
 ---
 
@@ -114,7 +130,7 @@ Curant isn't an app you open — it's a phone number you call or text, with a co
 
 These need real decisions/inputs from you before this is launch-ready:
 
-1. **Reward tiers** — not yet defined. Typical structure for a subscription SaaS product: early-bird discounted subscription months, lifetime-discount tiers, or "founding customer" status. Want me to draft these next?
+1. **Reward tiers** ✓ — defined (see "Reward Tiers" section above): $5 minimum pledge, 50% off August for all backers regardless of pledge size, stretch-gated free months (2 at $6,500, 3 at $8,500). One sub-question still open: whether to add a scaled higher-dollar tier (e.g., a bigger discount or different perk for a larger pledge) on top of the flat $5-minimum structure, or keep every backer's reward identical regardless of pledge size above the floor.
 2. **Campaign visuals/video** — not covered by this doc.
 3. **Privacy Policy FAQ answer** — currently a placeholder; fill in once drafted, don't publish speculative claims about data handling.
 4. **Risks section voice** — draft above is a starting structure; personalize before publishing.
