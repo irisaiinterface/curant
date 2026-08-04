@@ -375,18 +375,17 @@ signup now actually names real capabilities instead of a generic
   back to the dashboard instead of on to provisioning — same
   underlying Web Crypto/Fernet encryption logic either way, no
   duplication.
-- **`curant-dashboard.html` (the standalone file in this folder) is NOT
-  a real, deployable dashboard.** It's a demo/mockup Artifact — uses
-  `window.storage` (an Artifacts-only API, not any real Curant
-  infrastructure) and calls the Anthropic API with no auth header at
-  all, a pattern that only works inside a Claude.ai Artifact viewer
-  (would 401 if actually opened as a plain HTML file). It predates
-  `cloud_dashboard()`, which is the real, working dashboard. **Decision:
-  kept, not deleted** — its visual design (persona-card layout, the
-  "switchboard ticket" chat log motif) has real reference value for a
-  future real frontend. Now clearly marked as mockup-only with both an
-  HTML comment and a visible on-page banner, so it can't be mistaken
-  for something deployable again.
+- **`curant-dashboard.html` — deleted.** It was never a real,
+  deployable dashboard — a demo/mockup Artifact using `window.storage`
+  (an Artifacts-only API, not any real Curant infrastructure) and an
+  Anthropic API call with no auth header (only works inside a Claude.ai
+  Artifact viewer; would 401 anywhere else). It predated
+  `cloud_dashboard()`, which is the real, working dashboard and remains
+  the only one. Initially kept and relabeled as a design reference, then
+  removed outright on request — if its visual style (persona-card
+  layout, "switchboard ticket" chat log motif) is worth revisiting for
+  a future real frontend, it's still in git history at commit
+  `2bed794` and earlier.
 - **Rate limiting** ✓ — resolved. Was in-memory (a dict), which only ever
   rate-limited within a single process — meaningless once this runs
   behind multiple gunicorn workers, since each worker would silently
