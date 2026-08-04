@@ -1,0 +1,120 @@
+# Curant — Kickstarter Campaign Copy
+
+---
+
+## Campaign Title
+
+**Curant: An AI Secretary You Reach by Phone Call or Text — Not Another App**
+
+## Tagline (subtitle, under the title)
+
+Your own AI employee, on call. No app to open, no chat window to remember to check.
+
+---
+
+## Hero/Preview Summary
+
+> Curant is an AI personal secretary reachable by phone call or text — not another chat app. This raise covers the legal groundwork (privacy policy, trademark cleanup) and launch infrastructure needed to open Curant Cloud to real customers.
+
+---
+
+## The Pitch
+
+Every AI assistant on the market today assumes the same thing: that you'll open an app, find the right window, and type. Curant doesn't.
+
+Curant is reachable the way you'd reach an actual assistant — call it, or text it. It remembers who you are, keeps a consistent personality across every conversation, and hands off to a specialist persona when the job calls for one: an executive-ops assistant for scheduling and expenses, a legal/finance assistant for contracts, a real estate assistant that knows MLS listings, and more.
+
+**Two ways to run it:**
+
+- **Curant Home** — runs entirely on your own hardware (a Mac mini), reachable over iMessage/FaceTime through a dedicated Apple ID. Your data never leaves your network. *Already built and working.*
+- **Curant Cloud** — hosted, no hardware required, reachable by plain SMS and voice call from anywhere. *This is what this campaign funds into launch readiness.*
+
+The core reasoning behind every persona is Claude, from Anthropic — chosen deliberately over swapping between cheaper models, because consistency of judgment and personality across every call is the actual product, not a commodity chatbot wrapper.
+
+---
+
+## Why This Campaign, If It Already Works?
+
+Curant Home is built and running today. This campaign funds **Curant Cloud** specifically — the hosted tier that lets people use Curant without buying or setting up hardware.
+
+Before real customer data can flow through Cloud, three things have to be true that aren't yet:
+
+1. **A real privacy policy.** Hosting conversations and memory makes me the data controller, not just a processor — that's a different, higher legal bar than Home's local-only model.
+2. **A resolved trademark.** An earlier naming collision needs proper cleanup before this scales publicly.
+3. **Runway.** Hosting, carrier, and compliance costs need to be covered for the months before subscription revenue covers them on its own.
+
+The technology is ready. This raise covers what's legally and financially required to launch it responsibly — not to build it in the first place.
+
+---
+
+## Use of Funds — $4,500 Goal
+
+| Category | Amount | What it covers |
+|---|---|---|
+| **Legal & Compliance** | $2,000 | Cloud Privacy Policy (encryption at rest, data isolation, retention/deletion policy), trademark cleanup |
+| **Launch Infrastructure** | $655 | 6 months of VPS hosting, Telnyx SMS/voice carrier costs, A2P 10DLC campaign registration (required for US texting compliance) |
+| **Domain & Workspace Setup** | $350 | Domain registration, Google Workspace admin account, buffer for early customer Workspace seats |
+| **Buffer** | $1,495 | Contingency — legal costs in particular tend to run over estimates |
+
+**A note on what this isn't funding:** AI usage itself isn't part of this ask. Curant is bring-your-own-key on the Anthropic API — each customer's AI costs bill directly to their own account, never to Curant. This raise covers getting the product legally and technically ready to accept real customers, not ongoing inference costs.
+
+---
+
+## Stretch Goals
+
+### $4,500 — Base Goal ✓
+Legal, compliance, trademark cleanup, and 6 months of Cloud launch runway.
+
+### $6,500 — Voice Quality Upgrade
+Currently, Cloud voice calls run through Vapi as a prototyping layer. This funds an earlier migration to Telnyx's native Voice AI Agents — lower latency, more natural-sounding calls, from day one instead of waiting for scale to justify the switch.
+
+### $8,500 — Web Dashboard
+Builds the optional Cloud dashboard: conversation history, settings, and billing in one place. Removes the "text-only, no visibility" friction for customers who want to see what their persona has been doing on their behalf.
+
+### $11,000 — Deeper Domain Integrations
+Funds verified, live-tested integrations for two more persona domains beyond what's currently scoped — for example, deeper real estate MLS coverage or expanded healthcare-admin tooling — held to the same standard of testing against real, current vendor documentation as everything already built.
+
+### $14,000 — Early Backer Creative Bundle
+Curant's creative/generation tier (image, video, voice narration) is normally metered separately from the base subscription. At this tier, early backers get a limited trial of the creative tier included at no extra metered cost for their first few months.
+
+*Note: each stretch tier reflects something built sooner because of backer support — not work already planned regardless of funding.*
+
+---
+
+## FAQ
+
+**Why do you need funding if the product already works?**
+Curant Home (the local-first version) is built and running. This campaign funds Curant Cloud — the hosted tier — specifically for the legal and infrastructure work required before it can take real customer data responsibly: a proper privacy policy, resolved trademark, and launch runway.
+
+**Does this money pay your salary?**
+No. Every dollar is allocated to legal, compliance, and infrastructure costs — not personal profit. The itemized use-of-funds breakdown above reflects real costs, not a founder salary.
+
+**Will my AI usage cost extra?**
+No — Curant is bring-your-own-key for the Anthropic API. Your usage bills directly to your own account, never marked up or routed through Curant.
+
+**What happens to my data on Curant Cloud?**
+[Fill in once the Cloud Privacy Policy — funded by this campaign — is finalized. Do not commit to specific retention/encryption claims publicly until the policy is actually drafted and reviewed.]
+
+**How is this different from ChatGPT or another AI app?**
+Curant isn't an app you open — it's a phone number you call or text, with a consistent personality and memory across every conversation, backed by domain-specific tools (legal, real estate, healthcare admin, and more) rather than a general-purpose chat window.
+
+---
+
+## Risks & Challenges *(Kickstarter requires this section)*
+
+- **Legal timelines can slip.** Privacy policy drafting and trademark cleanup are external processes outside full control of the build timeline.
+- **Third-party dependencies.** SMS/voice compliance (A2P 10DLC registration) depends on carrier approval timelines, which are not fully predictable.
+- **Solo-founder bandwidth.** All development, product, and business work is currently done by one person — stretch goals are scoped to be realistic additions, not overcommitments.
+
+*[This section should be written in your own voice before publishing — Kickstarter reviews campaigns for genuine, specific risk disclosure, not boilerplate.]*
+
+---
+
+## Open Items Before Publishing
+
+These need real decisions/inputs from you before this is launch-ready:
+
+1. **Reward tiers** — not yet defined. Typical structure for a subscription SaaS product: early-bird discounted subscription months, lifetime-discount tiers, or "founding customer" status. Want me to draft these next?
+2. **Campaign visuals/video** — not covered by this doc.
+3. **Privacy Policy FAQ answer** — currently a placeholder; fill in once drafted, don't publish speculative claims about data handling.
+4. **Risks section voice** — draft above is a starting structure; personalize before publishing.

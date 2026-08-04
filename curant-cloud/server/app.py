@@ -49,6 +49,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from flask import (Flask, request, jsonify, session, redirect,
                    url_for, render_template_string, abort, Response)
 import requests as http
+import billing
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -185,6 +186,16 @@ def init_db():
             -- Same NULL-means-default / -1-means-uncapped pattern as
             -- monthly_voice_cap_usd, for August's generation spend.
             monthly_generation_cap_usd REAL,
+
+            -- Stripe billing. subscription_status mirrors Stripe's own
+            -- status strings ('active', 'past_due', 'canceled', etc.)
+            -- rather than a custom enum, so webhook handling is a direct
+            -- passthrough — see billing.extract_subscription_update.
+            -- NULL stripe_customer_id means "hasn't reached checkout yet"
+            -- (distinct from 'canceled', which means they did and left).
+            stripe_customer_id     TEXT,
+            stripe_subscription_id TEXT,
+            subscription_status    TEXT,
 
             created_at      TEXT DEFAULT CURRENT_TIMESTAMP
         );
@@ -346,6 +357,9 @@ def init_db():
             ("monthly_voice_cap_usd", "REAL"),
             ("encrypted_generation_keys", "TEXT"),
             ("monthly_generation_cap_usd", "REAL"),
+            ("stripe_customer_id", "TEXT"),
+            ("stripe_subscription_id", "TEXT"),
+            ("subscription_status", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {coltype}")
@@ -3844,7 +3858,7 @@ def signup_server_key():
                 store_key_server_side(cid, api_key, provider)
                 if is_dashboard_update:
                     return redirect(url_for("cloud_dashboard"))
-                return redirect(url_for("signup_provision"))
+                return redirect(url_for("signup_billing"))
 
     return render_template_string(BASE_STYLE + """
     <h1>{{ "Update your API key" if is_update else "Add your API key" }}</h1>
@@ -3897,7 +3911,7 @@ def signup_browser_key():
         session["browser_key_stored"] = True
         return jsonify({"ok": True})
 
-    redirect_target = url_for("cloud_dashboard") if is_dashboard_update else url_for("signup_provision")
+    redirect_target = url_for("cloud_dashboard") if is_dashboard_update else url_for("signup_billing")
 
     return render_template_string(BASE_STYLE + """
     <h1>{{ "Update your encrypted key" if is_update else "Encrypt your key" }}</h1>
@@ -3966,6 +3980,164 @@ def signup_browser_key():
     });
     </script>
     """, csrf_value=get_csrf(), redirect_target=redirect_target, is_update=is_dashboard_update)
+
+
+@app.route("/cloud/signup/billing", methods=["GET", "POST"])
+def signup_billing():
+    """
+    Subscription step, between API key setup and phone provisioning.
+    POST creates a Stripe Checkout Session and redirects the customer to
+    Stripe's hosted page; we don't touch the customer's card at all here.
+    Nothing in our DB is marked active/subscribed from this route — that
+    only happens once the /webhooks/stripe handler gets a real
+    checkout.session.completed event back from Stripe. Trusting the
+    success_url redirect alone would let anyone skip payment by just
+    visiting that URL directly.
+    """
+    cid = session.get("signup_customer_id")
+    if not cid:
+        return redirect(url_for("signup"))
+    customer = get_customer(cid)
+    if not customer:
+        return redirect(url_for("signup"))
+
+    if request.method == "POST":
+        if not check_csrf():
+            return jsonify({"ok": False, "error": "Session expired"}), 400
+        plan = request.form.get("plan", "cloud_base")
+        try:
+            checkout_url = billing.create_checkout_session(
+                customer_id=cid,
+                plan=plan,
+                email=customer.get("email"),
+            )
+            with closing(get_db()) as conn:
+                conn.execute("UPDATE customers SET plan=? WHERE id=?", (plan, cid))
+                conn.commit()
+            return redirect(checkout_url)
+        except Exception as e:
+            return render_template_string(BASE_STYLE + """
+            <h1>Something went wrong</h1>
+            <p class="error">Couldn't start checkout: {{ error }}</p>
+            <p><a href="/cloud/signup/billing">Try again</a></p>
+            """, error=str(e))
+
+    return render_template_string(BASE_STYLE + """
+    <h1>Choose your plan</h1>
+    <form method="post">{{ csrf }}
+      <label style="display:block;margin-bottom:10px">
+        <input type="radio" name="plan" value="cloud_base" checked> Base — $29/mo
+      </label>
+      <label style="display:block;margin-bottom:14px">
+        <input type="radio" name="plan" value="cloud_executive"> Executive — $149/mo (everything included)
+      </label>
+      <button class="btn" type="submit">Continue to payment</button>
+    </form>
+    <p class="muted">Add-ons can be added later from your dashboard.</p>
+    """, csrf=CSRF_FIELD.format(get_csrf()))
+
+
+@app.route("/cloud/signup/billing/success")
+def signup_billing_success():
+    """
+    Stripe redirects here after a successful Checkout. This is a
+    courtesy landing page only — actual subscription activation is
+    driven by the webhook, which usually (not always) beats the customer's
+    browser back to this page. If it hasn't landed yet, we show a
+    generic confirmation rather than block on it; the dashboard reflects
+    the real status once the webhook lands, typically within seconds.
+    """
+    return redirect(url_for("signup_provision"))
+
+
+@app.route("/cloud/billing/portal")
+@require_customer
+def billing_portal():
+    """
+    Logged-in customer's entry point to the Stripe-hosted Customer
+    Portal — upgrade/downgrade/cancel/update payment method, no custom
+    UI built for any of that on our side.
+    """
+    cid = session["customer_id"]
+    customer = get_customer(cid)
+    if not customer or not customer.get("stripe_customer_id"):
+        return redirect(url_for("cloud_dashboard"))
+    portal_url = billing.create_portal_session(
+        stripe_customer_id=customer["stripe_customer_id"],
+        return_url=f"{billing.PUBLIC_URL}/cloud/dashboard",
+    )
+    return redirect(portal_url)
+
+
+@app.route("/webhooks/stripe", methods=["POST"])
+def webhook_stripe():
+    """
+    Stripe webhook handler — the only place subscription state actually
+    changes. Same signature-verification-before-trusting-payload pattern
+    as the existing Telnyx/Vapi webhook handlers elsewhere in this file.
+    """
+    payload = request.data
+    sig_header = request.headers.get("Stripe-Signature", "")
+    try:
+        event = billing.verify_webhook(payload, sig_header)
+    except Exception as e:
+        print(f"Stripe webhook signature verification failed: {e}", file=sys.stderr)
+        return jsonify({"error": "invalid signature"}), 400
+
+    update = billing.extract_subscription_update(event)
+    if update and update.get("curant_customer_id"):
+        # 'canceled' stops Curant from answering texts/calls (mirrors the
+        # existing `if not customer["active"]` gate in sms_webhook and the
+        # voice path). 'active' re-enables it — covers both a resolved
+        # past_due and a straight reactivation.
+        #
+        # Deliberately NOT doing here: releasing the Telnyx number or
+        # deleting the customer's Workspace account. Those are the
+        # destructive, hard-to-undo steps /cloud/cancel already performs
+        # when the customer cancels through Curant's own UI. If they
+        # instead cancel directly from the Stripe portal, this webhook is
+        # the only place we'd hear about it — right now that leaves the
+        # phone number and data in place with the account just disabled,
+        # which is the safer default until you decide whether portal
+        # cancellations should trigger the same cleanup /cloud/cancel does.
+        active_flag = 1 if update["status"] == "active" else (
+            0 if update["status"] == "canceled" else None
+        )
+        with closing(get_db()) as conn:
+            if active_flag is not None:
+                conn.execute(
+                    """UPDATE customers
+                       SET stripe_customer_id=?, stripe_subscription_id=?,
+                           subscription_status=?, active=?
+                       WHERE id=?""",
+                    (
+                        update["stripe_customer_id"],
+                        update["stripe_subscription_id"],
+                        update["status"],
+                        active_flag,
+                        update["curant_customer_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE customers
+                       SET stripe_customer_id=?, stripe_subscription_id=?, subscription_status=?
+                       WHERE id=?""",
+                    (
+                        update["stripe_customer_id"],
+                        update["stripe_subscription_id"],
+                        update["status"],
+                        update["curant_customer_id"],
+                    ),
+                )
+            conn.commit()
+        print(
+            f"Stripe: customer {update['curant_customer_id']} subscription "
+            f"status -> {update['status']}",
+            file=sys.stderr,
+        )
+
+    return jsonify({"received": True})
 
 
 @app.route("/cloud/signup/provision", methods=["GET", "POST"])
@@ -4167,6 +4339,25 @@ def cloud_dashboard():
     <p class="muted">Your number: <strong>{{ customer.phone_number or "Being provisioned…" }}</strong></p>
     {% if message %}<p style="color:#1a7a1a">{{ message }}</p>{% endif %}
 
+    <h2>Billing</h2>
+    <div style="padding:12px 0;border-bottom:1px solid #eee;margin-bottom:14px">
+      {% if customer.subscription_status == 'active' %}
+      <p class="muted">Plan: <strong>{{ plan_display_names.get(customer.plan, customer.plan) }}</strong> &middot;
+         Status: <strong style="color:#1a7a1a">Active</strong></p>
+      {% elif customer.subscription_status == 'past_due' %}
+      <p class="muted">Plan: <strong>{{ plan_display_names.get(customer.plan, customer.plan) }}</strong> &middot;
+         Status: <strong style="color:#b8860b">Past due</strong> — your last payment failed. We'll keep
+         retrying automatically, but update your card to avoid interruption.</p>
+      {% elif customer.subscription_status in ('canceled', None) %}
+      <p class="muted">Status: <strong style="color:#a33">No active subscription</strong></p>
+      {% else %}
+      <p class="muted">Status: <strong>{{ customer.subscription_status }}</strong></p>
+      {% endif %}
+      {% if customer.stripe_customer_id %}
+      <a href="/cloud/billing/portal" class="btn" style="display:inline-block;text-decoration:none;text-align:center;width:auto;padding:8px 16px">Manage billing</a>
+      {% endif %}
+    </div>
+
     <h2>API key</h2>
     <div style="padding:12px 0;border-bottom:1px solid #eee;margin-bottom:14px">
       {% if customer.key_mode == 'server' %}
@@ -4274,6 +4465,7 @@ def cloud_dashboard():
     monthly_generation_spend=get_monthly_generation_spend(cid),
     generation_cap=get_generation_cap(customer),
     unlocked_addons=get_unlocked_addons(customer),
+    plan_display_names={"cloud_base": "Base — $29/mo", "cloud_executive": "Executive — $149/mo"},
     csrf=CSRF_FIELD.format(get_csrf()))
 
 
@@ -4390,7 +4582,7 @@ def owner_dashboard():
     with closing(get_db()) as conn:
         customers = conn.execute(
             """SELECT id, name, email, phone_number, plan, active,
-                      key_mode, created_at
+                      key_mode, subscription_status, created_at
                FROM customers ORDER BY created_at DESC"""
         ).fetchall()
         # Customers currently flagged over their monthly voice cap —
@@ -4406,8 +4598,38 @@ def owner_dashboard():
                  AND e.created_at >= date('now', 'start of month')
                ORDER BY c.name"""
         ).fetchall()
+        # Same shape as voice_alerts — customers whose Stripe status
+        # needs a human look. 'past_due' means Smart Retries is still
+        # working the card, not yet a lost customer; 'canceled' with
+        # active=1 would mean the DB and Stripe disagree (e.g. a webhook
+        # never landed), which is worth catching here rather than
+        # silently drifting.
+        billing_alerts = conn.execute(
+            """SELECT id, name, email, phone_number, subscription_status
+               FROM customers
+               WHERE subscription_status IN ('past_due', 'canceled', 'unpaid', 'incomplete_expired')
+                  OR (active = 1 AND stripe_customer_id IS NOT NULL AND subscription_status IS NULL)
+               ORDER BY name"""
+        ).fetchall()
     return render_template_string(BASE_STYLE + """
     <h1>Cloud customers</h1>
+
+    {% if billing_alerts %}
+    <div class="card" style="border-color:#b00020">
+      <h2 style="font-size:1.1rem;">Billing needs attention</h2>
+      <table>
+        <tr><th>Name</th><th>Email</th><th>Number</th><th>Status</th></tr>
+        {% for a in billing_alerts %}
+        <tr>
+          <td>{{ a.name }}</td>
+          <td>{{ a.email }}</td>
+          <td>{{ a.phone_number or "—" }}</td>
+          <td>{{ a.subscription_status or "no Stripe status recorded" }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
 
     {% if voice_alerts %}
     <div class="card" style="border-color:#e6a23c">
@@ -4433,6 +4655,7 @@ def owner_dashboard():
         <th style="text-align:left;padding:6px">Email</th>
         <th style="text-align:left;padding:6px">Number</th>
         <th style="text-align:left;padding:6px">Key mode</th>
+        <th style="text-align:left;padding:6px">Billing</th>
         <th style="text-align:left;padding:6px">Active</th>
       </tr>
       {% for c in customers %}
@@ -4441,6 +4664,7 @@ def owner_dashboard():
         <td style="padding:6px">{{ c.email }}</td>
         <td style="padding:6px">{{ c.phone_number or "—" }}</td>
         <td style="padding:6px">{{ c.key_mode }}</td>
+        <td style="padding:6px">{{ c.subscription_status or "—" }}</td>
         <td style="padding:6px">{{ "Yes" if c.active else "No" }}</td>
       </tr>
       {% endfor %}

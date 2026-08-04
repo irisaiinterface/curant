@@ -26,6 +26,10 @@ Everything built to date, in one place.
     verified real tools mapped to each persona
   - `CostCalculator.jsx` — interactive Cloud economics calculator (open
     as a React artifact)
+  - `Kickstarter_Campaign_Copy.md` — campaign title, pitch, use-of-funds
+    breakdown, stretch goals, and FAQ for a Cloud-launch funding raise —
+    several sections marked as placeholders pending real decisions
+    (reward tiers, risk-section voice, Privacy Policy FAQ answer)
 
 ## Quick orientation
 

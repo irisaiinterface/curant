@@ -1,4 +1,5 @@
 flask>=3.0
+stripe>=11.0
 cryptography>=42.0
 requests>=2.31
 anthropic>=0.40

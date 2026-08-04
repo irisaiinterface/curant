@@ -365,6 +365,45 @@ message and persisted (`messages.urgency`), and the welcome SMS sent at
 signup now actually names real capabilities instead of a generic
 "text me anything" greeting.
 
+## Billing — Stripe
+
+Real subscription billing, not manual invoicing. `billing.py` handles
+checkout, the customer self-service portal, and webhook-driven
+subscription sync; kept as its own module rather than folded into
+`app.py`, matching the codebase's existing separation-of-concerns style.
+
+**How it works:**
+- Two flat-rate plan Prices (Base $29/mo, Executive $149/mo) — set up
+  once via `setup_stripe_products.py`, then referenced by ID via
+  `STRIPE_PRICE_BASE`/`STRIPE_PRICE_EXECUTIVE`
+- Signup now requires a completed Checkout Session (`/cloud/signup/billing`)
+  *before* phone provisioning — inserted as a new step between API key
+  setup and `/cloud/signup/provision`
+- **The webhook (`/webhooks/stripe`), not the browser redirect, is the
+  source of truth for subscription state** — the success-page redirect
+  after Checkout is a courtesy landing page only. Trusting the redirect
+  alone would let anyone skip payment by just visiting that URL directly.
+- Customers manage their own subscription (upgrade/downgrade/cancel/update
+  card) through Stripe's own hosted Customer Portal (`/cloud/billing/portal`)
+  — no custom billing UI built for any of that
+- Dashboard shows live billing status (active/past_due/canceled) with a
+  "Manage billing" link; owner dashboard flags customers needing
+  attention (`past_due`, `canceled`, or a DB/Stripe status mismatch)
+
+**Two real open items, not yet resolved:**
+1. **`ADDON_PRICE_MAP` needs actual add-on names/prices filled in** —
+   the flat-plan checkout works today; add-on billing doesn't yet.
+2. **Portal cancellations don't trigger the same cleanup `/cloud/cancel`
+   does.** Cancelling through Curant's own UI immediately releases the
+   Telnyx number and deprovisions the Workspace account. Cancelling
+   through Stripe's portal instead only disables the account
+   (`active=0`) via the webhook — the phone number and Workspace account
+   stay provisioned. This is the deliberately safer default (destructive,
+   hard-to-undo steps shouldn't fire from a webhook without a decision
+   about whether that's actually wanted), but it needs a real decision,
+   not just this default, before real customers can cancel through
+   either path with the same outcome.
+
 ## What's still missing before production
 
 - **Customer dashboard API key management** ✓ — resolved this pass.
