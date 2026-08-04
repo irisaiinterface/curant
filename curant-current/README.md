@@ -760,9 +760,18 @@ trivial-vs-substantive examples).
   call-for-a-quote message tells customers to call a number that doesn't
   exist yet — needs the real business line before this feature is
   useful to anyone but you reviewing the local log.
-- **Veo and Descript integrations are honest stubs, not real yet.**
-  Deliberately not guessed-at code (see the August section above for
-  why) — both need real scoping before they'll actually work.
+- **Veo and Descript integrations** ✓ — resolved, this claim was stale.
+  Veo is a real, working implementation (submit/poll/download via the
+  `google-genai` SDK, targeting the current `veo-3.1-generate-preview`
+  model, BYOK). Descript is resolved differently — not a bespoke
+  integration at all, but a deliberate redirect to Descript's own
+  official hosted MCP server (`curant-cli mcp-add-oauth descript
+  https://api.descript.com/v2/mcp`), since duplicating a REST
+  integration Descript already exposes via MCP would be needless work.
+  See the docstrings on `_generate_video_veo_sync` and
+  `edit_media_descript` for the full verification notes and documented
+  real limitations (Descript's 30-day job history, no direct file
+  export, single-Drive scoping).
 - **`~/.curant/generated/` encryption + pruning** ✓ — resolved. Files
   are encrypted at rest (Fernet, dedicated key stored in config,
   generated once) and pruned after 24 hours — long enough to get
