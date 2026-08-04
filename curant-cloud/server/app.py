@@ -3793,7 +3793,19 @@ def signup_key_choice():
 
 @app.route("/cloud/signup/key/server", methods=["GET", "POST"])
 def signup_server_key():
+    """
+    Handles two distinct callers, distinguished by which session key is
+    set: session["signup_customer_id"] for a brand-new signup (redirects
+    on to provisioning when done), or session["customer_id"] for an
+    already-active customer updating/switching to Option A from their
+    dashboard (redirects back to the dashboard when done). Same logic
+    either way — only the entry/exit points differ.
+    """
     cid = session.get("signup_customer_id")
+    is_dashboard_update = False
+    if not cid:
+        cid = session.get("customer_id")
+        is_dashboard_update = True
     if not cid:
         return redirect(url_for("signup"))
 
@@ -3808,10 +3820,12 @@ def signup_server_key():
                 error = "Please enter your API key."
             else:
                 store_key_server_side(cid, api_key, provider)
+                if is_dashboard_update:
+                    return redirect(url_for("cloud_dashboard"))
                 return redirect(url_for("signup_provision"))
 
     return render_template_string(BASE_STYLE + """
-    <h1>Add your API key</h1>
+    <h1>{{ "Update your API key" if is_update else "Add your API key" }}</h1>
     <p>Get a free API key from
       <a href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic</a>
       or <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI</a>.
@@ -3826,9 +3840,10 @@ def signup_server_key():
         <option value="anthropic">Anthropic (Claude)</option>
         <option value="openai">OpenAI (GPT-4o)</option>
       </select>
-      <button class="btn" type="submit">Continue</button>
+      <button class="btn" type="submit">{{ "Save" if is_update else "Continue" }}</button>
     </form>
-    """, error=error, csrf=CSRF_FIELD.format(get_csrf()))
+    {% if is_update %}<p style="margin-top:12px"><a href="/cloud/dashboard">&larr; Back to dashboard</a></p>{% endif %}
+    """, error=error, csrf=CSRF_FIELD.format(get_csrf()), is_update=is_dashboard_update)
 
 
 @app.route("/cloud/signup/key/browser", methods=["GET", "POST"])
@@ -3837,8 +3852,16 @@ def signup_browser_key():
     Option B signup: the browser encrypts the API key with a customer-chosen
     passphrase using Web Crypto (PBKDF2 + AES-GCM) and posts only the
     ciphertext to this endpoint. We store it without ever seeing the plaintext.
+
+    Same dual-caller pattern as signup_server_key above — session["signup_customer_id"]
+    for fresh signups, session["customer_id"] for a dashboard-triggered
+    update/switch. The JS redirect target is templated based on which.
     """
     cid = session.get("signup_customer_id")
+    is_dashboard_update = False
+    if not cid:
+        cid = session.get("customer_id")
+        is_dashboard_update = True
     if not cid:
         return redirect(url_for("signup"))
 
@@ -3852,10 +3875,13 @@ def signup_browser_key():
         session["browser_key_stored"] = True
         return jsonify({"ok": True})
 
+    redirect_target = url_for("cloud_dashboard") if is_dashboard_update else url_for("signup_provision")
+
     return render_template_string(BASE_STYLE + """
-    <h1>Encrypt your key</h1>
+    <h1>{{ "Update your encrypted key" if is_update else "Encrypt your key" }}</h1>
     <p>Enter your API key and choose a passphrase. Your key is encrypted in your browser
-       before anything leaves this page — we never see it.</p>
+       before anything leaves this page — we never see it.
+       {% if is_update %}This replaces whatever key was previously stored.{% endif %}</p>
     <div id="form-area">
       <label>API key</label>
       <input type="password" id="api-key" placeholder="sk-ant-..." autocomplete="off">
@@ -3864,13 +3890,15 @@ def signup_browser_key():
       <label>Confirm passphrase</label>
       <input type="password" id="passphrase2" placeholder="Same passphrase again" autocomplete="new-password">
       <p class="error" id="err" style="display:none"></p>
-      <button class="btn" id="encrypt-btn">Encrypt and continue</button>
+      <button class="btn" id="encrypt-btn">{{ "Encrypt and save" if is_update else "Encrypt and continue" }}</button>
     </div>
     <div id="done" style="display:none">
       <p>Key encrypted. Redirecting…</p>
     </div>
+    {% if is_update %}<p style="margin-top:12px"><a href="/cloud/dashboard">&larr; Back to dashboard</a></p>{% endif %}
     <script>
     const CSRF = {{ csrf_value|tojson }};
+    const REDIRECT_TO = {{ redirect_target|tojson }};
 
     async function deriveKey(passphrase, salt) {
       const enc = new TextEncoder();
@@ -3908,14 +3936,14 @@ def signup_browser_key():
       if (body.ok) {
         document.getElementById("form-area").style.display = "none";
         document.getElementById("done").style.display      = "block";
-        setTimeout(() => window.location = "/cloud/signup/provision", 1200);
+        setTimeout(() => window.location = REDIRECT_TO, 1200);
       } else {
         err.style.display = "block";
         err.textContent   = body.error || "Something went wrong.";
       }
     });
     </script>
-    """, csrf_value=get_csrf())
+    """, csrf_value=get_csrf(), redirect_target=redirect_target, is_update=is_dashboard_update)
 
 
 @app.route("/cloud/signup/provision", methods=["GET", "POST"])
@@ -4116,6 +4144,25 @@ def cloud_dashboard():
     <h1>Your Curant</h1>
     <p class="muted">Your number: <strong>{{ customer.phone_number or "Being provisioned…" }}</strong></p>
     {% if message %}<p style="color:#1a7a1a">{{ message }}</p>{% endif %}
+
+    <h2>API key</h2>
+    <div style="padding:12px 0;border-bottom:1px solid #eee;margin-bottom:14px">
+      {% if customer.key_mode == 'server' %}
+      <p class="muted">Currently: <strong>we store it</strong> — encrypted on our server, answers every
+         message automatically including proactive check-ins.</p>
+      <a href="/cloud/signup/key/server" class="btn" style="display:inline-block;text-decoration:none;text-align:center;width:auto;padding:8px 16px">Update key</a>
+      <a href="/cloud/signup/key/browser" style="margin-left:10px;font-size:.85rem">Switch to browser-held instead &rarr;</a>
+      {% elif customer.key_mode == 'browser' %}
+      <p class="muted">Currently: <strong>you hold it</strong> — encrypted in your browser, we never see it.
+         You'll unlock with a text link once per session.</p>
+      <a href="/cloud/signup/key/browser" class="btn" style="display:inline-block;text-decoration:none;text-align:center;width:auto;padding:8px 16px">Update key</a>
+      <a href="/cloud/signup/key/server" style="margin-left:10px;font-size:.85rem">Switch to server-held instead &rarr;</a>
+      {% else %}
+      <p class="muted">No API key on file yet.</p>
+      <a href="/cloud/signup/key/server" class="btn" style="display:inline-block;text-decoration:none;text-align:center;width:auto;padding:8px 16px;margin-right:8px">We store it</a>
+      <a href="/cloud/signup/key/browser" class="btn" style="display:inline-block;text-decoration:none;text-align:center;width:auto;padding:8px 16px">You hold it</a>
+      {% endif %}
+    </div>
 
     <h2>Persona & instructions</h2>
     <form method="post">

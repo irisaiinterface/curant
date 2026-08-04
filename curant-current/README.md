@@ -925,10 +925,6 @@ trivial-vs-substantive examples).
   ~2 seconds per attempt at the chosen parameters) specifically to
   resist GPU/ASIC-accelerated brute-force far better than PBKDF2, whose
   cost is pure CPU time and parallelizes cheaply on dedicated hardware.
-- **Dashboard is now more out of date than before** — `curant-dashboard.html`
-  still assumes the server holds persona/instructions/API key and can
-  render/edit them centrally. None of that lives on the server anymore.
-  Worth a real conversation before building more on the current dashboard design.
 - **API key(s) are deliberately excluded from backup.** Losing the Mac
   still means re-entering whichever provider's key(s) were set, by
   hand, even after restoring a backup — treated keys as too sensitive

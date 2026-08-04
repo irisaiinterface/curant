@@ -364,6 +364,26 @@ signup now actually names real capabilities instead of a generic
 
 ## What's still missing before production
 
+- **Customer dashboard API key management** ✓ — resolved this pass.
+  `cloud_dashboard()` now shows a customer whether they're on Option A
+  (server-held) or Option B (browser-held), and lets them switch modes
+  or rotate their key at any time — previously `signup_server_key`/
+  `signup_browser_key` only worked once, during initial signup
+  (gated on `session["signup_customer_id"]`), with zero path to update
+  after. Both routes now also accept `session["customer_id"]` (an
+  already-active customer arriving from their dashboard) and redirect
+  back to the dashboard instead of on to provisioning — same
+  underlying Web Crypto/Fernet encryption logic either way, no
+  duplication.
+- **`curant-dashboard.html` (the standalone file in this folder) is NOT
+  a real, deployable dashboard.** It's a demo/mockup Artifact — uses
+  `window.storage` (an Artifacts-only API, not any real Curant
+  infrastructure) and calls the Anthropic API with no auth header at
+  all, a pattern that only works inside a Claude.ai Artifact viewer
+  (would 401 if actually opened as a plain HTML file). It predates
+  `cloud_dashboard()`, which is the real, working dashboard. Worth
+  deleting or clearly relabeling as a design-reference mockup only, so
+  it stops looking like it's the real thing.
 - **Rate limiting** ✓ — resolved. Was in-memory (a dict), which only ever
   rate-limited within a single process — meaningless once this runs
   behind multiple gunicorn workers, since each worker would silently
