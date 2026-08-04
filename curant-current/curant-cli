@@ -308,6 +308,14 @@ anything already covered by an existing memory.
 
 If an existing memory is now outdated or contradicted by the new exchange, mark it for removal.
 
+DEDUPLICATION — read this carefully: if a new fact is a rephrased, refined, more specific, \
+or otherwise near-duplicate version of an existing memory (not necessarily word-for-word \
+identical — e.g. "has a big presentation Tuesday" and "has a presentation this Tuesday" are \
+the SAME fact, differently worded), put the OLD memory's exact existing text in "remove" \
+and the new, better-phrased version in "add" — never leave both the old and new phrasing \
+stored at once. Only skip adding entirely if the new fact adds nothing beyond what the \
+existing memory already says.
+
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {"add": ["new memory 1", ...], "remove": ["exact text of outdated memory", ...]}
 
@@ -2587,6 +2595,17 @@ def update_memories_from_exchange(provider, api_key, existing_memories, user_mes
         for item in parsed.get("remove", []):
             delete_memory_by_content(item)
         for item in parsed.get("add", []):
+            # This exact-string check is a narrow safety net, NOT the
+            # real dedup mechanism — genuine near-duplicate detection
+            # ("has a presentation Tuesday" vs. "has a big presentation
+            # this Tuesday") needs semantic judgment a plain string
+            # comparison can't do, so that's handled by the model itself
+            # via MEMORY_EXTRACTION_PROMPT's explicit dedup instructions
+            # (it's told to pair a rephrased fact's "remove" of the old
+            # text with an "add" of the new one). This check only
+            # catches the trivial case where the model returns something
+            # already stored verbatim — cheap, harmless, worth keeping,
+            # just not sufficient on its own.
             if item and item not in existing_memories:
                 save_memory(item)
     except Exception as e:

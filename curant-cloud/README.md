@@ -381,9 +381,12 @@ signup now actually names real capabilities instead of a generic
   infrastructure) and calls the Anthropic API with no auth header at
   all, a pattern that only works inside a Claude.ai Artifact viewer
   (would 401 if actually opened as a plain HTML file). It predates
-  `cloud_dashboard()`, which is the real, working dashboard. Worth
-  deleting or clearly relabeling as a design-reference mockup only, so
-  it stops looking like it's the real thing.
+  `cloud_dashboard()`, which is the real, working dashboard. **Decision:
+  kept, not deleted** — its visual design (persona-card layout, the
+  "switchboard ticket" chat log motif) has real reference value for a
+  future real frontend. Now clearly marked as mockup-only with both an
+  HTML comment and a visible on-page banner, so it can't be mistaken
+  for something deployable again.
 - **Rate limiting** ✓ — resolved. Was in-memory (a dict), which only ever
   rate-limited within a single process — meaningless once this runs
   behind multiple gunicorn workers, since each worker would silently

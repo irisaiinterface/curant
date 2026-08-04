@@ -945,12 +945,29 @@ PERSONA_VOICE_IDS = {
     "aaron":   "pqHfZKP75CvOlQylNhV4",  # Bill — warm, grounded, matches a practical teaching-colleague tone
 }
 
-MEMORY_EXTRACTION_PROMPT = """You maintain long-term memory for a personal AI assistant.
-Given existing memories and the latest exchange, decide what (if anything)
-should be added or removed from memory. Only extract durable facts worth
-remembering long-term. Respond ONLY with JSON:
-{"add": ["..."], "remove": ["exact text of outdated memory", ...]}
-If nothing to change: {"add": [], "remove": []}"""
+MEMORY_EXTRACTION_PROMPT = """You maintain long-term memory for a personal AI assistant. \
+Given the existing memories about this person and their latest exchange, decide what \
+(if anything) should be added or removed from memory.
+
+Only extract durable facts worth remembering long-term: preferences, relationships, \
+ongoing projects, recurring commitments, important dates, things they've explicitly \
+told the assistant to remember. Do NOT extract one-off requests, small talk, or \
+anything already covered by an existing memory.
+
+If an existing memory is now outdated or contradicted by the new exchange, mark it for removal.
+
+DEDUPLICATION — read this carefully: if a new fact is a rephrased, refined, more specific, \
+or otherwise near-duplicate version of an existing memory (not necessarily word-for-word \
+identical — e.g. "has a big presentation Tuesday" and "has a presentation this Tuesday" are \
+the SAME fact, differently worded), put the OLD memory's exact existing text in "remove" \
+and the new, better-phrased version in "add" — never leave both the old and new phrasing \
+stored at once. Only skip adding entirely if the new fact adds nothing beyond what the \
+existing memory already says.
+
+Respond with ONLY a JSON object, no other text, in this exact shape:
+{"add": ["new memory 1", ...], "remove": ["exact text of outdated memory", ...]}
+
+If there's nothing to add or remove, respond with {"add": [], "remove": []}."""
 
 
 def build_system_prompt(customer: dict, memories: list, people: list, channel: str = "sms",
@@ -2292,6 +2309,11 @@ def extract_memories_async(customer_id: str, provider: str, api_key: str,
             for item in parsed.get("remove", []):
                 delete_memory(customer_id, item)
             for item in parsed.get("add", []):
+                # Narrow safety net, not the real dedup mechanism — see
+                # Home's identical comment on update_memories_from_exchange
+                # for the full reasoning. Real near-duplicate detection is
+                # the model's job via MEMORY_EXTRACTION_PROMPT's explicit
+                # dedup instructions; this only catches a verbatim repeat.
                 if item and item not in existing:
                     save_memory(customer_id, item)
         except Exception as e:
