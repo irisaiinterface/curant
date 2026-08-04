@@ -3150,6 +3150,49 @@ def release_phone_number(phone_sid: str):
     resp.raise_for_status()
 
 
+# Whether a Stripe portal cancellation should trigger the same
+# destructive, hard-to-undo cleanup that /cloud/cancel performs
+# (releasing the Telnyx number, deprovisioning the Workspace account).
+# Defaults to false — the safer default, since a webhook silently
+# performing irreversible steps without an explicit product decision is
+# worse than briefly leaving a canceled account's resources in place.
+# Set to "true" once you've actually decided this is the wanted
+# behavior; see the comment on webhook_stripe for how each path differs
+# if this stays false.
+CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES = os.environ.get(
+    "CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES", "false"
+).lower() == "true"
+
+
+def release_customer_resources(customer_id: str, customer: dict):
+    """
+    The actual destructive cleanup — releases the Telnyx number,
+    deprovisions the Workspace account, deactivates routing, clears the
+    customer row's resource fields. Extracted from cloud_cancel() so
+    webhook_stripe() can call the EXACT same logic when
+    CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES is enabled, rather than a
+    second, potentially-drifting copy of the same steps.
+    """
+    if customer.get("phone_sid"):
+        release_phone_number(customer["phone_sid"])
+    if customer.get("workspace_email"):
+        try:
+            deprovision_workspace_account(customer["workspace_email"])
+        except Exception as e:
+            print(f"Workspace deprovisioning failed for {customer_id} (non-fatal): {e}", file=sys.stderr)
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE phone_routing SET active=0 WHERE customer_id=?",
+            (customer_id,),
+        )
+        conn.execute(
+            "UPDATE customers SET phone_number=NULL, phone_sid=NULL, "
+            "workspace_email=NULL, workspace_user_id=NULL WHERE id=?",
+            (customer_id,),
+        )
+        conn.commit()
+
+
 def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str) -> bool:
     """
     Verify that an incoming webhook is genuinely from Telnyx, not
@@ -4086,50 +4129,47 @@ def webhook_stripe():
 
     update = billing.extract_subscription_update(event)
     if update and update.get("curant_customer_id"):
+        cid = update["curant_customer_id"]
         # 'canceled' stops Curant from answering texts/calls (mirrors the
         # existing `if not customer["active"]` gate in sms_webhook and the
         # voice path). 'active' re-enables it — covers both a resolved
         # past_due and a straight reactivation.
         #
-        # Deliberately NOT doing here: releasing the Telnyx number or
-        # deleting the customer's Workspace account. Those are the
-        # destructive, hard-to-undo steps /cloud/cancel already performs
-        # when the customer cancels through Curant's own UI. If they
-        # instead cancel directly from the Stripe portal, this webhook is
-        # the only place we'd hear about it — right now that leaves the
-        # phone number and data in place with the account just disabled,
-        # which is the safer default until you decide whether portal
-        # cancellations should trigger the same cleanup /cloud/cancel does.
+        # Whether to ALSO release the phone number/Workspace account on
+        # cancellation is now a real, configured decision rather than an
+        # unresolved question — see CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES
+        # above release_customer_resources. Default is false: cancelling
+        # through Curant's own UI (/cloud/cancel) always does the full
+        # cleanup immediately, since that's an explicit, confirmed
+        # customer action. Cancelling through Stripe's portal instead only
+        # disables the account by default — set the env var to true once
+        # you've decided a portal cancellation should behave identically.
         active_flag = 1 if update["status"] == "active" else (
             0 if update["status"] == "canceled" else None
         )
+
+        if update["status"] == "canceled" and CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES:
+            customer = get_customer(cid)
+            if customer:
+                try:
+                    release_customer_resources(cid, customer)
+                except Exception as e:
+                    print(f"Resource cleanup failed for {cid} on Stripe cancellation "
+                          f"(non-fatal, account still deactivated below): {e}", file=sys.stderr)
+
+        addons_json = json.dumps(update["unlocked_addons"]) if "unlocked_addons" in update else None
+
         with closing(get_db()) as conn:
+            set_clauses = ["stripe_customer_id=?", "stripe_subscription_id=?", "subscription_status=?"]
+            params = [update["stripe_customer_id"], update["stripe_subscription_id"], update["status"]]
             if active_flag is not None:
-                conn.execute(
-                    """UPDATE customers
-                       SET stripe_customer_id=?, stripe_subscription_id=?,
-                           subscription_status=?, active=?
-                       WHERE id=?""",
-                    (
-                        update["stripe_customer_id"],
-                        update["stripe_subscription_id"],
-                        update["status"],
-                        active_flag,
-                        update["curant_customer_id"],
-                    ),
-                )
-            else:
-                conn.execute(
-                    """UPDATE customers
-                       SET stripe_customer_id=?, stripe_subscription_id=?, subscription_status=?
-                       WHERE id=?""",
-                    (
-                        update["stripe_customer_id"],
-                        update["stripe_subscription_id"],
-                        update["status"],
-                        update["curant_customer_id"],
-                    ),
-                )
+                set_clauses.append("active=?")
+                params.append(active_flag)
+            if addons_json is not None:
+                set_clauses.append("unlocked_addons=?")
+                params.append(addons_json)
+            params.append(cid)
+            conn.execute(f"UPDATE customers SET {', '.join(set_clauses)} WHERE id=?", params)
             conn.commit()
         print(
             f"Stripe: customer {update['curant_customer_id']} subscription "
@@ -4485,30 +4525,9 @@ def cloud_cancel():
             error = "Session expired."
         elif request.form.get("confirm") == "yes":
             try:
-                # 1. Release the Telnyx number immediately
-                if customer.get("phone_sid"):
-                    release_phone_number(customer["phone_sid"])
-                # 2. Delete the Workspace utility account too — best-effort,
-                #    same reasoning as provisioning: shouldn't block
-                #    cancellation if this fails or was never configured.
-                if customer.get("workspace_email"):
-                    try:
-                        deprovision_workspace_account(customer["workspace_email"])
-                    except Exception as e:
-                        print(f"Workspace deprovisioning failed for {cid} (non-fatal): {e}", file=sys.stderr)
-                # 3. Delete/archive the routing entry at the same moment —
-                #    this is what prevents a reassigned number from routing
-                #    to a stale account.
+                release_customer_resources(cid, customer)
                 with closing(get_db()) as conn:
-                    conn.execute(
-                        "UPDATE phone_routing SET active=0 WHERE customer_id=?",
-                        (cid,),
-                    )
-                    conn.execute(
-                        "UPDATE customers SET active=0, phone_number=NULL, phone_sid=NULL, "
-                        "workspace_email=NULL, workspace_user_id=NULL WHERE id=?",
-                        (cid,),
-                    )
+                    conn.execute("UPDATE customers SET active=0 WHERE id=?", (cid,))
                     conn.commit()
                 session.pop("customer_id", None)
                 done = True

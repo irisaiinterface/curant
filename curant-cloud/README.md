@@ -390,19 +390,38 @@ subscription sync; kept as its own module rather than folded into
   "Manage billing" link; owner dashboard flags customers needing
   attention (`past_due`, `canceled`, or a DB/Stripe status mismatch)
 
-**Two real open items, not yet resolved:**
-1. **`ADDON_PRICE_MAP` needs actual add-on names/prices filled in** —
-   the flat-plan checkout works today; add-on billing doesn't yet.
-2. **Portal cancellations don't trigger the same cleanup `/cloud/cancel`
-   does.** Cancelling through Curant's own UI immediately releases the
-   Telnyx number and deprovisions the Workspace account. Cancelling
-   through Stripe's portal instead only disables the account
-   (`active=0`) via the webhook — the phone number and Workspace account
-   stay provisioned. This is the deliberately safer default (destructive,
-   hard-to-undo steps shouldn't fire from a webhook without a decision
-   about whether that's actually wanted), but it needs a real decision,
-   not just this default, before real customers can cancel through
-   either path with the same outcome.
+**Two real gaps from the initial merge — both closed this pass:**
+
+1. **`ADDON_PRICE_MAP` now uses real add-on identifiers** ✓ —
+   `browser_automation` and `august`, matching the only two add-ons
+   actually gated anywhere in the codebase
+   (`get_browser_automation_tools`/`get_august_tools`); the placeholder
+   keys (`grace_persona`, `extra_voice_minutes`) from the initial merge
+   didn't correspond to anything real. `setup_stripe_products.py` now
+   creates both as real Stripe Products/Prices.
+   **Still a placeholder, on purpose:** the actual dollar amounts
+   ($10/mo browser automation, $15/mo August) are founder-adjustable
+   defaults, not a business pricing decision made here — see the
+   module docstring.
+   **Also closed, and connected to this:** a real gap where paying for
+   an add-on via Stripe would never actually unlock it — `unlocked_addons`
+   was only ever read, never written by the billing flow. Now derived
+   fresh from the subscription's actual Stripe line items on every
+   `customer.subscription.updated` webhook event
+   (`billing._price_ids_to_addons`), so both adding AND removing an
+   add-on through the portal correctly flow through to the real feature
+   gate, with no separate "remove" logic needed.
+
+2. **Portal-vs-in-app cancellation behavior is now a real, configured
+   decision** ✓ — `CLOUD_PORTAL_CANCEL_RELEASES_RESOURCES` (env var,
+   defaults to `false`). Cancelling through Curant's own UI
+   (`/cloud/cancel`) always does full cleanup immediately (an explicit,
+   confirmed customer action). Cancelling through Stripe's portal only
+   disables the account by default — set this to `true` once you've
+   deliberately decided a portal cancellation should behave identically.
+   Both paths now call the exact same `release_customer_resources()`
+   function (extracted from `/cloud/cancel`'s previously-inline logic),
+   so there's no risk of the two cleanup paths drifting apart over time.
 
 ## What's still missing before production
 

@@ -50,18 +50,21 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 # Plan name -> Price ID. Add-on Prices aren't listed here since they're
 # looked up dynamically (customers pick add-ons in the dashboard, not at
-# initial signup) — see ADDON_PRICE_MAP below, filled in once you've
-# created the add-on Prices in Stripe and know their IDs.
+# initial signup) — see ADDON_PRICE_MAP below.
 PLAN_PRICE_MAP = {
     "cloud_base": PRICE_BASE,
     "cloud_executive": PRICE_EXECUTIVE,
 }
 
-# Fill in once add-on Prices exist in Stripe (see setup_stripe_products.py).
-# Keyed by the same add-on identifiers used in `customers.unlocked_addons`.
+# Keyed by the same add-on identifiers used in `customers.unlocked_addons`
+# and checked by get_browser_automation_tools/get_august_tools in app.py.
+# These are the only two add-ons actually gated in the current codebase —
+# see setup_stripe_products.py for how these Price IDs get created and
+# for the honest note that the actual dollar amounts are placeholders,
+# not a business decision made here.
 ADDON_PRICE_MAP = {
-    # "grace_persona": "price_xxx",
-    # "extra_voice_minutes": "price_xxx",
+    "browser_automation": os.environ.get("STRIPE_PRICE_BROWSER_AUTOMATION"),
+    "august": os.environ.get("STRIPE_PRICE_AUGUST"),
 }
 
 
@@ -129,19 +132,44 @@ def verify_webhook(payload, sig_header):
     return stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
 
 
+def _price_ids_to_addons(price_ids):
+    """Reverse lookup against ADDON_PRICE_MAP — turns a subscription's
+    actual Stripe line items into the add-on identifiers app.py's
+    feature gates (get_browser_automation_tools, get_august_tools)
+    actually check. Any price_id not found in ADDON_PRICE_MAP (e.g. the
+    base/executive plan Price itself) is silently ignored here, not an
+    error — this function's only job is finding add-ons among the line
+    items, not validating the whole subscription."""
+    reverse_map = {v: k for k, v in ADDON_PRICE_MAP.items() if v}
+    return [reverse_map[pid] for pid in price_ids if pid in reverse_map]
+
+
 def extract_subscription_update(event):
     """
     Pulls the (customer_id, stripe_customer_id, stripe_subscription_id,
-    status) tuple out of a Stripe event, for the handful of event types
-    that change a customer's subscription state. Returns None for event
-    types the caller doesn't need to act on — app.py's webhook route just
-    no-ops in that case rather than every event type needing its own
-    branch there.
+    status, unlocked_addons) tuple out of a Stripe event, for the
+    handful of event types that change a customer's subscription state.
+    Returns None for event types the caller doesn't need to act on —
+    app.py's webhook route just no-ops in that case rather than every
+    event type needing its own branch there.
+
+    unlocked_addons is DERIVED FRESH from the subscription's actual
+    current line items every time, not incrementally added to — this is
+    what makes both adding AND removing an add-on through the Stripe
+    portal work correctly with no separate 'remove' logic needed. It's
+    only present in the returned dict for event types that actually
+    carry a full Subscription object with line items
+    (customer.subscription.updated/deleted); checkout.session.completed
+    doesn't include them by default, but Stripe also fires a
+    subscription.updated event around the same time as a completed
+    checkout, which is what actually syncs add-on state in practice.
 
     Handled event types:
       checkout.session.completed   — new subscription just started
-      customer.subscription.updated — plan change, renewal, past_due, etc.
-      customer.subscription.deleted — cancellation took effect
+      customer.subscription.updated — plan change, renewal, past_due,
+                                       add-on added/removed, etc.
+      customer.subscription.deleted — cancellation took effect (add-ons
+                                       correctly come back empty here)
       invoice.payment_failed        — a renewal charge failed (customer
                                        stays active during Stripe's Smart
                                        Retries; only subscription.deleted
@@ -162,11 +190,14 @@ def extract_subscription_update(event):
     if event_type in ("customer.subscription.updated", "customer.subscription.deleted"):
         curant_customer_id = obj.get("metadata", {}).get("curant_customer_id")
         status = "canceled" if event_type == "customer.subscription.deleted" else obj.get("status")
+        items = obj.get("items", {}).get("data", [])
+        price_ids = [item.get("price", {}).get("id") for item in items]
         return {
             "curant_customer_id": curant_customer_id,
             "stripe_customer_id": obj.get("customer"),
             "stripe_subscription_id": obj.get("id"),
             "status": status,
+            "unlocked_addons": _price_ids_to_addons(price_ids),
         }
 
     if event_type == "invoice.payment_failed":
