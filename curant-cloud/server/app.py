@@ -1404,11 +1404,15 @@ def fill_and_submit_form(url: str, field_values: dict, submit_selector: str, con
         return None, f"Browser automation failed: {e}"
 
 
-# In-memory job tracking for the hybrid sync/async pattern — same shape
-# and same reasoning as _session_keys above (a single Cloud process is
-# the deployment target per docker-compose.yml; move to Redis if this
-# ever runs as multiple worker processes, same caveat already noted on
-# _check_rate before it was made DB-backed).
+# In-memory job tracking for the hybrid sync/async pattern. Unlike
+# _session_keys below, this IS safe for a multi-worker deployment as-is —
+# every read and write happens inside fill_and_submit_form_hybrid (which
+# creates the job) or the background thread it spawns via
+# threading.Thread, which always runs in the SAME process as its caller.
+# No other code path ever touches this dict, so there's no scenario
+# where a different worker needs to see it. (An earlier version of this
+# comment incorrectly grouped this with _session_keys as needing the
+# same fix — corrected after actually tracing every read/write site.)
 _browser_jobs: dict[str, dict] = {}
 _browser_jobs_lock = threading.Lock()
 
@@ -3132,6 +3136,31 @@ def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str)
 # ── Session key store (Option B in-memory unlock cache) ───────────────────────
 # Plain dict keyed by customer_id → (api_key, expires_at).
 # Daemon thread cleans it up; never written to disk.
+#
+# MULTI-WORKER REQUIREMENT, stated plainly: unlike _browser_jobs above,
+# this DOES need cross-request visibility — a customer unlocks via
+# /unlock/submit (could land on any worker), then a LATER, separate SMS
+# webhook request needs to read that same key back (could land on a
+# different worker). A plain in-memory dict only works if the SAME
+# worker handles both requests.
+#
+# The fix is deliberately NOT "move this to the database" — that would
+# genuinely fix the multi-worker bug, but at a real cost: this holds
+# DECRYPTED, PLAINTEXT API keys, and the entire point of Option B is
+# that the server never persists them anywhere durable, only holds them
+# briefly in memory, gone on restart. Writing them into SQLite (even the
+# SQLCipher-encrypted DB) would mean a compromised disk or backup could
+# expose plaintext keys that were specifically designed never to touch
+# disk at all — a real security regression, not just a bug fix.
+#
+# REQUIRED if this ever runs behind multiple gunicorn workers: configure
+# STICKY SESSIONS at the reverse proxy / load balancer (route a given
+# customer's requests to the same worker consistently — e.g. nginx's
+# ip_hash, or a cookie-based sticky directive). This preserves the
+# "never touches disk" property entirely, at the cost of being an infra
+# config requirement rather than something enforceable from inside this
+# file. A single-worker deployment (the default per docker-compose.yml
+# today) has no exposure to this at all.
 
 _session_keys: dict[str, tuple[str, float]] = {}
 _session_lock = threading.Lock()
@@ -3283,6 +3312,7 @@ def vapi_custom_llm(customer_id):
 
     provider = customer.get("api_provider", "anthropic")
     completion_id = f"chatcmpl-{secrets.token_hex(12)}"
+    reported_model = PROVIDER_MODELS.get(provider, PROVIDER_MODELS["anthropic"])
 
     if wants_stream:
         def sse_generate():
@@ -3291,14 +3321,14 @@ def vapi_custom_llm(customer_id):
                     chunk_payload = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
-                        "model": "claude-sonnet-4-6",
+                        "model": reported_model,
                         "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}],
                     }
                     yield f"data: {json.dumps(chunk_payload)}\n\n"
                 final_payload = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
-                    "model": "claude-sonnet-4-6",
+                    "model": reported_model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 }
                 yield f"data: {json.dumps(final_payload)}\n\n"
@@ -3322,7 +3352,7 @@ def vapi_custom_llm(customer_id):
     return jsonify({
         "id": completion_id,
         "object": "chat.completion",
-        "model": "claude-sonnet-4-6",
+        "model": reported_model,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": reply_text},
@@ -3422,16 +3452,20 @@ def vapi_webhook():
             model_block = {
                 "provider": "custom-llm",
                 "url": f"{CLOUD_PUBLIC_URL}/vapi-llm/{customer['id']}",
-                "model": "claude-sonnet-4-6",
+                "model": PROVIDER_MODELS.get(customer.get("api_provider", "anthropic"), PROVIDER_MODELS["anthropic"]),
                 "systemPrompt": system,
             }
         else:
             # No known customer to route a per-customer key to — falls
             # back to Vapi's own account-level key so an unrecognized
             # caller at least gets *a* response, rather than nothing.
+            # provider is genuinely fixed to "anthropic" here (Vapi's
+            # own dashboard key, not a per-customer choice), so this one
+            # correctly stays PROVIDER_MODELS["anthropic"] rather than
+            # depending on any customer field.
             model_block = {
                 "provider": "anthropic",
-                "model": "claude-sonnet-4-6",
+                "model": PROVIDER_MODELS["anthropic"],
                 "systemPrompt": system,
             }
 

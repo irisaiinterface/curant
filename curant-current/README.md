@@ -701,6 +701,59 @@ browser tools, a real behavior change from before, confirmed
 deliberately rather than assumed; August's own generation tools remain
 unaffected by any of this.
 
+## Local front-door layer — a small local model sitting in front of Claude
+
+A small local model (via [Ollama](https://ollama.com), running on the
+customer's own Mac) handles a few narrow, low-stakes jobs before
+anything reaches Claude's API. Claude stays the actual reasoning brain
+for everything that matters — this layer never replaces it, only sits
+in front of it.
+
+**What it does:**
+
+- **PII redaction** — SSNs and credit card numbers (Luhn-validated to
+  cut false positives) get masked out of the content sent to Claude,
+  so the raw value never leaves the device even in transit. Local
+  storage keeps the original, unredacted text — this protects what
+  crosses the network, not what's visible on the customer's own
+  machine. Deliberately covers only what can be detected with real
+  confidence — bank routing/account numbers are NOT covered, since a
+  bare 9-digit number has no reliable structural signature and a noisy
+  pattern would erode trust faster than it protects anything.
+- **Triviality short-circuit** — a quick "thanks" or "ok" gets a
+  local-generated reply instead of a full Claude call. Deliberately
+  conservative: any failure to classify (Ollama not running, an
+  ambiguous result) defaults to NOT trivial, so this can only ever
+  save a call, never silently downgrade a real request.
+- **Offline fallback** — if Claude's API is unreachable, this tries a
+  degraded local-model reply (explicitly flagged to the customer as
+  reduced-capability) instead of a hard failure with no answer at all.
+
+**Honest dependency, stated plainly:** this requires Ollama installed
+and running locally — it is NOT bundled with `curant-cli`, and nothing
+about this is a hard requirement. Every function in this layer
+(`is_local_model_available`, `_call_ollama`, and everything built on
+them) fails safe — returns `None`/`False` — if Ollama isn't running,
+rather than raising. A customer who never installs Ollama gets exactly
+the same behavior Curant had before this layer existed.
+
+**Setup, if you want it:**
+```
+brew install ollama
+ollama pull qwen3:8b
+ollama serve
+```
+Model name and host are both overridable via environment variables
+(`CURANT_LOCAL_MODEL`, `CURANT_OLLAMA_HOST`) if a different local model
+or a non-default Ollama port is preferred.
+
+**What's NOT built as part of this:** local answering of substantive
+questions (only genuinely trivial small talk gets a local-only reply —
+anything with real content still goes to Claude), and a proper
+regression-tested classification prompt (the current triviality
+classifier is a single prompt, not yet validated against a real set of
+trivial-vs-substantive examples).
+
 ## What's Still Missing (be aware before demoing)
 
 - **`QUOTE_PHONE_NUMBER` in `curant-cli` is still a placeholder.** The

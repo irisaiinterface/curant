@@ -391,10 +391,18 @@ signup now actually names real capabilities instead of a generic
 - **DB encryption at rest** ✓ — implemented with SQLCipher (AES-256). Set
   `CLOUD_DB_KEY` in your `.env` before storing any real customer data.
   See `.env.example` for the generate command.
-- **Browser automation job tracking** — the in-memory `_browser_jobs` dict
-  (and `_session_keys` for Option B unlock, same underlying pattern) only
-  works correctly on a single process. Fine for now; if this ever runs
-  behind multiple gunicorn workers, the same fix already applied to rate
-  limiting (move to the shared SQLite database, or Redis) needs to happen
-  here too — a form submission started on one worker won't be visible to
-  a poll that lands on a different worker.
+- **Option B session-key store needs sticky sessions in multi-worker
+  deployments** — `_session_keys` (the in-memory cache holding a
+  customer's decrypted API key for `SESSION_TTL_SECONDS` after they
+  unlock) only works correctly if the same worker handles both the
+  unlock request and the later SMS request that needs the key. Fix:
+  configure sticky sessions at the reverse proxy (e.g. nginx `ip_hash`),
+  not a code change — and deliberately NOT "move it to the database,"
+  since that would undo the whole point of Option B (the server never
+  persists a plaintext key anywhere durable). See the code comment
+  directly above `_session_keys` for the full reasoning. No exposure at
+  all in the current single-worker deployment.
+  (`_browser_jobs`, browser automation's job tracker, does NOT have this
+  problem — traced every read/write site and confirmed it's genuinely
+  process-local by construction, unlike an earlier version of this note
+  incorrectly claimed.)

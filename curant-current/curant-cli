@@ -3233,6 +3233,212 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
     return "\n\n".join(system_parts)
 
 
+# ── Local front-door layer ───────────────────────────────────────────────────
+# A small local model (via Ollama, running on the customer's own Mac)
+# sitting IN FRONT OF Claude, never instead of it — Claude stays the
+# actual reasoning brain for everything that matters. This layer only
+# handles a few narrow, low-stakes jobs before anything reaches the
+# network:
+#   1. PII redaction — sensitive-looking content (SSNs, credit card
+#      numbers) gets masked out of whatever's sent to Claude's API,
+#      so the raw value never leaves the device even in transit. Local
+#      storage (save_message, memory) keeps the ORIGINAL unredacted
+#      text — the point is protecting what crosses the network, not
+#      hiding anything from the customer's own machine.
+#   2. Triviality short-circuit — a quick "hey" or "thanks" gets a
+#      local-generated reply instead of spending a full Claude call on
+#      it. Deliberately conservative: any failure to classify (local
+#      model unavailable, ambiguous result) defaults to NOT trivial,
+#      so this can only ever save a call, never silently downgrade a
+#      real request.
+#   3. Offline fallback — if Claude's API is unreachable, this tries a
+#      degraded local-model reply (clearly flagged as reduced-capability)
+#      instead of a hard failure with no answer at all.
+#
+# HONEST DEPENDENCY, stated plainly: this requires Ollama
+# (https://ollama.com) installed and running locally — NOT bundled
+# with curant-cli itself. Every function below fails safe (returns
+# None / False) if Ollama isn't running, rather than raising — this
+# entire layer is an optimization and a privacy improvement, never a
+# hard requirement for Curant to work. A customer who never installs
+# Ollama gets the exact same behavior as before this layer existed.
+
+OLLAMA_HOST = os.environ.get("CURANT_OLLAMA_HOST", "http://localhost:11434")
+LOCAL_MODEL_NAME = os.environ.get("CURANT_LOCAL_MODEL", "qwen3:8b")
+LOCAL_MODEL_TIMEOUT_SECONDS = 8
+LOCAL_MODEL_HEALTH_CHECK_TIMEOUT_SECONDS = 1.5  # short — this is checked on every
+                                                   # message, shouldn't add latency
+                                                   # when Ollama simply isn't running
+
+
+def is_local_model_available():
+    """Fast health check — short timeout on purpose (see above). Never
+    raises; any failure (not installed, not running, wrong port) means
+    'not available', not an error."""
+    try:
+        import requests
+        resp = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=LOCAL_MODEL_HEALTH_CHECK_TIMEOUT_SECONDS)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _call_ollama(prompt, system="", timeout=LOCAL_MODEL_TIMEOUT_SECONDS):
+    """
+    Raw call to Ollama's local REST API. Returns the reply text, or
+    None on ANY failure — connection refused, timeout, malformed
+    response, model not pulled yet. Every caller in this section
+    treats None as 'local model unavailable right now' and falls back
+    accordingly; nothing here ever raises up to relay().
+    """
+    try:
+        import requests
+        resp = requests.post(
+            f"{OLLAMA_HOST}/api/chat",
+            json={
+                "model": LOCAL_MODEL_NAME,
+                "messages": ([{"role": "system", "content": system}] if system else [])
+                            + [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return (data.get("message") or {}).get("content", "").strip() or None
+    except Exception:
+        return None
+
+
+# ── PII redaction ────────────────────────────────────────────────────────────
+# Deterministic regex detection, not model-based judgment — same
+# principle as _is_sensitive_field's hard block on payment form fields
+# elsewhere in this file: a small local model's fuzzy judgment isn't
+# reliable enough to be the ONLY line of defense for something this
+# security-relevant, so this uses structural pattern matching instead.
+#
+# Deliberately covers only what can be detected with real confidence:
+# SSNs (clean XXX-XX-XXXX format) and credit card numbers (13-19
+# digits, Luhn-validated to cut false positives against arbitrary long
+# numbers). Bank routing/account numbers are NOT covered — a bare
+# 9-digit number has no reliable structural signature distinguishing it
+# from any other number, and a noisy pattern that redacts things that
+# aren't actually bank numbers would erode trust in this feature faster
+# than it protects anything. Better to cover two categories well than
+# five categories unreliably.
+
+SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+CREDIT_CARD_CANDIDATE_PATTERN = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+
+
+def _luhn_valid(digit_string):
+    digits = [int(d) for d in re.sub(r"[ -]", "", digit_string)]
+    checksum = 0
+    for i, digit in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+def redact_pii(text):
+    """
+    Returns (redacted_text, redaction_count). Only ever called on
+    content that's about to leave the device (the API-bound message
+    content and the memory-extraction input) — never applied to what's
+    saved to local storage, since the whole point is protecting what
+    crosses the network, not hiding anything from the customer's own
+    machine. Safe on empty/None input.
+    """
+    if not text:
+        return text, 0
+
+    count = 0
+    redacted = SSN_PATTERN.sub(lambda m: "[REDACTED_SSN]", text)
+    count += len(SSN_PATTERN.findall(text))
+
+    def _replace_card(match):
+        nonlocal count
+        candidate = match.group(0)
+        if not _luhn_valid(candidate):
+            return candidate  # fails Luhn check — not actually a valid card number, leave it alone
+        count += 1
+        return "[REDACTED_CARD_NUMBER]"
+
+    redacted = CREDIT_CARD_CANDIDATE_PATTERN.sub(_replace_card, redacted)
+    return redacted, count
+
+
+# ── Triviality short-circuit ─────────────────────────────────────────────────
+
+def classify_message_triviality(text):
+    """
+    Conservative by design: returns False (not trivial — use full
+    Claude reasoning) on any doubt at all. This can only ever save an
+    API call on a genuinely trivial message; it can never cause a real
+    request to get a degraded local-only answer, since a wrong "not
+    trivial" classification just means the normal path runs anyway.
+    """
+    if not text or not text.strip():
+        return False
+    if not is_local_model_available():
+        return False
+    result = _call_ollama(
+        prompt=f"Message: {text}",
+        system=(
+            "You classify a single incoming message to a personal AI secretary. "
+            "Reply with EXACTLY one word: TRIVIAL if this is just a greeting, "
+            "acknowledgment, thanks, or similar low-stakes small talk that needs only "
+            "a brief friendly reply — SUBSTANTIVE for anything that involves a real "
+            "question, task, request, or requires any actual thought. When genuinely "
+            "unsure, answer SUBSTANTIVE."
+        ),
+        timeout=4,  # this is meant to save time, not cost more of it — short budget
+    )
+    if result is None:
+        return False
+    return result.strip().upper().startswith("TRIVIAL")
+
+
+def generate_local_reply(text, persona_name="Curant"):
+    """
+    Only called after classify_message_triviality already returned
+    True, so the local model is confirmed available — but still handles
+    a None result gracefully (a race between the two calls, or Ollama
+    going down in between) rather than ever returning nothing.
+    """
+    reply = _call_ollama(
+        prompt=text,
+        system=(f"You are {persona_name}, a personal AI secretary. Reply briefly and "
+                f"warmly to this short, low-stakes message — a sentence or two at most."),
+    )
+    return reply or "Got it!"
+
+
+def generate_offline_reply(text, persona_name="Curant"):
+    """
+    Called only when the real Claude call already failed (see relay()).
+    Returns None if the local model ISN'T available either — in that
+    case relay() falls back to its original hard-failure behavior,
+    since there's genuinely nothing left to try.
+    """
+    if not is_local_model_available():
+        return None
+    return _call_ollama(
+        prompt=text,
+        system=(
+            f"You are {persona_name}, a personal AI secretary, currently running in a "
+            f"reduced OFFLINE mode because the main connection is unreachable. Be "
+            f"upfront about that — you may not have full context or your usual "
+            f"capabilities right now. Help as best you can with just what's in this "
+            f"message, and mention that full service will resume once the connection "
+            f"is back."
+        ),
+    )
+
+
 def relay(message_text, context="", image_path=None, apple_id=None):
     """
     Handle an incoming message entirely locally: verify entitlement (using
@@ -3271,6 +3477,23 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         print(json.dumps({"reply": None, "error": "inactive_or_invalid_license"}))
         sys.exit(1)
 
+    # Local front-door layer, step 1: triviality short-circuit. Only
+    # attempted for plain text (an image always deserves real reasoning
+    # to actually look at it) and only ever SAVES a Claude call — never
+    # skips one on uncertain ground, since classify_message_triviality
+    # defaults to False on any doubt at all.
+    if not image_path and classify_message_triviality(message_text):
+        local_reply = generate_local_reply(message_text, persona_name=config.get("persona", "Curant").title())
+        save_message("user", message_text, urgency="normal")
+        save_message("assistant", local_reply, provider="local")
+        print(json.dumps({
+            "reply": local_reply,
+            "reply_format": config.get("reply_format", "text"),
+            "voice_tier": config.get("voice_tier", "standard"),
+            "attachment_path": None,
+        }))
+        return
+
     memories = get_memories()
     people = get_important_people()
 
@@ -3301,10 +3524,23 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         is_first_message=is_first_message, urgency=urgency,
     )
 
+    # Local front-door layer, step 2: PII redaction. Applied ONLY to what
+    # actually leaves the device — the content sent to Claude below, and
+    # (further down) what's passed into memory extraction, which is
+    # itself a real API call and would otherwise defeat the point of
+    # redacting here at all. Local storage (save_message, a few lines
+    # down) deliberately keeps the ORIGINAL message_text — nothing about
+    # this feature is about hiding anything from the customer's own
+    # machine, only about what crosses the network.
+    redacted_message_text, pii_redaction_count = redact_pii(message_text)
+    if pii_redaction_count:
+        print(f"[front-door] redacted {pii_redaction_count} PII match(es) before sending to {provider}",
+              file=sys.stderr)
+
     if image_path:
-        user_content = build_image_message_content(provider, image_path, message_text)
+        user_content = build_image_message_content(provider, image_path, redacted_message_text)
     else:
-        user_content = message_text
+        user_content = redacted_message_text
     history.append({"role": "user", "content": user_content})
 
     # Tool support: log_capability_gap is always available; any
@@ -3321,9 +3557,24 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         else:
             reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=1000, tier="main")
     except Exception as e:
-        report_error("llm_call_failed", "curant-cli")
-        print(json.dumps({"reply": f"Couldn't reach {provider} on your account: {e}", "error": "llm_call_failed"}))
-        sys.exit(1)
+        # Local front-door layer, step 3: offline fallback. Only
+        # attempted after the real call has already failed — this never
+        # substitutes for Claude when Claude is actually reachable, it
+        # only fills the gap between "the connection is down" and
+        # "total silence." generate_offline_reply returns None if the
+        # local model isn't available either, in which case this falls
+        # through to the original hard-failure behavior unchanged.
+        offline_reply = generate_offline_reply(
+            redacted_message_text, persona_name=config.get("persona", "Curant").title()
+        )
+        if offline_reply:
+            reply_text = offline_reply
+            provider = "local_offline"
+            report_error("llm_call_failed", "curant-cli")  # still worth knowing the real call failed
+        else:
+            report_error("llm_call_failed", "curant-cli")
+            print(json.dumps({"reply": f"Couldn't reach {provider} on your account: {e}", "error": "llm_call_failed"}))
+            sys.exit(1)
 
     user_history_text = message_text if message_text else ("[sent an image]" if image_path else message_text)
     save_message("user", user_history_text, urgency=urgency)
@@ -3339,7 +3590,10 @@ def relay(message_text, context="", image_path=None, apple_id=None):
     # model); this process exits right after, so a background thread
     # would risk being killed before it finishes. A few hundred ms here
     # is an acceptable tradeoff for memory reliably actually happening.
-    update_memories_from_exchange(provider, api_key, memories, user_history_text, reply_text)
+    # Uses the REDACTED text, not user_history_text — this is a real API
+    # call too, and would otherwise leak whatever the front-door layer
+    # just redacted from the main conversation turn.
+    update_memories_from_exchange(provider, api_key, memories, redacted_message_text, reply_text)
 
     # Generated files sit encrypted on disk (see _save_generated_bytes) —
     # decrypt to a short-lived temp file only at the moment of actually
