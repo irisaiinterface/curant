@@ -345,7 +345,10 @@ Per customer, in `curant_cloud.db`:
 
 **Unlike Curant Home**, the Cloud server holds all of a customer's data — not their
 device. This makes you a data controller. The privacy policy needs to cover:
-- Encryption at rest (the DB file itself — not yet implemented, flagged below)
+- Encryption at rest ✓ — implemented (SQLCipher, AES-256; see `get_db()`'s
+  `PRAGMA key=` handling). This paragraph was stale — written before that
+  landed and never updated. See the "Rate limiting ✓" and "DB encryption
+  at rest ✓" entries further down for the actual verification notes.
 - Isolation between customers (each row is keyed by customer_id)
 - Retention and deletion on cancel (implemented: active=0, routing archived)
 
