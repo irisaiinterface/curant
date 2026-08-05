@@ -86,7 +86,7 @@ Full positioning work, including the "three tiers of noncustomers" analysis (who
 
 What exists instead, as a substitute signal at this stage:
 
-- **A genuinely complete, working product**, not a prototype — both tiers have real, tested integrations (Google Workspace, Telnyx, Vapi, Stripe, Playwright browser automation, FLUX/Ideogram/ElevenLabs/Veo generation), each verified against real infrastructure or real vendor documentation rather than assumed. This is unusual completeness for a pre-seed stage company — most of the technical risk in "can this actually be built" is already retired.
+- **A genuinely complete, working product**, not a prototype — built solo, in under 3 months, by a founder with a software engineering background. Both tiers have real, tested integrations (Google Workspace, Telnyx, Vapi, Stripe, Playwright browser automation, FLUX/Ideogram/ElevenLabs/Veo generation), each verified against real infrastructure or real vendor documentation rather than assumed. This is unusual completeness for a pre-seed stage company in this short a window — most of the technical risk in "can this actually be built" is already retired.
 - **Real, code-enforced safety properties**, not just described ones — the confirmation gate on consequential actions and the spend caps on metered generation are structural, not prompt-based, meaning they can't silently regress as the underlying model changes.
 - **A documented verification discipline** running through the entire build — every commit in this repo's history either confirms something against real infrastructure or flags explicitly where that wasn't yet possible. That discipline is itself a signal about execution quality, separate from the product's current market traction.
 
@@ -136,14 +136,20 @@ What exists instead, as a substitute signal at this stage:
 
 ## 11. Team
 
-*Not filled in — needs the founder's actual background, not a generated bio. A solo-founder narrative is a real, common pattern for pre-seed AI products, but investors will want the specific "why this founder, why now" case made directly, not inferred from commit history.*
+**Solo founder, software engineering background, building Curant for under 3 months as of this document.**
+
+The strongest evidence for the "why this founder" case is the repository itself, not a claimed résumé: in under three months, one person has shipped two genuinely distinct, working architectures (a fully local Mac client and a hosted multi-tenant server), each with real third-party integrations — Telnyx, Vapi, Stripe, Google Workspace, Playwright, four separate generation APIs — verified against live vendor documentation rather than assumed, plus code-enforced safety properties (the confirmation gate, the spend caps) that go beyond what most early-stage AI products bother building at all. For a solo, sub-3-month effort, that's an unusually high output-to-time ratio, and it's independently checkable by reading the commit history rather than taking a claim on faith.
+
+**Explicitly still needed, not filled in here:** specific prior work history, employer names, education, and any previously shipped products — none of that is known to whoever is drafting this document and shouldn't be fabricated. Add those details directly before this goes in front of an actual investor; execution speed alone won't answer every "why this founder" question a real diligence conversation will ask.
+
+**Solo-founder risk, named plainly rather than glossed over:** all current development, product, and business work depends on one person. Any real investor conversation should expect this to come up, and the honest answer is that it's a real, current constraint — not resolved by this document, and worth having a direct answer ready for (e.g., planned early hires, advisors, or how the raise itself changes this).
 
 ---
 
 ## Open items before this is presentation-ready
 
 1. **Legal entity and cap table status** — unconfirmed, needs a real answer before any equity conversation can proceed
-2. **Team section** — needs the founder's real bio/background
+2. **Team section** — partially filled in (solo founder, software engineering background, sub-3-month build timeline). Still needs: specific work history, employer names, education, and any previously shipped products — not fabricated here since they're not known
 3. **The equity ask itself** — amount, instrument, valuation/cap — needs a lawyer and a real decision, not a draft
 4. **Visual design** — this document is content only, not slide layout/design
 5. **A real demo** — a recorded video or live walkthrough would meaningfully strengthen §7, given there's no traction data to lean on otherwise
