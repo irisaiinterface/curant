@@ -87,13 +87,25 @@ Curant's creative/generation tier (image, video, voice narration) is normally me
 
 **Minimum backer pledge: $5.** Kept intentionally low — Curant has no physical goods to produce or ship, so there's no fulfillment-cost floor pushing this higher. $5 is a genuine, symbolic "count me in," not priced to extract a meaningful contribution on its own.
 
-Every backer at the $5 minimum (or above) gets, regardless of pledge size:
+Every backer at the $5 minimum gets, regardless of pledge size:
 
 - **Founding Backer credit** — acknowledged as an early supporter (exact placement — campaign page, in-product, etc. — TBD)
-- **50% off August, Curant's creative/generation add-on, for as long as they stay subscribed to Curant Cloud.** Not stretch-gated — this applies simply for backing, at any pledge level.
+- **50% off August, Curant's creative/generation add-on, for as long as they stay subscribed to Curant Cloud.** Flat — not scaled by pledge size, not stretch-gated. Applies simply for backing, at any level.
 - **Free subscription months, IF the corresponding stretch goal is reached** — 2 months at $6,500, 3 months at $8,500 (not additive; the $8,500 tier's 3 months replaces the $6,500 tier's 2, it isn't 2+3=5)
 
-*No separate higher-dollar reward tiers beyond the $5 minimum are defined yet — every backer gets the same rewards regardless of pledge size above that floor. If a scaled structure (e.g., a higher tier for a lifetime discount or a name-in-credits placement) is wanted, that's still open — see below.*
+**On top of that, the bigger the pledge, the bigger a discount on Curant's fixed prices** (Base, Executive, and the Browser Automation add-on — everything except August, which already has its own flat 50% off above). **Lasts 6 months from when Cloud launches**, then reverts to standard pricing.
+
+| Pledge | Discount on fixed prices | Base ($29) becomes | Executive ($149) becomes | Browser Automation ($10) becomes |
+|---|---|---|---|---|
+| $5 (minimum) | 5% off | $27.55 | $141.55 | $9.50 |
+| $25 | 10% off | $26.10 | $134.10 | $9.00 |
+| $50 | 15% off | $24.65 | $126.65 | $8.50 |
+| $100 | 20% off | $23.20 | $119.20 | $8.00 |
+| $250+ | 25% off | $21.75 | $111.75 | $7.50 |
+
+*Wording note for the actual campaign page: avoid the word "invest" anywhere near this reward — Kickstarter is reward-based crowdfunding, and language that reads like a return-on-investment promise (rather than a discount reward for backing) risks the campaign getting flagged. "Back at this level to get X% off" is the safe framing; "the more you invest, the more you save" is not.*
+
+*Why 6 months and not longer: the highest cash-flow uncertainty window is the first stretch after Cloud actually launches — locking in reduced margin for a full year during exactly that window is a bigger commitment than the reward needs to make to feel generous. 6 months is real, meaningful savings for a backer while reverting to standard pricing around when there's actually enough usage data to know what's sustainable at scale.*
 
 ---
 
@@ -130,7 +142,7 @@ Curant isn't an app you open — it's a phone number you call or text, with a co
 
 These need real decisions/inputs from you before this is launch-ready:
 
-1. **Reward tiers** ✓ — defined (see "Reward Tiers" section above): $5 minimum pledge, 50% off August for all backers regardless of pledge size, stretch-gated free months (2 at $6,500, 3 at $8,500). One sub-question still open: whether to add a scaled higher-dollar tier (e.g., a bigger discount or different perk for a larger pledge) on top of the flat $5-minimum structure, or keep every backer's reward identical regardless of pledge size above the floor.
+1. **Reward tiers** ✓ — fully defined (see "Reward Tiers" section above): $5 minimum pledge, a scaled discount on fixed prices (5%-25% depending on pledge size, lasting 6 months post-launch), 50% off August flat for all backers regardless of pledge size, and stretch-gated free months (2 at $6,500, 3 at $8,500).
 2. **Campaign visuals/video** — not covered by this doc.
 3. **Privacy Policy FAQ answer** — currently a placeholder; fill in once drafted, don't publish speculative claims about data handling.
 4. **Risks section voice** — draft above is a starting structure; personalize before publishing.
