@@ -38,7 +38,21 @@ Most AI products today assume you'll open an app and type. Curant doesn't compet
 - **AI inference is a $0 cost to the business at every tier.** Every AI call — the core persona reasoning, and August's image/voice/video generation — is bring-your-own-key. This is the single fact that makes Cloud's margins what they are: **~76% on Base, ~85% on Executive**, since the business's actual per-customer cost is just infrastructure (Telnyx number, SMS/voice usage, Workspace seat, Stripe processing), not compute.
 - **Billing is real and live**, not a manual process: Stripe Checkout for subscriptions, a Stripe-hosted Customer Portal for self-service plan changes/cancellation, webhook-driven subscription state (the webhook, not the browser redirect, is the source of truth — closes an obvious "skip payment by visiting the success URL" gap).
 - Full unit economics, itemized: `reference-documents/CostCalculator.jsx` (interactive) and `reference-documents/Curant_Summary.docx`.
-- A Kickstarter campaign to fund Cloud's launch readiness (legal/compliance costs specifically, not inference or development) is drafted at `reference-documents/Kickstarter_Campaign_Copy.md` — not yet published.
+
+---
+
+## Fundraising Materials
+
+Two separate documents, for two separate instruments — kept deliberately distinct rather than conflated, since they're regulated differently and promise backers/investors different things:
+
+| | **Kickstarter** | **Equity Investors** |
+|---|---|---|
+| **Document** | `reference-documents/Kickstarter_Campaign_Copy.md` | `reference-documents/Investor_Pitch_Materials.md` |
+| **What it is** | Reward-based, non-dilutive campaign copy — pledge, get a discount/perk in return | Pitch deck content — market sizing, unit economics, the case for an equity stake |
+| **Funds** | Cloud's specific launch-readiness costs (legal/compliance, not inference or dev) | Not yet defined — no equity ask has actually been finalized (see below) |
+| **Status** | Drafted, not yet published — reward tiers finalized, visuals/video and the founder's own risk-section voice still needed | Content drafted; explicitly missing a formed legal entity/cap table confirmation, a real founder bio, and actual round terms (a lawyer's job, not a draft) |
+
+**Not to be mixed in messaging:** the Kickstarter campaign specifically avoids "invest" language (a wording choice, not a mechanic problem — see the note in that doc) since Kickstarter is reward-based crowdfunding, a different regulatory regime than equity. If both are ever promoted together, keep the asks — and the audiences — visibly separate.
 
 ---
 
