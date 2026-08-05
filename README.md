@@ -108,3 +108,4 @@ Split honestly into two categories — what's buildable but simply hasn't been p
   - `Curant_Job_Specific_Skills_Tools.docx` — job-specific skills and verified real tools mapped to each persona
   - `CostCalculator.jsx` — interactive Cloud economics calculator (open as a React artifact)
   - `Kickstarter_Campaign_Copy.md` — draft campaign copy, several sections explicitly marked as placeholders pending real decisions
+  - `Investor_Pitch_Materials.md` — pitch deck content (not slide design), sourced market sizing, unit economics, and illustrative financial projections for an equity raise — explicitly separate from the Kickstarter, which is reward-based, and honest about what's still needed (legal entity confirmation, team bios, an actual equity ask)
