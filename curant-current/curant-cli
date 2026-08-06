@@ -48,6 +48,45 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LOCAL_DB_PATH = os.path.join(CONFIG_DIR, "local.db")
 SERVER_BASE = "https://api.curant.app"  # placeholder — real endpoint once server is deployed
 
+# --- Dean's shell access ---------------------------------------------------
+# Home-only, Dean-only, by deliberate scoping decision (Aug 2026): Cloud's
+# multi-tenant architecture already treats arbitrary command execution as
+# categorically unsafe (see the "no stdio on Cloud" reasoning next to
+# KNOWN_MCP_SERVICES in app.py) — Home is a single customer's own Mac mini,
+# the same "their own machine, their own blast radius" reasoning that
+# already lets Home spawn MCP stdio subprocesses. Every other persona
+# doesn't get this at all — their whole job is talking to a customer by
+# voice/text, a much larger prompt-injection attack surface than Dean's
+# developer-facing use case.
+#
+# Three safety modes, customer's own choice (never Curant's default
+# imposed silently) — see set_shell_safety_mode below, which is how Dean
+# is instructed to actually offer this rather than assuming:
+#   "confirm"    (default) — every command needs explicit customer
+#                 confirmation first, same pattern as fill_and_submit_form.
+#   "allowlist"  — only a fixed set of read-only/low-risk commands run,
+#                 no confirmation needed for those; anything else refused.
+#   "autonomous" — no per-command confirmation at all. Closest to how
+#                 Claude Code/the Agent SDK actually work, but Dean-scoped
+#                 rather than using the full Agent SDK — see the module
+#                 note above DEAN_SHELL_WORKSPACE for why.
+DEAN_SHELL_SAFETY_MODES = ("confirm", "allowlist", "autonomous")
+DEAN_SHELL_DEFAULT_SAFETY_MODE = "confirm"
+DEAN_SHELL_WORKSPACE = os.path.join(CONFIG_DIR, "dean_shell_workspace")
+DEAN_SHELL_TIMEOUT_SECONDS = 90
+DEAN_SHELL_OUTPUT_MAX_CHARS = 4000
+# Deliberately small and read-oriented — this is "safe enough to skip
+# confirmation," not "everything a dev might reasonably want." Anything
+# that writes, installs, or touches network/git remotes stays out of this
+# list on purpose, even common ones like `git commit` or `npm install`.
+DEAN_SHELL_ALLOWLIST = {
+    "ls", "pwd", "cat", "head", "tail", "wc", "echo", "date", "whoami",
+    "git status", "git log", "git diff", "git branch", "git show",
+    "npm test", "npm run build", "npm list",
+    "python3 -m pytest", "python -m pytest",
+    "node --version", "python3 --version", "python --version",
+}
+
 STATUS_RECHECK_SECONDS = 12 * 60 * 60  # re-verify with the server at most every 12h;
                                          # use the last cached result in between so a
                                          # brief server/network outage doesn't stop
@@ -163,7 +202,15 @@ PERSONAS = {
             "workflow vs. Jira's depth for complex/enterprise processes), Docker, CI/CD, Slack, Figma, "
             "Sentry. Concrete things you're good at: drafting PR descriptions, writing technical specs/RFCs, "
             "turning a vague bug report into a properly-scoped ticket, drafting incident postmortems, and "
-            "explaining an error log in plain terms without dumbing down the actual technical content.",
+            "explaining an error log in plain terms without dumbing down the actual technical content. "
+            "You have real shell access on this Mac (shell_exec), scoped to your own sandboxed working "
+            "directory, not the customer's whole filesystem. The FIRST time shell access would actually "
+            "be useful in a conversation, ask the customer directly which safety mode they want it to run "
+            "in — 'confirm' (you ask before every command, the default), 'allowlist' (a small set of "
+            "read-only commands run without asking), or 'autonomous' (no confirmation at all) — explain "
+            "the tradeoff plainly, then call set_shell_safety_mode with whatever they actually pick. Never "
+            "switch to a looser mode on your own judgment just because it would be more convenient — that's "
+            "the customer's call, not yours, every time.",
     "nora": "You are Nora, an advisor-style AI Secretary — thoughtful, asks a clarifying question before "
             "acting. Personality basis: INFJ-leaning (Advocate) — deliberately cautious before committing "
             "to a course of action, reads underlying needs rather than just the literal request. "
@@ -1342,6 +1389,49 @@ def get_all_available_tools(config):
             "server_command": None, "raw_name": "list_grading_assignments", "builtin": True,
         })
 
+    # Dean's shell access — see the module comment above DEAN_SHELL_SAFETY_MODES
+    # for the full scoping (Home-only, Dean-only, customer's own safety-mode
+    # choice). Gated purely on persona, no addon/unlock needed — unlike
+    # August's generation tools, this isn't a paid add-on, just a
+    # capability restricted to the one persona it's actually relevant to.
+    if config.get("persona") == "dean":
+        current_mode = get_shell_safety_mode(config)
+        tools.append({
+            "qualified_name": "shell_exec",
+            "description": (
+                f"Run a shell command in Dean's own sandboxed workspace directory on this Mac "
+                f"(not the customer's whole filesystem). Current safety mode: '{current_mode}'. "
+                f"In 'confirm' mode (the default), this needs confirmed=true AFTER the customer "
+                f"has explicitly approved the exact command in a prior reply — always show them "
+                f"the exact command first. In 'allowlist' mode, only a small set of read-only "
+                f"commands (ls, git status, npm test, etc.) run without asking. In 'autonomous' "
+                f"mode, commands run immediately with no confirmation — use good judgment "
+                f"regardless of mode; this is real shell access on a real machine."
+            ),
+            "input_schema": {"type": "object", "properties": {
+                "command": {"type": "string", "description": "The exact shell command to run"},
+                "cwd": {"type": "string", "description": "Optional subdirectory of Dean's shell workspace to run in"},
+                "confirmed": {"type": "boolean", "description": "Only meaningful in 'confirm' mode — must be true and only after real customer confirmation"}},
+                "required": ["command"]},
+            "server_command": None, "raw_name": "shell_exec", "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "set_shell_safety_mode",
+            "description": (
+                "Sets how much confirmation shell_exec needs going forward: 'confirm' (ask "
+                "every time, the default), 'allowlist' (only pre-approved read-only commands "
+                "run without asking), or 'autonomous' (no confirmation at all). IMPORTANT: only "
+                "call this after actually asking the customer which mode they want and getting "
+                "a clear answer — never default to a looser mode on your own judgment just "
+                "because it would be more convenient. If they haven't been asked yet and shell "
+                "access is coming up, ask them now, in plain terms, before using shell_exec at all."
+            ),
+            "input_schema": {"type": "object", "properties": {
+                "mode": {"type": "string", "enum": list(DEAN_SHELL_SAFETY_MODES)}},
+                "required": ["mode"]},
+            "server_command": None, "raw_name": "set_shell_safety_mode", "builtin": True,
+        })
+
     return tools
 
 
@@ -2180,6 +2270,90 @@ def browse_page(url):
         return None, f"Could not load that page: {e}"
 
 
+def get_shell_safety_mode(config):
+    mode = config.get("shell_safety_mode")
+    return mode if mode in DEAN_SHELL_SAFETY_MODES else DEAN_SHELL_DEFAULT_SAFETY_MODE
+
+
+def set_shell_safety_mode(mode):
+    """Called either from the CLI (set-shell-mode) or by Dean himself via
+    the set_shell_safety_mode tool, once he's actually asked the customer
+    which mode they want — see the tool's description in
+    get_all_available_tools for why this is asked rather than assumed."""
+    if mode not in DEAN_SHELL_SAFETY_MODES:
+        return False, f"Not a valid mode — must be one of: {', '.join(DEAN_SHELL_SAFETY_MODES)}."
+    config = load_config()
+    config["shell_safety_mode"] = mode
+    save_config(config)
+    return True, f"Shell safety mode set to '{mode}'."
+
+
+def _shell_command_is_allowlisted(command: str) -> bool:
+    """Exact-prefix match against DEAN_SHELL_ALLOWLIST — deliberately
+    strict rather than trying to parse/allow arbitrary flag combinations,
+    since a cleverer matcher is exactly the kind of thing that ends up
+    with an exploitable gap. `git status -s` is allowed (starts with an
+    allowlisted entry); `git status; rm -rf /` is not, because the
+    semicolon means the command as a whole isn't a prefix match at all —
+    shell metacharacters break the match rather than sneaking past it."""
+    command = command.strip()
+    return any(command == entry or command.startswith(entry + " ") for entry in DEAN_SHELL_ALLOWLIST)
+
+
+def shell_exec(command: str, cwd: str | None, confirmed: bool, config: dict) -> tuple[str | None, str | None]:
+    """
+    Dean's real shell-access action — see the module comment above
+    DEAN_SHELL_SAFETY_MODES for the full scoping reasoning (Home-only,
+    Dean-only, customer's own choice of safety mode). Runs inside
+    DEAN_SHELL_WORKSPACE (created on first use) or a subdirectory of it —
+    `cwd` can't escape that root, checked below, so this can't be used to
+    run something against an arbitrary path elsewhere on the customer's
+    machine even in "autonomous" mode.
+
+    Returns (output, error) — output includes the exit code and combined
+    stdout/stderr (truncated), error is set only when the command didn't
+    run at all (blocked by safety mode, or a real subprocess failure).
+    """
+    os.makedirs(DEAN_SHELL_WORKSPACE, exist_ok=True)
+
+    mode = get_shell_safety_mode(config)
+    if mode == "confirm" and not confirmed:
+        return None, (
+            f"Not run — this action requires explicit customer confirmation first. The exact "
+            f"command that would run is: `{command}`. Ask the customer to confirm, wait for "
+            f"their reply, then call this again with confirmed=true."
+        )
+    if mode == "allowlist" and not _shell_command_is_allowlisted(command):
+        return None, (
+            f"Not run — shell safety mode is 'allowlist', and `{command}` isn't one of the "
+            f"pre-approved read-only commands. Ask the customer to either approve switching to "
+            f"'confirm' or 'autonomous' mode (via set_shell_safety_mode) or run this themselves."
+        )
+
+    run_dir = DEAN_SHELL_WORKSPACE
+    if cwd:
+        candidate = os.path.realpath(os.path.join(DEAN_SHELL_WORKSPACE, cwd))
+        if not candidate.startswith(os.path.realpath(DEAN_SHELL_WORKSPACE)):
+            return None, "Not run — that working directory would escape Dean's shell workspace."
+        run_dir = candidate
+        os.makedirs(run_dir, exist_ok=True)
+
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=run_dir, capture_output=True, text=True,
+            timeout=DEAN_SHELL_TIMEOUT_SECONDS,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        truncated = output[:DEAN_SHELL_OUTPUT_MAX_CHARS]
+        if len(output) > DEAN_SHELL_OUTPUT_MAX_CHARS:
+            truncated += "\n[...output truncated...]"
+        return f"[exit code {result.returncode}]\n{truncated}", None
+    except subprocess.TimeoutExpired:
+        return None, f"Command timed out after {DEAN_SHELL_TIMEOUT_SECONDS} seconds and was killed."
+    except Exception as e:
+        return None, f"Command failed to run: {e}"
+
+
 def fill_and_submit_form(url, field_values, submit_selector, confirmed=False):
     """
     The real external-effect action. `confirmed` is now checked here in
@@ -2322,6 +2496,20 @@ def execute_tool_call(tool_name, arguments, available_tools):
         if not description:
             return "[No description provided — nothing was logged.]"
         return log_capability_gap(description)
+
+    if match["builtin"] and tool_name == "shell_exec":
+        config = load_config()
+        output, error = shell_exec(
+            arguments.get("command", ""),
+            arguments.get("cwd"),
+            arguments.get("confirmed", False),
+            config,
+        )
+        return error if error else output
+
+    if match["builtin"] and tool_name == "set_shell_safety_mode":
+        ok, msg = set_shell_safety_mode(arguments.get("mode", ""))
+        return msg
 
     if match["builtin"] and tool_name in (
         "generate_image", "generate_image_with_text", "generate_voice", "edit_media"
@@ -4729,6 +4917,10 @@ def main():
     p_spend_cap.add_argument("amount", nargs="?", default=None,
                               help="Dollar amount, e.g. '25' or '25.00'. Use 'none' to remove the cap entirely. Omit to just view the current cap and this month's spend.")
 
+    p_shell_mode = sub.add_parser("set-shell-mode", help="Set (or view) how much confirmation Dean's shell access needs before running a command")
+    p_shell_mode.add_argument("mode", nargs="?", default=None, choices=list(DEAN_SHELL_SAFETY_MODES),
+                               help="'confirm' (ask every time, default), 'allowlist' (pre-approved read-only commands only), or 'autonomous' (no confirmation). Omit to just view the current mode.")
+
     p_routing_rules = sub.add_parser("routing-rules", help="Show (or remove) standing rules for which AI handles which kind of task")
     p_routing_rules.add_argument("--remove", default=None, metavar="CATEGORY", help="Remove the standing rule for this category")
 
@@ -4830,6 +5022,12 @@ def main():
         status()
     elif args.command == "set-spend-cap":
         set_spend_cap_cmd(args.amount)
+    elif args.command == "set-shell-mode":
+        if args.mode is None:
+            print(f"Current shell safety mode: {get_shell_safety_mode(load_config())}")
+        else:
+            ok, msg = set_shell_safety_mode(args.mode)
+            print(msg)
     elif args.command == "routing-rules":
         routing_rules_cmd(remove=args.remove)
     elif args.command == "routing-log":
