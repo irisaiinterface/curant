@@ -12,17 +12,17 @@
 |---|---------|----------|--------|
 | 1 | Customer login requires only an email address — no password | **Critical** | **FIXED** — SMS code |
 | 2 | Shell allowlist trivially bypassed → arbitrary command execution | **Critical** | **FIXED** |
-| 3 | Shell "sandbox" does not contain anything | **Critical** | **Partly fixed** — allowlist mode contained; wording corrected; OS containment still open |
+| 3 | Shell "sandbox" does not contain anything | **Critical** | **FIXED** — macOS sandbox-exec containment added (untested on real hardware); wording corrected |
 | 4 | Vapi webhook unauthenticated → memory disclosure + poisoning | **High** | **FIXED** |
 | 5 | `/vapi-llm/<customer_id>` unauthenticated → API-key abuse | **High** | **FIXED** |
 | 6 | Telnyx signature verification fails **open** | **High** | **FIXED** — fails closed |
 | 7 | OAuth callbacks not bound to session → account-linking CSRF | **High** | **FIXED** |
-| 8 | Indirect prompt injection reaches consequential tools | **High** | Partly mitigated — open |
+| 8 | Indirect prompt injection reaches consequential tools | **High** | Mitigated — tool description warns explicitly; shell now contained + network-denied. Inherent to the pattern; not "solved" |
 | 9 | No replay protection on Telnyx webhooks | Medium | **FIXED** — 5-min window |
-| 10 | `browse_page` has no SSRF protection | Medium | Open |
-| 11 | `FLASK_DEBUG` env var can enable Werkzeug debugger (RCE) | Medium | Open |
-| 12 | Rate limiting keyed on spoofable `remote_addr` | Low | Open |
-| 13 | Sensitive-field blocklist has real gaps | Low | Open |
+| 10 | `browse_page` has no SSRF protection | Medium | **FIXED** — scheme + resolved-IP checks, enforced on redirects/subresources too |
+| 11 | `FLASK_DEBUG` env var can enable Werkzeug debugger (RCE) | Medium | **FIXED** — also requires CURANT_DEV_MODE |
+| 12 | Rate limiting keyed on spoofable `remote_addr` | Low | **FIXED** — TRUSTED_PROXY_COUNT-aware `client_ip()` |
+| 13 | Sensitive-field blocklist has real gaps | Low | **FIXED** — IBAN/SWIFT, passport, tax ID, DOB, credentials added |
 | 14 | OAuth exception text returned to the browser | Low | **FIXED** |
 
 ### Also found during remediation (not in the original 14)

@@ -32,6 +32,9 @@ import argparse
 import asyncio
 import json
 import re
+import socket
+import ipaddress
+from urllib.parse import urlparse
 import os
 import sys
 import tempfile
@@ -104,6 +107,87 @@ DEAN_SHELL_ALLOWLIST = {
 # approves the exact string, and in "autonomous", which is unrestricted
 # by the customer's own explicit choice.
 SHELL_METACHARACTERS = (";", "&", "|", "`", "$", ">", "<", "\n", "\r", "(", ")")
+
+# ── OS-level containment for shell_exec (macOS) ──────────────────────────────
+# The Aug 2026 audit's finding #3 was that the "sandbox" was only a working
+# directory: in confirm/autonomous mode a command could still write anywhere
+# and read anything, including ~/.ssh and the customer's own API key in
+# ~/.curant/config.json. Confirmation is a real control, but it is procedural
+# — it depends on a person reading carefully — and it is the only thing that
+# was standing between an injected instruction and the filesystem.
+#
+# This adds a structural control underneath it, using macOS's own sandbox-exec
+# (SBPL). Home is a Mac product, so this covers the deployed platform. The
+# profile is permissive by default and subtractive, because a deny-by-default
+# profile breaks ordinary dev commands (they need to read interpreters,
+# libraries, and caches all over the filesystem):
+#   - all writes denied except the workspace and the usual temp/null devices
+#   - reads denied on the specific things worth stealing: SSH/AWS/GCP creds,
+#     Keychains, browser profiles, shell history, and Curant's own config
+#   - outbound network denied outright (a shell command has no reason to
+#     exfiltrate, and this is the cheapest place to stop it)
+#
+# HONEST LIMITATION: sandbox-exec is deprecated by Apple (still functional,
+# and still what powers the sandbox other tools rely on) and this profile has
+# NOT been exercised on a real macOS machine from this build environment,
+# which is Linux. It is therefore applied defensively: _sandbox_wrap() runs a
+# trivial self-test first and, if the sandbox is unavailable or the profile
+# is rejected, the command still runs but the result is prefixed with a
+# visible warning rather than silently pretending containment applied. Verify
+# on a real Mac before relying on it.
+DEAN_SHELL_SANDBOX_DENIED_READS = (
+    "~/.ssh", "~/.aws", "~/.config/gcloud", "~/.gnupg", "~/.curant",
+    "~/Library/Keychains", "~/Library/Application Support/Google/Chrome",
+    "~/Library/Application Support/Firefox", "~/Library/Cookies",
+    "~/.bash_history", "~/.zsh_history", "~/.netrc",
+)
+
+
+def _build_sandbox_profile(workspace: str) -> str:
+    """SBPL profile text. Paths are subpath-literals, so a denied entry covers
+    everything beneath it."""
+    denied = "\n".join(
+        f'    (subpath "{os.path.expanduser(d)}")' for d in DEAN_SHELL_SANDBOX_DENIED_READS
+    )
+    return f"""(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+    (subpath "{workspace}")
+    (subpath "/private/tmp")
+    (subpath "/private/var/tmp")
+    (literal "/dev/null")
+    (literal "/dev/stdout")
+    (literal "/dev/stderr"))
+(deny file-read*
+{denied})
+(deny network-outbound)
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+"""
+
+
+_sandbox_state = {"checked": False, "ok": False}
+
+
+def _sandbox_available(workspace: str) -> bool:
+    """One-time self-test: does sandbox-exec exist, and does this profile
+    actually load? Cached — this shells out, and shell_exec may be called
+    repeatedly in a conversation."""
+    if _sandbox_state["checked"]:
+        return _sandbox_state["ok"]
+    _sandbox_state["checked"] = True
+    if sys.platform != "darwin":
+        _sandbox_state["ok"] = False
+        return False
+    try:
+        probe = subprocess.run(
+            ["sandbox-exec", "-p", _build_sandbox_profile(workspace), "/usr/bin/true"],
+            capture_output=True, timeout=10,
+        )
+        _sandbox_state["ok"] = probe.returncode == 0
+    except Exception:
+        _sandbox_state["ok"] = False
+    return _sandbox_state["ok"]
 
 STATUS_RECHECK_SECONDS = 12 * 60 * 60  # re-verify with the server at most every 12h;
                                          # use the last cached result in between so a
@@ -2237,11 +2321,82 @@ def build_grading_calibration_context(assignment_name):
 #     should ask first" — a categorically different risk than filling
 #     out a newsletter signup.
 
+# Expanded after the Aug 2026 audit, which tested the matcher against real
+# field names and found it correctly caught card/cvv/ssn/routing but missed
+# several categories that are just as sensitive: international bank details,
+# government IDs, and date of birth.
 PAYMENT_FIELD_KEYWORDS = (
     "card", "cvv", "cvc", "ccnum", "cardnumber", "security-code",
     "securitycode", "expiry", "exp-date", "expdate", "ssn", "social-security",
     "socialsecurity", "routing-number", "routingnumber", "account-number", "accountnumber",
+    # international banking
+    "iban", "bic", "swift", "sortcode", "sort-code",
+    # government / identity documents
+    "passport", "taxid", "tax-id", "nationalid", "national-id", "driverslicense",
+    "drivers-license", "licensenumber", "sin", "nino",
+    # date of birth (commonly paired with the above for identity verification)
+    "dateofbirth", "date-of-birth", "dob", "birthdate", "birth-date",
+    # credentials — never auto-fill these either
+    "password", "passwd", "pin", "otp", "onetimecode", "mfa", "2fa",
 )
+
+# ── SSRF guard for the browser tools ─────────────────────────────────────────
+# Added after the Aug 2026 audit found browse_page() passed whatever URL it
+# was given straight to Playwright with no validation at all. That meant the
+# model could be steered — by a customer, or by injected text in an email or
+# web page it had just read — into fetching http://localhost, a router admin
+# page on the customer's LAN, or a cloud metadata endpoint like
+# http://169.254.169.254/ and reporting the contents back.
+#
+# Blocks by resolved IP, not by hostname string: a name like
+# "internal.example.com" or a DNS entry deliberately pointed at 127.0.0.1
+# looks perfectly public as text. Resolution happens here, and again inside
+# the page's request interceptor, so a redirect or a subresource can't reach
+# somewhere the top-level URL wasn't allowed to.
+BLOCKED_URL_SCHEMES_NOTE = "only http:// and https:// are allowed"
+
+
+def _ip_is_private(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable — treat as unsafe rather than allow
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _is_safe_url(url):
+    """Returns (safe, reason). Used both up front and per-request."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "that isn't a URL I can parse"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"the scheme '{parsed.scheme or 'none'}' isn't allowed — {BLOCKED_URL_SCHEMES_NOTE}"
+    host = parsed.hostname
+    if not host:
+        return False, "that URL has no hostname"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"'{host}' couldn't be resolved"
+    for info in infos:
+        if _ip_is_private(info[4][0]):
+            return False, (f"'{host}' resolves to a private, loopback, or link-local address "
+                            f"({info[4][0]}) — internal network addresses are not reachable from here")
+    return True, ""
+
+
+def _install_ssrf_guard(page):
+    """Re-checks every request the page makes, so redirects, iframes, and
+    subresource loads are held to the same rule as the original URL."""
+    def _route(route, request):
+        ok, _ = _is_safe_url(request.url)
+        if ok:
+            route.continue_()
+        else:
+            route.abort()
+    page.route("**/*", _route)
 
 
 def _is_sensitive_field(field_name):
@@ -2270,12 +2425,17 @@ def browse_page(url):
     knows what a subsequent fill_and_submit_form() call could target.
     No side effect, no confirmation needed, same as reading an email.
     """
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
                 text_content = page.inner_text("body")
@@ -2370,19 +2530,27 @@ def shell_exec(command: str, cwd: str | None, confirmed: bool, config: dict) -> 
     DEAN_SHELL_SAFETY_MODES for the full scoping reasoning (Home-only,
     Dean-only, customer's own choice of safety mode).
 
-    HONEST SCOPE, corrected after the Aug 2026 audit: DEAN_SHELL_WORKSPACE
-    is a default working DIRECTORY, not a sandbox, and this docstring
-    previously implied otherwise. In "confirm" and "autonomous" mode the
-    command runs through a real shell and can name any absolute path on
-    this Mac — `cd`, `>`, and an absolute argument all reach outside the
-    working directory, and no OS-level containment is applied. What
-    actually limits blast radius in those modes is the customer reading
-    and approving the exact command ("confirm") or having explicitly
-    accepted no guardrails ("autonomous"). Only "allowlist" mode is
-    genuinely constrained: no shell interpretation at all, no
-    metacharacters, no absolute paths (see
-    _shell_command_is_allowlisted). Real containment (sandbox-exec or a
-    container) is a known gap, tracked in the README.
+    HONEST SCOPE. Two layers, and it is worth being precise about which
+    does what, because an earlier version of this docstring overstated it:
+
+      - Mode rules (procedural). "confirm" needs the customer to approve
+        the exact string; "allowlist" permits only a short list of
+        commands, with no shell interpretation, no metacharacters and no
+        absolute paths; "autonomous" is unrestricted by the customer's
+        own explicit choice.
+      - OS containment (structural, macOS only). Commands run under
+        sandbox-exec: writes denied outside the workspace, reads denied
+        on credential stores (~/.ssh, ~/.aws, Keychains, browser
+        profiles, shell history, and Curant's own config), outbound
+        network denied. This is what stops an approved-but-misunderstood
+        command, or an injected one, from reaching things it shouldn't.
+
+    If sandbox-exec is unavailable (non-macOS, or the profile is
+    rejected) the command still runs, but the output carries a visible
+    warning saying containment did not apply — it never silently
+    pretends to be contained. The profile itself has not yet been
+    exercised on real macOS hardware; see the note above
+    DEAN_SHELL_SANDBOX_DENIED_READS.
 
     The `cwd` parameter specifically is still checked against escaping
     the workspace root — that's a guard on this function's own argument,
@@ -2419,26 +2587,37 @@ def shell_exec(command: str, cwd: str | None, confirmed: bool, config: dict) -> 
         run_dir = candidate
         os.makedirs(run_dir, exist_ok=True)
 
+    sandboxed = _sandbox_available(DEAN_SHELL_WORKSPACE)
+    sandbox_note = "" if sandboxed else (
+        "[warning: OS-level containment is unavailable on this machine, so this command "
+        "ran with your full user permissions — it could read or write anything you can. "
+        "Mention this to the customer if it matters for what they asked.]\n"
+    )
+
     try:
         if mode == "allowlist":
             # No shell interpretation at all in this mode — the argv list is
             # passed straight to exec, so there is no shell left to interpret
             # a metacharacter even if one somehow got past the check above.
             # Defense in depth: the check and this are independent.
-            result = subprocess.run(
-                shlex.split(command), shell=False, cwd=run_dir, capture_output=True,
-                text=True, timeout=DEAN_SHELL_TIMEOUT_SECONDS,
-            )
+            argv = shlex.split(command)
         else:
-            result = subprocess.run(
-                command, shell=True, cwd=run_dir, capture_output=True, text=True,
-                timeout=DEAN_SHELL_TIMEOUT_SECONDS,
-            )
+            # A real shell, because confirm/autonomous legitimately want pipes
+            # and redirection — the customer approved the exact string.
+            argv = ["/bin/sh", "-c", command]
+
+        if sandboxed:
+            argv = ["sandbox-exec", "-p", _build_sandbox_profile(DEAN_SHELL_WORKSPACE)] + argv
+
+        result = subprocess.run(
+            argv, shell=False, cwd=run_dir, capture_output=True, text=True,
+            timeout=DEAN_SHELL_TIMEOUT_SECONDS,
+        )
         output = (result.stdout or "") + (result.stderr or "")
         truncated = output[:DEAN_SHELL_OUTPUT_MAX_CHARS]
         if len(output) > DEAN_SHELL_OUTPUT_MAX_CHARS:
             truncated += "\n[...output truncated...]"
-        return f"[exit code {result.returncode}]\n{truncated}", None
+        return f"{sandbox_note}[exit code {result.returncode}]\n{truncated}", None
     except subprocess.TimeoutExpired:
         return None, f"Command timed out after {DEAN_SHELL_TIMEOUT_SECONDS} seconds and was killed."
     except Exception as e:
@@ -2476,12 +2655,17 @@ def fill_and_submit_form(url, field_values, submit_selector, confirmed=False):
             f"automated, regardless of confirmation."
         )
 
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 for field_name, value in field_values.items():
                     el = page.query_selector(f"#{field_name}, [name='{field_name}']")

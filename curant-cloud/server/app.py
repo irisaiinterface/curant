@@ -45,6 +45,10 @@ Environment variables required:
                             login codes and signup verification texts.
                             Separate from each customer's own assigned
                             DID, which doesn't exist yet at signup time.
+  TRUSTED_PROXY_COUNT     — how many reverse proxies sit in front of this
+                            app (default 0 = none). Only when this is set
+                            is X-Forwarded-For consulted for the client IP
+                            used in rate limiting.
   CURANT_DEV_MODE         — set to "1" ONLY for local development. Allows
                             webhook signature verification to be skipped
                             when a secret isn't configured. Absent (the
@@ -53,6 +57,9 @@ Environment variables required:
 
 import os
 import re
+import socket
+import ipaddress
+from urllib.parse import urlparse
 import sys
 import json
 import hmac
@@ -149,6 +156,7 @@ MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 CURANT_VERIFY_FROM_NUMBER = os.environ.get("CURANT_VERIFY_FROM_NUMBER", "")
 VAPI_WEBHOOK_SECRET   = os.environ.get("VAPI_WEBHOOK_SECRET", "")
 WEBHOOK_MAX_AGE_SECONDS = 300  # reject signed webhooks older than 5 minutes (replay window)
+TRUSTED_PROXY_COUNT   = int(os.environ.get("TRUSTED_PROXY_COUNT", "0") or 0)
 CURANT_DEV_MODE = os.environ.get("CURANT_DEV_MODE", "") == "1"
 # This server's own public URL — needed so Vapi's Custom LLM provider
 # knows where to send voice-call LLM requests back to us (see the
@@ -559,6 +567,33 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass  # column already exists
+
+
+def client_ip() -> str:
+    """
+    The real client address, for rate limiting.
+
+    Added after the Aug 2026 audit: every rate limit was keyed on
+    request.remote_addr, which behind a reverse proxy is the PROXY's
+    address — identical for every customer. That silently converts a
+    per-client limit into a global one: one noisy client exhausts the
+    bucket for everybody (a self-inflicted denial of service), while an
+    attacker gets no per-client restriction at all.
+
+    TRUSTED_PROXY_COUNT says how many proxies sit in front of this app.
+    X-Forwarded-For is client-controlled and trivially spoofable, so it is
+    only consulted when that is explicitly configured, and then only the
+    entry the nearest trusted proxy actually appended is read — counting
+    from the RIGHT, never taking the leftmost value, which is the part an
+    attacker can write freely.
+    """
+    if TRUSTED_PROXY_COUNT <= 0:
+        return request.remote_addr or "unknown"
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+    if len(parts) >= TRUSTED_PROXY_COUNT:
+        return parts[-TRUSTED_PROXY_COUNT]
+    return request.remote_addr or "unknown"
 
 
 def _check_rate(key: str, max_req: int, window_sec: int) -> bool:
@@ -1758,11 +1793,82 @@ def build_grading_calibration_context(customer_id: str, assignment_name: str):
 # ever one execution of the actual submission, never a risk of double-
 # submitting a form.
 
+# Expanded after the Aug 2026 audit, which tested the matcher against real
+# field names and found it correctly caught card/cvv/ssn/routing but missed
+# several categories that are just as sensitive: international bank details,
+# government IDs, and date of birth.
 PAYMENT_FIELD_KEYWORDS = (
     "card", "cvv", "cvc", "ccnum", "cardnumber", "security-code",
     "securitycode", "expiry", "exp-date", "expdate", "ssn", "social-security",
     "socialsecurity", "routing-number", "routingnumber", "account-number", "accountnumber",
+    # international banking
+    "iban", "bic", "swift", "sortcode", "sort-code",
+    # government / identity documents
+    "passport", "taxid", "tax-id", "nationalid", "national-id", "driverslicense",
+    "drivers-license", "licensenumber", "sin", "nino",
+    # date of birth (commonly paired with the above for identity verification)
+    "dateofbirth", "date-of-birth", "dob", "birthdate", "birth-date",
+    # credentials — never auto-fill these either
+    "password", "passwd", "pin", "otp", "onetimecode", "mfa", "2fa",
 )
+
+# ── SSRF guard for the browser tools ─────────────────────────────────────────
+# Added after the Aug 2026 audit found browse_page() passed whatever URL it
+# was given straight to Playwright with no validation at all. That meant the
+# model could be steered — by a customer, or by injected text in an email or
+# web page it had just read — into fetching http://localhost, a router admin
+# page on the customer's LAN, or a cloud metadata endpoint like
+# http://169.254.169.254/ and reporting the contents back.
+#
+# Blocks by resolved IP, not by hostname string: a name like
+# "internal.example.com" or a DNS entry deliberately pointed at 127.0.0.1
+# looks perfectly public as text. Resolution happens here, and again inside
+# the page's request interceptor, so a redirect or a subresource can't reach
+# somewhere the top-level URL wasn't allowed to.
+BLOCKED_URL_SCHEMES_NOTE = "only http:// and https:// are allowed"
+
+
+def _ip_is_private(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable — treat as unsafe rather than allow
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _is_safe_url(url):
+    """Returns (safe, reason). Used both up front and per-request."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "that isn't a URL I can parse"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"the scheme '{parsed.scheme or 'none'}' isn't allowed — {BLOCKED_URL_SCHEMES_NOTE}"
+    host = parsed.hostname
+    if not host:
+        return False, "that URL has no hostname"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"'{host}' couldn't be resolved"
+    for info in infos:
+        if _ip_is_private(info[4][0]):
+            return False, (f"'{host}' resolves to a private, loopback, or link-local address "
+                            f"({info[4][0]}) — internal network addresses are not reachable from here")
+    return True, ""
+
+
+def _install_ssrf_guard(page):
+    """Re-checks every request the page makes, so redirects, iframes, and
+    subresource loads are held to the same rule as the original URL."""
+    def _route(route, request):
+        ok, _ = _is_safe_url(request.url)
+        if ok:
+            route.continue_()
+        else:
+            route.abort()
+    page.route("**/*", _route)
 
 
 def _is_sensitive_field(field_name: str) -> bool:
@@ -1787,12 +1893,17 @@ def browse_page(url: str):
     """Read-only — see what's on a page and what fields exist, so the
     model knows what a subsequent fill_and_submit_form() call could
     target. No side effect, no confirmation needed."""
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
                 text_content = page.inner_text("body")
@@ -1834,12 +1945,17 @@ def fill_and_submit_form(url: str, field_values: dict, submit_selector: str, con
             f"automated, regardless of confirmation."
         )
 
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 for field_name, value in field_values.items():
                     el = page.query_selector(f"#{field_name}, [name='{field_name}']")
@@ -4723,7 +4839,7 @@ def unlock_submit():
     Stores it in the in-memory session cache for SESSION_TTL_SECONDS.
     Rate limited to prevent brute-force unlock attempts.
     """
-    if not _check_rate(f"unlock:{request.remote_addr}", 5, 300):
+    if not _check_rate(f"unlock:{client_ip()}", 5, 300):
         return jsonify({"ok": False, "error": "Too many attempts — try again in a few minutes."}), 429
 
     data  = request.get_json(force=True)
@@ -5369,7 +5485,7 @@ def customer_login():
             error, stage = "Session expired — start again.", "email"
 
         elif stage == "email":
-            if not _check_rate(f"login:{request.remote_addr}", 5, 300):
+            if not _check_rate(f"login:{client_ip()}", 5, 300):
                 error = "Too many attempts — try again later."
             else:
                 email = request.form.get("email", "").strip().lower()
@@ -5393,7 +5509,7 @@ def customer_login():
 
         elif stage == "code":
             pending_cid = session.get("pending_login_customer_id")
-            if not _check_rate(f"logincode:{request.remote_addr}", 10, 300):
+            if not _check_rate(f"logincode:{client_ip()}", 10, 300):
                 error, stage = "Too many attempts — try again later.", "email"
             elif not pending_cid:
                 # Either the enumeration-safe no-account path above, or an
@@ -6127,7 +6243,7 @@ def owner_login():
     if request.method == "POST":
         if not ADMIN_PASSWORD:
             error = "Owner login is disabled — CLOUD_ADMIN_PASSWORD not set."
-        elif not _check_rate(f"owner:{request.remote_addr}", 5, 300):
+        elif not _check_rate(f"owner:{client_ip()}", 5, 300):
             error = "Too many attempts."
         elif not check_csrf():
             error = "Session expired."
@@ -6268,4 +6384,14 @@ def health():
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5051))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
+    # The Werkzeug debugger is an interactive remote code execution console.
+    # Previously one env var away from being enabled on a 0.0.0.0 listener;
+    # now it additionally requires CURANT_DEV_MODE, so a stray FLASK_DEBUG in
+    # a production environment can't switch it on by itself.
+    debug_requested = os.environ.get("FLASK_DEBUG") == "1"
+    debug_enabled = debug_requested and CURANT_DEV_MODE
+    if debug_requested and not debug_enabled:
+        print("REFUSING to enable the Flask debugger: FLASK_DEBUG=1 was set but "
+              "CURANT_DEV_MODE=1 was not. The debugger is a remote code execution "
+              "console and must never be reachable in production.", file=sys.stderr)
+    app.run(host="0.0.0.0", port=port, debug=debug_enabled)
