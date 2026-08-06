@@ -4274,6 +4274,19 @@ OAUTH_CALLBACK_PORT = 8790  # localhost-only, matches the pattern already used f
 # but that's a different trust profile and isn't included here for
 # one-command auto-connect — a customer who wants that should evaluate
 # and connect it manually via mcp-add-oauth with their own judgment).
+#
+# Same reasoning excludes two more, Aug 2026: Jenkins DOES have an
+# official first-party MCP Server plugin (jenkinsci/mcp-server-plugin),
+# but it runs on each customer's own Jenkins instance at
+# <their-jenkins-url>/mcp-server/mcp with HTTP Basic auth (username +
+# personal access token, base64-encoded) — there's no single Curant-wide
+# URL to hardcode, so it's connectable today via mcp-add-http with a
+# customer's own URL/token, not auto-connect. SOAP/WSDL services are the
+# same shape one level further removed — no known service at all, just a
+# generic gateway (e.g. AustinWise/mcp2ws) that takes a customer's own
+# WSDL URL as a stdio launch argument; genuinely per-customer, so it
+# isn't a KNOWN_MCP_SERVICES entry either, just a documented pattern for
+# whoever sets one up by hand.
 KNOWN_MCP_SERVICES = {
     "linear": {
         "url": "https://mcp.linear.app/mcp",
@@ -4288,7 +4301,10 @@ KNOWN_MCP_SERVICES = {
         "description": "Atlassian's official Rovo MCP server — Jira, Confluence, Bitbucket. "
                         "Note: does not currently support HIPAA or FedRAMP requirements, per "
                         "Atlassian's own documentation — relevant if this would ever touch "
-                        "anything health-related.",
+                        "anything health-related. Also note: as of Jul 2026, Bitbucket's tools "
+                        "on this server authenticate via scoped API token only — OAuth is on "
+                        "Atlassian's roadmap but not live yet, unlike Jira/Confluence which "
+                        "already support OAuth 2.1.",
     },
     "github": {
         "url": "https://api.githubcopilot.com/mcp/",
@@ -4297,6 +4313,58 @@ KNOWN_MCP_SERVICES = {
         "description": "GitHub's official remote MCP server — repos, issues, PRs, code review, "
                         "CI/CD workflow runs, security alerts. Confirmed across multiple independent "
                         "sources including GitHub's own repository docs.",
+    },
+    "testrail": {
+        "command": ["npx", "-y", "@uarlouski/testrail-mcp-server@latest"],
+        "transport": "stdio",
+        "official": False,
+        "description": "No official TestRail MCP server exists — this is the most active "
+                        "community implementation (Apache-2.0, actively maintained, 26 stars as "
+                        "of Aug 2026). Stdio only: curant-cli spawns it as a local subprocess, "
+                        "which inherits this machine's environment — set TESTRAIL_INSTANCE_URL, "
+                        "TESTRAIL_USERNAME, and TESTRAIL_API_KEY in the shell profile curant-cli "
+                        "runs under (never stored by Curant itself, consistent with how stdio "
+                        "servers are already handled). Home-tier only — Cloud has no per-customer "
+                        "machine to spawn a subprocess on, so this entry is intentionally absent "
+                        "from Cloud's registry.",
+    },
+    "postman": {
+        "url": "https://mcp.postman.com/mcp",
+        "transport": "http",
+        "official": True,
+        "description": "Postman's official remote MCP server — workspaces, collections, "
+                        "environments, API requests. OAuth works on the US server only; the EU "
+                        "server requires a Postman API key via header instead.",
+    },
+    "outlook": {
+        "command": ["uvx", "--from", "microsoft-graph-mcp-server", "microsoft-graph-mcp-server"],
+        "transport": "stdio",
+        "official": False,
+        "description": "Deliberate Option B choice: Microsoft's own official Outlook MCP (Work "
+                        "IQ Mail/Calendar under Agent 365) requires a customer M365 Copilot "
+                        "license plus their IT admin registering an Entra app per tenant — real "
+                        "friction most individual customers can't clear. This community wrapper "
+                        "(marlonluo2018/microsoft_graph_mcp_server) talks to Microsoft Graph "
+                        "directly via its own public client ID, so a customer just runs the "
+                        "device-code sign-in once — zero Azure app registration needed on either "
+                        "side. Unofficial and unmanaged by Microsoft; inherits whatever "
+                        "maintenance risk that carries. Home-tier only for the same reason as "
+                        "TestRail — stdio needs a machine to spawn on, which Cloud deliberately "
+                        "doesn't allow. Relevant to Dean's software development specialization "
+                        "(meeting scheduling, inbox triage) as well as general-purpose use.",
+    },
+    "teams": {
+        "command": ["npx", "-y", "@floriscornel/teams-mcp@latest"],
+        "transport": "stdio",
+        "official": False,
+        "description": "Same Option B reasoning as 'outlook' above — Microsoft's official Teams "
+                        "Graph MCP sits behind the same Copilot-license/Entra-admin wall. This "
+                        "wrapper (floriscornel/teams-mcp, MIT, 122 stars) uses its own OAuth "
+                        "device-code flow against Microsoft Graph with no Azure setup required. "
+                        "Supports a read-only mode (TEAMS_MCP_READ_ONLY=true) that requests a "
+                        "reduced permission scope — worth defaulting to for any persona that "
+                        "doesn't need to send messages on the customer's behalf. Home-tier only, "
+                        "same stdio-on-Cloud restriction as testrail/outlook.",
     },
     "figma": {
         "url": "https://mcp.figma.com/mcp",

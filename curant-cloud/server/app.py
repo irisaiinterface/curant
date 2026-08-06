@@ -1868,15 +1868,23 @@ def get_august_tools(customer: dict) -> list[dict]:
 # same standard already applied to the Vapi response-shape assumptions
 # elsewhere in this file.
 
-# Same registry as Home's KNOWN_MCP_SERVICES — deliberately HTTP/SSE only
-# (no stdio entries exist in Home's registry either, so nothing was
-# dropped moving to Cloud). stdio itself — spawning an arbitrary local
-# command — is correctly NOT supported on Cloud at all: there's no
-# "customer's machine" to spawn it on, and arbitrary command execution
-# on a shared multi-tenant server is a real security concern Home simply
-# doesn't have (one customer per install there). Keep this in sync with
-# Home's registry by hand — there's no shared-code mechanism between the
-# two independently-deployed files.
+# Same registry as Home's KNOWN_MCP_SERVICES — deliberately HTTP/SSE only.
+# stdio itself — spawning an arbitrary local command — is correctly NOT
+# supported on Cloud at all: there's no "customer's machine" to spawn it
+# on, and arbitrary command execution on a shared multi-tenant server is
+# a real security concern Home simply doesn't have (one customer per
+# install there). As of Aug 2026, Home's registry has exactly one stdio
+# entry — "testrail" (no official remote TestRail MCP server exists, only
+# community stdio packages) — deliberately NOT mirrored here for that
+# reason. Keep the rest in sync with Home's registry by hand — there's no
+# shared-code mechanism between the two independently-deployed files.
+#
+# Also deliberately excluded, Aug 2026: Jenkins (official plugin, but no
+# single URL — runs per-customer at <their-jenkins-url>/mcp-server/mcp
+# with Basic auth; connectable today via the manual HTTP+headers path,
+# same as Clio) and generic SOAP/WSDL gateways (e.g. AustinWise/mcp2ws —
+# takes a customer's own WSDL URL, stdio-only, so Home-only even if it
+# were added). See Home's registry comment for the fuller writeup.
 KNOWN_MCP_SERVICES = {
     "linear": {
         "url": "https://mcp.linear.app/mcp", "transport": "http", "official": True,
@@ -1886,7 +1894,10 @@ KNOWN_MCP_SERVICES = {
         "url": "https://mcp.atlassian.com/v1/mcp/authv2", "transport": "http", "official": True,
         "description": "Atlassian's official Rovo MCP server — Jira, Confluence, Bitbucket. "
                         "Note: does not currently support HIPAA or FedRAMP requirements, per "
-                        "Atlassian's own documentation.",
+                        "Atlassian's own documentation. Also note: as of Jul 2026, Bitbucket's "
+                        "tools on this server authenticate via scoped API token only — OAuth is "
+                        "on Atlassian's roadmap but not live yet, unlike Jira/Confluence which "
+                        "already support OAuth 2.1.",
     },
     "github": {
         "url": "https://api.githubcopilot.com/mcp/", "transport": "http", "official": True,
@@ -1896,6 +1907,12 @@ KNOWN_MCP_SERVICES = {
     "figma": {
         "url": "https://mcp.figma.com/mcp", "transport": "http", "official": True,
         "description": "Figma's official remote MCP server — files, designs, Dev Mode context.",
+    },
+    "postman": {
+        "url": "https://mcp.postman.com/mcp", "transport": "http", "official": True,
+        "description": "Postman's official remote MCP server — workspaces, collections, "
+                        "environments, API requests. OAuth works on the US server only; the EU "
+                        "server requires a Postman API key via header instead.",
     },
     "hubspot": {
         "url": "https://mcp.hubspot.com", "transport": "http", "official": True,
