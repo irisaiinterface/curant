@@ -10,20 +10,28 @@
 
 | # | Finding | Severity | Status |
 |---|---------|----------|--------|
-| 1 | Customer login requires only an email address — no password | **Critical** | Pre-existing |
-| 2 | Shell allowlist trivially bypassed → arbitrary command execution | **Critical** | **Introduced this session** |
-| 3 | Shell "sandbox" does not contain anything | **Critical** | **Introduced this session** |
-| 4 | Vapi webhook unauthenticated → memory disclosure + poisoning | **High** | Pre-existing |
-| 5 | `/vapi-llm/<customer_id>` unauthenticated → API-key abuse | **High** | Pre-existing |
-| 6 | Telnyx signature verification fails **open** | **High** | Pre-existing |
-| 7 | OAuth callbacks not bound to session → account-linking CSRF | **High** | Mixed |
-| 8 | Indirect prompt injection reaches consequential tools | **High** | Pre-existing, worsened |
-| 9 | No replay protection on Telnyx webhooks | Medium | Pre-existing |
-| 10 | `browse_page` has no SSRF protection | Medium | Pre-existing |
-| 11 | `FLASK_DEBUG` env var can enable Werkzeug debugger (RCE) | Medium | Pre-existing |
-| 12 | Rate limiting keyed on spoofable `remote_addr` | Low | Pre-existing |
-| 13 | Sensitive-field blocklist has real gaps | Low | Pre-existing |
-| 14 | OAuth exception text returned to the browser | Low | Introduced this session |
+| 1 | Customer login requires only an email address — no password | **Critical** | **FIXED** — SMS code |
+| 2 | Shell allowlist trivially bypassed → arbitrary command execution | **Critical** | **FIXED** |
+| 3 | Shell "sandbox" does not contain anything | **Critical** | **Partly fixed** — allowlist mode contained; wording corrected; OS containment still open |
+| 4 | Vapi webhook unauthenticated → memory disclosure + poisoning | **High** | **FIXED** |
+| 5 | `/vapi-llm/<customer_id>` unauthenticated → API-key abuse | **High** | **FIXED** |
+| 6 | Telnyx signature verification fails **open** | **High** | **FIXED** — fails closed |
+| 7 | OAuth callbacks not bound to session → account-linking CSRF | **High** | **FIXED** |
+| 8 | Indirect prompt injection reaches consequential tools | **High** | Partly mitigated — open |
+| 9 | No replay protection on Telnyx webhooks | Medium | **FIXED** — 5-min window |
+| 10 | `browse_page` has no SSRF protection | Medium | Open |
+| 11 | `FLASK_DEBUG` env var can enable Werkzeug debugger (RCE) | Medium | Open |
+| 12 | Rate limiting keyed on spoofable `remote_addr` | Low | Open |
+| 13 | Sensitive-field blocklist has real gaps | Low | Open |
+| 14 | OAuth exception text returned to the browser | Low | **FIXED** |
+
+### Also found during remediation (not in the original 14)
+
+| # | Finding | Severity | Status |
+|---|---------|----------|--------|
+| 15 | `phone_routing` stored the assigned DID, but lookups use the sender's number — **all inbound SMS and voice routing was broken**, and the customer's own number was never collected anywhere | **Critical (functional)** | **FIXED** |
+
+Finding 15 surfaced while designing the SMS login: there was no customer phone number to send a code to. Tracing why revealed that provisioning inserted Curant's own DID into `phone_routing` while `get_customer_by_phone()` is called with the *sender's* number — so no inbound message could ever match a customer. Every text would have been answered "this number is not associated with an active Curant account," and every call would have fallen through to the unknown-caller branch. Collecting and routing on the customer's own mobile fixes both that and finding 1, which is why they were done together. It is also the safer key: routing on the dialled DID instead would mean anyone who discovered a customer's Curant number was treated as that customer.
 
 ---
 

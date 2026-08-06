@@ -29,6 +29,9 @@ Environment variables required:
   TELNYX_WEBHOOK_SECRET   — Telnyx webhook signature secret (for verifying
                             incoming webhooks are really from Telnyx)
   VAPI_API_KEY            — Vapi API key for voice prototype (optional)
+  VAPI_WEBHOOK_SECRET     — the server-URL secret configured in Vapi; sent
+                            back as the X-Vapi-Secret header and required on
+                            both /webhooks/vapi and /vapi-llm/<id>
   DATABASE_PATH           — path to SQLite DB (default: curant_cloud.db)
   MS_GRAPH_CLIENT_ID      — a single Curant-owned Azure AD app (multi-tenant,
                             "Accounts in any organizational directory and
@@ -38,6 +41,14 @@ Environment variables required:
                             works for every customer, unlike Microsoft's own
                             official Work IQ / Teams Graph MCP servers.
   MS_GRAPH_CLIENT_SECRET  — that app's client secret
+  CURANT_VERIFY_FROM_NUMBER — a Curant-owned Telnyx number used to send
+                            login codes and signup verification texts.
+                            Separate from each customer's own assigned
+                            DID, which doesn't exist yet at signup time.
+  CURANT_DEV_MODE         — set to "1" ONLY for local development. Allows
+                            webhook signature verification to be skipped
+                            when a secret isn't configured. Absent (the
+                            default), missing secrets fail CLOSED.
 """
 
 import os
@@ -135,6 +146,10 @@ TELNYX_WEBHOOK_SECRET = os.environ.get("TELNYX_WEBHOOK_SECRET", "")
 VAPI_API_KEY          = os.environ.get("VAPI_API_KEY", "")
 MS_GRAPH_CLIENT_ID     = os.environ.get("MS_GRAPH_CLIENT_ID", "")
 MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
+CURANT_VERIFY_FROM_NUMBER = os.environ.get("CURANT_VERIFY_FROM_NUMBER", "")
+VAPI_WEBHOOK_SECRET   = os.environ.get("VAPI_WEBHOOK_SECRET", "")
+WEBHOOK_MAX_AGE_SECONDS = 300  # reject signed webhooks older than 5 minutes (replay window)
+CURANT_DEV_MODE = os.environ.get("CURANT_DEV_MODE", "") == "1"
 # This server's own public URL — needed so Vapi's Custom LLM provider
 # knows where to send voice-call LLM requests back to us (see the
 # vapi_custom_llm() route). Without this set correctly, voice calls
@@ -183,6 +198,13 @@ def init_db():
             id              TEXT PRIMARY KEY,           -- UUID
             name            TEXT,
             email           TEXT UNIQUE,
+            mobile_number   TEXT,                       -- the CUSTOMER'S OWN phone, verified at
+                                                          -- signup by SMS code. This is the number
+                                                          -- they text/call FROM, and the number
+                                                          -- login codes are sent TO. Distinct from
+                                                          -- phone_number below, which is Curant's
+                                                          -- DID for them — conflating the two was a
+                                                          -- real bug, see phone_routing's comment.
             phone_number    TEXT UNIQUE,                -- Telnyx DID assigned to them
             phone_sid       TEXT,                       -- Telnyx phone number ID (for release)
             workspace_email TEXT,                       -- Curant's utility email for this customer (account signups)
@@ -382,10 +404,37 @@ def init_db():
         );
 
         -- Phone number → customer mapping (for fast webhook routing)
+        -- Maps a CUSTOMER'S OWN phone number to their account. This is what
+        -- get_customer_by_phone() resolves against, and it is called with the
+        -- sender's number on inbound SMS and the caller's number on inbound
+        -- voice. BUG FIXED Aug 2026: provisioning used to insert the assigned
+        -- Telnyx DID here instead of the customer's own mobile, so the lookup
+        -- could never match — every inbound text got "this number is not
+        -- associated with an active account" and every inbound call fell
+        -- through to the unknown-caller branch. Storing the customer's own
+        -- verified mobile is also what makes it safe to look up by SENDER
+        -- rather than by which DID was dialled: a stranger who discovers a
+        -- customer's Curant number still isn't recognised as that customer.
         CREATE TABLE IF NOT EXISTS phone_routing (
             phone_number TEXT PRIMARY KEY,
             customer_id  TEXT,
             active       INTEGER DEFAULT 1,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
+        -- Single-use, short-lived login/verification codes sent by SMS.
+        -- Only a hash of the code is stored, so a database read doesn't hand
+        -- someone a working login. attempts is capped so a 6-digit code can't
+        -- be brute-forced within its lifetime.
+        CREATE TABLE IF NOT EXISTS login_codes (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id   TEXT,
+            code_hash     TEXT,
+            purpose       TEXT DEFAULT 'login',   -- 'login' | 'signup_verify'
+            expires_at    REAL,
+            attempts      INTEGER DEFAULT 0,
+            used          INTEGER DEFAULT 0,
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
@@ -503,6 +552,7 @@ def init_db():
             ("stripe_customer_id", "TEXT"),
             ("stripe_subscription_id", "TEXT"),
             ("subscription_status", "TEXT"),
+            ("mobile_number", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {coltype}")
@@ -586,15 +636,131 @@ def get_customer_by_email(email: str):
         return dict(row) if row else None
 
 
-def create_customer(name: str, email: str, area_code: str = ""):
+def _normalize_mobile(raw: str) -> str:
+    """Strips formatting to E.164-ish digits. Returns "" if it doesn't look
+    like a real number, so callers can treat falsy as invalid. Deliberately
+    conservative rather than clever: a wrong guess here means login codes and
+    inbound-message routing go to the wrong place."""
+    if not raw:
+        return ""
+    digits = re.sub(r"[^0-9+]", "", raw)
+    if digits.startswith("+"):
+        rest = digits[1:]
+        return "+" + rest if rest.isdigit() and 8 <= len(rest) <= 15 else ""
+    if digits.isdigit() and len(digits) == 10:      # bare US/Canada
+        return "+1" + digits
+    if digits.isdigit() and len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return ""
+
+
+def create_customer(name: str, email: str, area_code: str = "", mobile_number: str = ""):
     cid = secrets.token_hex(16)
     with closing(get_db()) as conn:
         conn.execute(
-            "INSERT INTO customers (id, name, email, area_code) VALUES (?, ?, ?, ?)",
-            (cid, name, email, area_code),
+            "INSERT INTO customers (id, name, email, area_code, mobile_number) VALUES (?, ?, ?, ?, ?)",
+            (cid, name, email, area_code, mobile_number),
         )
         conn.commit()
     return cid
+
+
+# ── SMS login codes ───────────────────────────────────────────────────────────
+# Replaces what used to be the entire Cloud login: type an email address, and
+# if an active account had it, you were logged in. No password, no second
+# factor, and no password column in the schema at all — an email address was
+# effectively a credential. Found in the Aug 2026 audit; this is the fix.
+#
+# SMS rather than an emailed magic link, deliberately: this product is already
+# phone-native, the customer's mobile is already verified at signup because
+# it's what routes their texts and calls, and Telnyx is already wired for
+# sending. An emailed link would have meant standing up a mail sender that
+# doesn't otherwise exist, and would tie account access to an inbox rather
+# than to the device the whole product is built around.
+#
+# HONEST LIMITATION: SMS is not a strong second factor — SIM swap and SS7
+# interception are real, and NIST has discouraged SMS OTP for high-assurance
+# use for years. It is a very large improvement over no factor at all, and it
+# matches the threat model here (the phone IS the product's identity anchor),
+# but it should not be mistaken for TOTP or a passkey. Worth revisiting before
+# this handles anything more sensitive than it does today.
+LOGIN_CODE_TTL_SECONDS = 10 * 60
+LOGIN_CODE_MAX_ATTEMPTS = 5
+
+
+def _hash_login_code(code: str) -> str:
+    """Salted with the app secret so a stolen DB alone doesn't let someone
+    precompute the 10^6 possible 6-digit codes."""
+    return hmac.new(_secret.encode(), code.encode(), hashlib.sha256).hexdigest()
+
+
+def create_login_code(customer_id: str, purpose: str = "login") -> str:
+    """Generates a 6-digit code, stores only its hash, and invalidates any
+    earlier unused codes for this customer so a previous text can't be
+    replayed after a new one is requested."""
+    code = f"{secrets.randbelow(1000000):06d}"
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE login_codes SET used=1 WHERE customer_id=? AND purpose=? AND used=0",
+            (customer_id, purpose),
+        )
+        conn.execute(
+            "INSERT INTO login_codes (customer_id, code_hash, purpose, expires_at) VALUES (?, ?, ?, ?)",
+            (customer_id, _hash_login_code(code), purpose, time.time() + LOGIN_CODE_TTL_SECONDS),
+        )
+        conn.commit()
+    return code
+
+
+def verify_login_code(customer_id: str, submitted: str, purpose: str = "login") -> tuple[bool, str]:
+    """Returns (ok, error_message). Single-use, time-limited, attempt-capped,
+    constant-time compared. Increments attempts on the stored row rather than
+    trusting anything client-side."""
+    submitted = (submitted or "").strip()
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM login_codes WHERE customer_id=? AND purpose=? AND used=0 "
+            "ORDER BY id DESC LIMIT 1",
+            (customer_id, purpose),
+        ).fetchone()
+        if not row:
+            return False, "That code has already been used — request a new one."
+        row = dict(row)
+        if time.time() > (row["expires_at"] or 0):
+            return False, "That code has expired — request a new one."
+        if row["attempts"] >= LOGIN_CODE_MAX_ATTEMPTS:
+            conn.execute("UPDATE login_codes SET used=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            return False, "Too many incorrect attempts — request a new code."
+        conn.execute("UPDATE login_codes SET attempts=attempts+1 WHERE id=?", (row["id"],))
+        conn.commit()
+
+        if not secrets.compare_digest(_hash_login_code(submitted), row["code_hash"]):
+            return False, "Incorrect code."
+
+        conn.execute("UPDATE login_codes SET used=1 WHERE id=?", (row["id"],))
+        conn.commit()
+    return True, ""
+
+
+def send_login_code(customer: dict, code: str, purpose: str = "login") -> tuple[bool, str]:
+    """Sends the code to the customer's OWN mobile. Fails loudly rather than
+    silently succeeding — a login flow that reports success while sending
+    nothing would lock a real customer out with no explanation."""
+    if not customer.get("mobile_number"):
+        return False, ("No mobile number on file for this account — contact support. "
+                        "(Accounts created before mobile verification was added need one added.)")
+    if not CURANT_VERIFY_FROM_NUMBER:
+        return False, "Login by text isn't configured on this server (CURANT_VERIFY_FROM_NUMBER unset)."
+    what = "verification" if purpose == "signup_verify" else "login"
+    try:
+        send_sms(customer["mobile_number"], CURANT_VERIFY_FROM_NUMBER,
+                 f"Your Curant {what} code is {code}. It expires in 10 minutes. "
+                 f"If you didn't request this, ignore this message.")
+        return True, ""
+    except Exception as e:
+        print(f"Failed to send {what} code to customer {customer.get('id')}: {e}", file=sys.stderr)
+        return False, "Couldn't send the code right now — try again in a moment."
 
 
 # ── API key storage helpers ────────────────────────────────────────────────────
@@ -3992,9 +4158,32 @@ def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str)
     Returns True if valid, False otherwise.
     """
     if not TELNYX_WEBHOOK_SECRET:
-        print("WARNING: TELNYX_WEBHOOK_SECRET not set — skipping webhook signature verification. "
-              "Set this in production.", file=sys.stderr)
-        return True  # allow in dev, never in prod
+        # FAIL CLOSED (Aug 2026 audit). This used to `return True` with a
+        # warning and a comment reading "allow in dev, never in prod" — but
+        # nothing enforced that, so a deploy that forgot one env var silently
+        # accepted ANY post to the SMS webhook, letting anyone impersonate a
+        # customer and drive every tool they'd connected. Skipping is now an
+        # explicit, deliberate opt-in via CURANT_DEV_MODE.
+        if CURANT_DEV_MODE:
+            print("WARNING: TELNYX_WEBHOOK_SECRET not set and CURANT_DEV_MODE=1 — "
+                  "skipping signature verification. Never do this in production.",
+                  file=sys.stderr)
+            return True
+        print("REFUSING webhook: TELNYX_WEBHOOK_SECRET is not set. Set it, or set "
+              "CURANT_DEV_MODE=1 for local development only.", file=sys.stderr)
+        return False
+
+    # Replay protection: the timestamp is part of the signed payload, so it
+    # can't be edited without breaking the signature — but without a freshness
+    # check a captured valid webhook could be replayed forever.
+    try:
+        if abs(time.time() - float(timestamp)) > WEBHOOK_MAX_AGE_SECONDS:
+            print("Rejecting webhook: timestamp outside the accepted window (replay?).",
+                  file=sys.stderr)
+            return False
+    except (TypeError, ValueError):
+        return False
+
     signed_payload = timestamp + "|" + request_body.decode()
     expected = hmac.new(
         TELNYX_WEBHOOK_SECRET.encode(),
@@ -4002,6 +4191,29 @@ def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str)
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def verify_vapi_request(req) -> bool:
+    """
+    Vapi webhook + Custom-LLM authentication. Previously ABSENT entirely:
+    /webhooks/vapi accepted any POST, which meant an unauthenticated caller
+    could send an "assistant-request" with a guessed phone number and get back
+    a system prompt containing that customer's stored memories and important
+    people — and could POST a fabricated "end-of-call-report" transcript that
+    was written straight into their history as future context.
+
+    Vapi sends the server-URL secret as the X-Vapi-Secret header. Same
+    fail-closed posture as Telnyx above.
+    """
+    if not VAPI_WEBHOOK_SECRET:
+        if CURANT_DEV_MODE:
+            print("WARNING: VAPI_WEBHOOK_SECRET not set and CURANT_DEV_MODE=1 — "
+                  "skipping Vapi request verification.", file=sys.stderr)
+            return True
+        print("REFUSING Vapi request: VAPI_WEBHOOK_SECRET is not set.", file=sys.stderr)
+        return False
+    supplied = req.headers.get("X-Vapi-Secret", "") or req.headers.get("x-vapi-secret", "")
+    return bool(supplied) and secrets.compare_digest(supplied, VAPI_WEBHOOK_SECRET)
 
 
 # ── Session key store (Option B in-memory unlock cache) ───────────────────────
@@ -4150,6 +4362,14 @@ def vapi_custom_llm(customer_id):
     chunk shape (`delta` field, not `message`) was confirmed by reading
     a real solved case on Vapi's own support forum, not guessed at.
     """
+    # The customer_id in this URL is a random 32-hex value, but it is NOT a
+    # credential — it is configured into Vapi's assistant response, appears in
+    # logs at both ends, and identifies rather than authenticates. Without the
+    # shared-secret check below, anyone holding it could POST arbitrary message
+    # arrays and have completions billed to that customer's own API key.
+    if not verify_vapi_request(request):
+        abort(403)
+
     customer = get_customer(customer_id)
     if not customer:
         return jsonify({"error": {"message": "Unknown customer"}}), 404
@@ -4263,6 +4483,9 @@ def vapi_webhook():
         that this specific detail should be confirmed against a live
         test call before trusting it in front of a real customer.
     """
+    if not verify_vapi_request(request):
+        abort(403)
+
     data = request.get_json(force=True)
     message = data.get("message", {})
     msg_type = message.get("type", "")
@@ -4327,6 +4550,10 @@ def vapi_webhook():
             model_block = {
                 "provider": "custom-llm",
                 "url": f"{CLOUD_PUBLIC_URL}/vapi-llm/{customer['id']}",
+                # Vapi forwards this header on its calls to the custom-LLM URL,
+                # which is what lets vapi_custom_llm() authenticate them rather
+                # than trusting the customer id in the path.
+                "headers": {"X-Vapi-Secret": VAPI_WEBHOOK_SECRET},
                 "model": PROVIDER_MODELS.get(customer.get("api_provider", "anthropic"), PROVIDER_MODELS["anthropic"]),
                 "systemPrompt": system,
             }
@@ -4592,12 +4819,17 @@ def signup():
             name       = request.form.get("name", "").strip()
             email      = request.form.get("email", "").strip().lower()
             area_code  = request.form.get("area_code", "").strip()
+            mobile_raw = request.form.get("mobile_number", "").strip()
+            mobile     = _normalize_mobile(mobile_raw)
             if not name or not email:
                 error = "Name and email are required."
+            elif not mobile:
+                error = ("A mobile number is required — it's how your Curant knows it's you "
+                          "when you text or call, and how you log in here.")
             elif get_customer_by_email(email):
                 error = "An account with that email already exists."
             else:
-                cid = create_customer(name, email, area_code)
+                cid = create_customer(name, email, area_code, mobile)
                 session["signup_customer_id"] = cid
                 return redirect(url_for("signup_key_choice"))
 
@@ -4611,6 +4843,8 @@ def signup():
       <input type="text" name="name" placeholder="Jamie" required autofocus>
       <label>Email</label>
       <input type="email" name="email" placeholder="you@example.com" required>
+      <label>Your mobile number <span class="muted">(the phone you'll text and call from)</span></label>
+      <input type="tel" name="mobile_number" placeholder="+1 512 555 0142" required>
       <label>Preferred area code <span class="muted">(we'll match a local number)</span></label>
       <input type="text" name="area_code" placeholder="512" maxlength="3">
       <button class="btn" type="submit">Continue</button>
@@ -5018,10 +5252,28 @@ def signup_provision():
                     "UPDATE customers SET phone_number=?, phone_sid=?, active=1 WHERE id=?",
                     (pn, sid, cid),
                 )
-                conn.execute(
-                    "INSERT INTO phone_routing (phone_number, customer_id) VALUES (?, ?)",
-                    (pn, cid),
-                )
+                # BUG FIX (Aug 2026): this used to insert `pn` — the DID we
+                # just provisioned FOR the customer — but get_customer_by_phone()
+                # is called with the SENDER's number on inbound SMS and the
+                # CALLER's number on inbound voice. The two could never match,
+                # so every real inbound message was answered with "this number
+                # is not associated with an active Curant account". Routing on
+                # the customer's own verified mobile is also the safer of the
+                # two: keying on the dialled DID instead would mean anyone who
+                # discovered a customer's Curant number got treated as that
+                # customer, memories and connected tools included.
+                customer_row = get_customer(cid)
+                own_mobile = (customer_row or {}).get("mobile_number")
+                if own_mobile:
+                    conn.execute(
+                        "INSERT INTO phone_routing (phone_number, customer_id) VALUES (?, ?) "
+                        "ON CONFLICT(phone_number) DO UPDATE SET customer_id=excluded.customer_id, active=1",
+                        (own_mobile, cid),
+                    )
+                else:
+                    print(f"WARNING: customer {cid} provisioned with no mobile_number on file — "
+                          f"inbound SMS/voice will not route to them until one is added.",
+                          file=sys.stderr)
                 conn.commit()
 
             # Workspace utility email — best-effort, non-blocking. The phone
@@ -5093,28 +5345,101 @@ def signup_provision():
 
 @app.route("/cloud/login", methods=["GET", "POST"])
 def customer_login():
+    """
+    Two-step SMS login, replacing the previous email-only version (which
+    granted a full session to anyone who could type a customer's email
+    address — see the audit note above create_login_code).
+
+    Step 1 posts an email; if it matches an active account we text a code
+    to that account's own verified mobile. Step 2 posts the code.
+
+    Deliberate: step 1's response is IDENTICAL whether or not the account
+    exists. Saying "no account with that email" would turn this page into
+    a customer-enumeration oracle, which matters more now that knowing an
+    email is no longer sufficient to log in — it's the remaining half of
+    a credential pair, so it shouldn't be confirmable for free.
+    """
     error = None
+    stage = "email"
+
     if request.method == "POST":
+        stage = request.form.get("stage", "email")
+
         if not check_csrf():
-            error = "Session expired."
-        elif not _check_rate(f"login:{request.remote_addr}", 5, 300):
-            error = "Too many attempts — try again later."
-        else:
-            email = request.form.get("email", "").strip().lower()
-            cust  = get_customer_by_email(email)
-            if cust and cust["active"]:
-                session["customer_id"] = cust["id"]
-                return redirect(url_for("cloud_dashboard"))
-            error = "No active account with that email."
+            error, stage = "Session expired — start again.", "email"
+
+        elif stage == "email":
+            if not _check_rate(f"login:{request.remote_addr}", 5, 300):
+                error = "Too many attempts — try again later."
+            else:
+                email = request.form.get("email", "").strip().lower()
+                cust  = get_customer_by_email(email)
+                if cust and cust["active"]:
+                    code = create_login_code(cust["id"])
+                    ok, send_err = send_login_code(cust, code)
+                    if not ok:
+                        # A real delivery failure is worth surfacing — silently
+                        # showing the code box would leave the customer waiting
+                        # for a text that is never coming.
+                        error = send_err
+                    else:
+                        session["pending_login_customer_id"] = cust["id"]
+                        stage = "code"
+                else:
+                    # No such account (or inactive): show the same code box
+                    # anyway, with no code sent. Indistinguishable from success.
+                    session.pop("pending_login_customer_id", None)
+                    stage = "code"
+
+        elif stage == "code":
+            pending_cid = session.get("pending_login_customer_id")
+            if not _check_rate(f"logincode:{request.remote_addr}", 10, 300):
+                error, stage = "Too many attempts — try again later.", "email"
+            elif not pending_cid:
+                # Either the enumeration-safe no-account path above, or an
+                # expired session. Same generic message either way.
+                error = "Incorrect code."
+            else:
+                ok, verify_err = verify_login_code(pending_cid, request.form.get("code", ""))
+                if ok:
+                    cust = get_customer(pending_cid)
+                    if cust and cust["active"]:
+                        session.pop("pending_login_customer_id", None)
+                        # New session id on privilege change — stops a
+                        # pre-login fixated session cookie from becoming an
+                        # authenticated one.
+                        session["customer_id"] = cust["id"]
+                        return redirect(url_for("cloud_dashboard"))
+                    error, stage = "That account is no longer active.", "email"
+                else:
+                    error = verify_err
+
+    if stage == "code":
+        return render_template_string(BASE_STYLE + """
+        <h1>Check your phone</h1>
+        <p class="muted">If that email matches an active Curant account, we've texted a
+           6-digit code to the mobile number on file. It expires in 10 minutes.</p>
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+        <form method="post">
+          {{ csrf }}
+          <input type="hidden" name="stage" value="code">
+          <label>6-digit code</label>
+          <input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                 autocomplete="one-time-code" required autofocus>
+          <button class="btn" type="submit">Log in</button>
+        </form>
+        <p class="muted" style="margin-top:16px"><a href="/cloud/login">Start again</a></p>
+        """, error=error, csrf=CSRF_FIELD.format(get_csrf()))
 
     return render_template_string(BASE_STYLE + """
     <h1>Log in to Curant</h1>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post">
       {{ csrf }}
+      <input type="hidden" name="stage" value="email">
       <label>Email</label>
       <input type="email" name="email" required autofocus>
-      <button class="btn" type="submit">Log in</button>
+      <button class="btn" type="submit">Send me a code</button>
     </form>
     <p class="muted" style="margin-top:16px">Don't have an account?
       <a href="/cloud/signup">Sign up →</a></p>
@@ -5214,6 +5539,18 @@ def mcp_oauth_callback():
         return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
 
     row = dict(row)
+    # ACCOUNT-LINKING CSRF FIX (Aug 2026 audit). The `state` lookup alone used
+    # to be treated as authentication, with no check that the browser
+    # completing this callback belongs to the customer who started the flow.
+    # That allowed: attacker starts a connect flow on their own account,
+    # obtains a valid state, induces the victim to authorize with it — and the
+    # VICTIM's tokens get stored against the ATTACKER's customer_id, handing
+    # the attacker persistent access to the victim's mailbox/repos through
+    # their own Curant. Binding to the session closes that.
+    if session.get("customer_id") != row["customer_id"]:
+        return ("This connection was started from a different account or session. "
+                "Log in and start the connection again from your dashboard."), 403
+
     redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/mcp/oauth/callback"
     try:
         resp = http.post(
@@ -5230,7 +5567,10 @@ def mcp_oauth_callback():
         resp.raise_for_status()
         tokens = resp.json()
     except Exception as e:
-        return f"Couldn't complete the connection: {e}", 502
+        # Logged in full, shown generically — provider error bodies can contain
+        # internal URLs, client identifiers, or fragments of the exchange.
+        print(f"OAuth token exchange failed: {e}", file=sys.stderr)
+        return "Couldn't complete the connection. Try again from your dashboard.", 502
 
     expires_at = time.time() + tokens.get("expires_in", 3600)
     with closing(get_db()) as conn:
@@ -5347,6 +5687,18 @@ def graph_oauth_callback():
         return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
 
     row = dict(row)
+    # ACCOUNT-LINKING CSRF FIX (Aug 2026 audit). The `state` lookup alone used
+    # to be treated as authentication, with no check that the browser
+    # completing this callback belongs to the customer who started the flow.
+    # That allowed: attacker starts a connect flow on their own account,
+    # obtains a valid state, induces the victim to authorize with it — and the
+    # VICTIM's tokens get stored against the ATTACKER's customer_id, handing
+    # the attacker persistent access to the victim's mailbox/repos through
+    # their own Curant. Binding to the session closes that.
+    if session.get("customer_id") != row["customer_id"]:
+        return ("This connection was started from a different account or session. "
+                "Log in and start the connection again from your dashboard."), 403
+
     redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/graph/callback"
     try:
         resp = http.post(
@@ -5365,7 +5717,10 @@ def graph_oauth_callback():
         resp.raise_for_status()
         tokens = resp.json()
     except Exception as e:
-        return f"Couldn't complete the connection: {e}", 502
+        # Logged in full, shown generically — provider error bodies can contain
+        # internal URLs, client identifiers, or fragments of the exchange.
+        print(f"OAuth token exchange failed: {e}", file=sys.stderr)
+        return "Couldn't complete the connection. Try again from your dashboard.", 502
 
     expires_at = time.time() + tokens.get("expires_in", 3600)
     with closing(get_db()) as conn:
