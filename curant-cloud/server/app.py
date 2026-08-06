@@ -30,6 +30,14 @@ Environment variables required:
                             incoming webhooks are really from Telnyx)
   VAPI_API_KEY            — Vapi API key for voice prototype (optional)
   DATABASE_PATH           — path to SQLite DB (default: curant_cloud.db)
+  MS_GRAPH_CLIENT_ID      — a single Curant-owned Azure AD app (multi-tenant,
+                            "Accounts in any organizational directory and
+                            personal Microsoft accounts"), used for Outlook/
+                            Teams tools. Not per-customer — see the module
+                            comment above get_graph_tools for why one app
+                            works for every customer, unlike Microsoft's own
+                            official Work IQ / Teams Graph MCP servers.
+  MS_GRAPH_CLIENT_SECRET  — that app's client secret
 """
 
 import os
@@ -44,7 +52,7 @@ import time
 import threading
 from contextlib import closing
 from functools import wraps
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from flask import (Flask, request, jsonify, session, redirect,
                    url_for, render_template_string, abort, Response)
@@ -87,9 +95,46 @@ else:
           "Fernet; print(Fernet.generate_key().decode())\"", file=sys.stderr)
     _fernet = None
 
+
+def _enc(plaintext: str | None) -> str | None:
+    """Generic Fernet encrypt for at-rest secrets that aren't the Option-A
+    API key / generation-key blobs (which have their own inline
+    _fernet.encrypt calls elsewhere) — used for third-party OAuth tokens
+    (mcp_oauth_tokens, graph_oauth_tokens). Passes plaintext through
+    unchanged if no CLOUD_ENCRYPTION_KEY is configured, same fail-open
+    posture as everywhere else _fernet is optional, rather than crashing
+    a whole OAuth flow over a missing env var — but this means these
+    tokens genuinely aren't at-rest-encrypted until that key is set,
+    same caveat that already applies to Option-A keys."""
+    if plaintext is None:
+        return None
+    if not _fernet:
+        return plaintext
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+
+def _dec(ciphertext: str | None) -> str | None:
+    """Inverse of _enc. Also tolerates a value that was never encrypted
+    in the first place (no _fernet configured at write time, or a legacy
+    plaintext row from before this fix) — Fernet tokens have a fixed,
+    recognizable structure, so InvalidToken on decrypt means "this was
+    already plaintext," not corruption, and falling back to returning it
+    as-is is the correct behavior rather than raising."""
+    if ciphertext is None:
+        return None
+    if not _fernet:
+        return ciphertext
+    try:
+        return _fernet.decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        return ciphertext
+
+
 TELNYX_API_KEY        = os.environ.get("TELNYX_API_KEY", "")
 TELNYX_WEBHOOK_SECRET = os.environ.get("TELNYX_WEBHOOK_SECRET", "")
 VAPI_API_KEY          = os.environ.get("VAPI_API_KEY", "")
+MS_GRAPH_CLIENT_ID     = os.environ.get("MS_GRAPH_CLIENT_ID", "")
+MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
 # This server's own public URL — needed so Vapi's Custom LLM provider
 # knows where to send voice-call LLM requests back to us (see the
 # vapi_custom_llm() route). Without this set correctly, voice calls
@@ -270,6 +315,32 @@ def init_db():
             created_at       TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Graph OAuth tokens — one row per customer (not per-server like
+        -- mcp_oauth_tokens above, since Outlook and Teams both authenticate
+        -- through the same single Curant-owned Azure AD app and the same
+        -- Microsoft Graph access token covers both). See the module comment
+        -- above get_graph_tools() for why this is a fixed, non-DCR app
+        -- rather than the discover-and-register flow mcp_oauth_tokens uses.
+        CREATE TABLE IF NOT EXISTS graph_oauth_tokens (
+            customer_id    TEXT PRIMARY KEY,
+            access_token   TEXT,
+            refresh_token  TEXT,
+            expires_at     REAL,
+            scope          TEXT,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Same short-lived pending-flow pattern as mcp_oauth_pending, but
+        -- Graph only ever needs the PKCE verifier + which customer this is
+        -- for — client_id/secret are fixed (MS_GRAPH_CLIENT_ID/SECRET), not
+        -- per-flow like a dynamically-registered MCP client's would be.
+        CREATE TABLE IF NOT EXISTS graph_oauth_pending (
+            state          TEXT PRIMARY KEY,
+            customer_id    TEXT,
+            code_verifier  TEXT,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- Per-customer memories (same schema as Home)
         CREATE TABLE IF NOT EXISTS memories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -387,6 +458,18 @@ def init_db():
             duration_seconds    REAL,
             estimated_cost_usd  REAL,
             created_at          TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
+        -- Calls currently in progress, tracked so the background voice-cap
+        -- enforcer (see _voice_cap_enforcer below) knows which live calls to
+        -- poll. Populated on "assistant-request", removed on
+        -- "end-of-call-report" or once the enforcer itself ends a call.
+        CREATE TABLE IF NOT EXISTS active_voice_calls (
+            call_id      TEXT PRIMARY KEY,
+            customer_id  TEXT,
+            started_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            ended_by_cap INTEGER DEFAULT 0,
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
@@ -710,24 +793,33 @@ PROVIDER_MODELS = {
 # ── Voice spend tracking and monthly cap ─────────────────────────────────────
 # Previously nothing tracked voice usage at all — spend was only visible by
 # checking Vapi's own dashboard by hand. This closes that gap: real
-# per-customer usage logging, plus a monthly cap with visibility for the
-# business owner when a customer crosses it.
+# per-customer usage logging, a monthly cap, AND (as of Aug 2026) an actual
+# hard stop on live calls, not just visibility.
 #
-# HONEST LIMITATION, stated plainly rather than glossed over: unlike Home's
-# generation-tool cap (which blocks a paid call before it fires), a live
-# voice call is already connecting by the time assistant-request runs, and
-# Vapi bills its own platform/STT/TTS cost per minute regardless of which
-# LLM key is used for that call — swapping to a different key doesn't stop
-# that cost. Cleanly rejecting or ending a call from assistant-request would
-# need a specific Vapi mechanism that hasn't been verified against their
-# current docs (same standard as the "NOT independently re-verified" flag
-# already on this webhook's response shape). Until that's confirmed, this
-# implements what's actually solid: real usage visibility, a soft in-call
-# warning to the model once a customer is over cap, and a flagged alert in
-# the owner dashboard so a person can decide whether to intervene — the same
-# "log it, let a human decide" pattern already used for device-release
-# requests, rather than fabricating a hard stop this codebase can't
-# guarantee actually works.
+# UPDATE, Aug 2026: the "no verified mechanism" limitation below is
+# resolved. Confirmed against Vapi's current docs (docs.vapi.ai/calls/
+# call-features, "Live Call Control"): any live call exposes a
+# monitor.controlUrl, fetchable via GET https://api.vapi.ai/call/{id} with
+# our own API key regardless of who initiated the call (assistant-request
+# doesn't need to have created it via POST /call — that's just the
+# doc example's way of showing the response shape). POSTing
+# {"type": "end-call"} to that controlUrl ends the call immediately.
+# _voice_cap_enforcer() below polls each active call's live running cost via
+# that same GET and ends it the moment the customer's monthly cap is
+# breached mid-call — the actual hard stop that was previously flagged as
+# unverified.
+#
+# HONEST LIMITATION, still stated plainly: this has NOT been exercised
+# against a real live phone call in this environment — no live Vapi call
+# has actually been placed here to confirm the call object's exact field
+# names (monitor.controlUrl, cost) survive unchanged for a real inbound
+# PSTN call routed through Telnyx, as opposed to the outbound-call example
+# in Vapi's docs. Confirm against one real test call before trusting this
+# in front of an actual customer, same standard already applied elsewhere
+# in this file (FLUX/Veo, the OAuth flow, the webhook's own response
+# shape). If it doesn't hold, this degrades safely: the enforcer thread
+# just logs and skips a call it can't parse, and the pre-existing soft
+# in-system-prompt warning below still applies regardless.
 VAPI_ESTIMATED_COST_PER_MINUTE_USD = 0.20  # Vapi's platform fee alone is $0.05/min;
                                              # $0.15-0.33/min all-in with STT/LLM/TTS
                                              # per Vapi's own published numbers — same
@@ -777,6 +869,118 @@ def is_over_voice_cap(customer: dict) -> tuple[bool, float, float | None]:
         return False, 0.0, None
     spend = get_monthly_voice_spend(customer["id"])
     return spend >= cap, spend, cap
+
+
+def _track_active_call(call_id: str, customer_id: str):
+    """Called from assistant-request once we know both IDs, so the
+    background enforcer has something to poll."""
+    if not call_id or not customer_id:
+        return
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO active_voice_calls (call_id, customer_id) VALUES (?, ?) "
+            "ON CONFLICT(call_id) DO NOTHING",
+            (call_id, customer_id),
+        )
+        conn.commit()
+
+
+def _untrack_active_call(call_id: str):
+    if not call_id:
+        return
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM active_voice_calls WHERE call_id = ?", (call_id,))
+        conn.commit()
+
+
+def _vapi_get_call(call_id: str) -> dict | None:
+    """GET the current call resource from Vapi's REST API — the same
+    representation returned by POST /call, including monitor.controlUrl
+    and a live-updating cost field, per docs.vapi.ai/calls/call-features.
+    Returns None on any failure rather than raising, since this runs from
+    a background loop that must never crash the whole enforcer thread over
+    one bad call."""
+    if not VAPI_API_KEY:
+        return None
+    try:
+        resp = http.get(
+            f"https://api.vapi.ai/call/{call_id}",
+            headers={"Authorization": f"Bearer {VAPI_API_KEY}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def _vapi_end_call(control_url: str) -> bool:
+    """POST the documented Live Call Control end-call message. Returns
+    whether the request itself succeeded (2xx) — not a guarantee the call
+    actually hung up, just that Vapi accepted the instruction."""
+    try:
+        resp = http.post(control_url, json={"type": "end-call"}, timeout=10)
+        return 200 <= resp.status_code < 300
+    except Exception:
+        return False
+
+
+def _voice_cap_enforcer():
+    """Background daemon, same pattern as _session_cleanup below: polls
+    every 20 seconds for any active call whose customer has now crossed
+    their monthly voice cap mid-call (started under cap, crossed it while
+    talking — the case the monthly-spend-at-call-start check in
+    assistant-request can't catch), and ends it via Live Call Control.
+    Uses Vapi's own live "cost" field on the call object rather than
+    re-deriving cost from duration, since Vapi's number reflects whatever
+    it's actually going to bill, not our per-minute estimate."""
+    while True:
+        time.sleep(20)
+        try:
+            with closing(get_db()) as conn:
+                rows = conn.execute(
+                    "SELECT call_id, customer_id FROM active_voice_calls WHERE ended_by_cap = 0"
+                ).fetchall()
+            for row in rows:
+                call_id, customer_id = row["call_id"], row["customer_id"]
+                customer = get_customer(customer_id)
+                if not customer:
+                    continue
+                cap = get_voice_cap(customer)
+                if cap is None:  # explicitly uncapped
+                    continue
+                already_logged = get_monthly_voice_spend(customer_id)
+                call = _vapi_get_call(call_id)
+                if not call:
+                    continue
+                live_cost = call.get("cost")
+                if live_cost is None:  # field missing/renamed — degrade safely, see module comment
+                    continue
+                if already_logged + float(live_cost) < cap:
+                    continue
+                control_url = (call.get("monitor") or {}).get("controlUrl")
+                if not control_url:
+                    continue
+                if _vapi_end_call(control_url):
+                    with closing(get_db()) as conn:
+                        conn.execute(
+                            "UPDATE active_voice_calls SET ended_by_cap = 1 WHERE call_id = ?",
+                            (call_id,),
+                        )
+                        conn.execute(
+                            "INSERT INTO error_reports (customer_id, error_code, component) "
+                            "VALUES (?, ?, ?)",
+                            (customer_id, "voice_call_ended_mid_call_over_cap", "_voice_cap_enforcer"),
+                        )
+                        conn.commit()
+        except Exception:
+            # Never let one bad iteration kill the whole background thread —
+            # same defensive stance as _session_cleanup.
+            continue
+
+
+threading.Thread(target=_voice_cap_enforcer, daemon=True).start()
 
 
 # ── August's generation services — key storage, cost tracking, spend cap ────
@@ -2002,12 +2206,21 @@ def get_mcp_servers_for_customer(customer_id: str, enabled_only: bool = True) ->
 
 
 def _get_mcp_token_row(customer_id: str, server_name: str):
+    """Single choke point for reading this table — decrypts access_token,
+    refresh_token, and client_secret here so every caller downstream gets
+    plaintext without needing to know encryption is involved at all."""
     with closing(get_db()) as conn:
         row = conn.execute(
             "SELECT * FROM mcp_oauth_tokens WHERE customer_id=? AND server_name=?",
             (customer_id, server_name),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        row = dict(row)
+        row["access_token"] = _dec(row.get("access_token"))
+        row["refresh_token"] = _dec(row.get("refresh_token"))
+        row["client_secret"] = _dec(row.get("client_secret"))
+        return row
 
 
 def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | None:
@@ -2042,7 +2255,7 @@ def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | No
             conn.execute(
                 "UPDATE mcp_oauth_tokens SET access_token=?, refresh_token=?, expires_at=? "
                 "WHERE customer_id=? AND server_name=?",
-                (new_access, new_refresh, expires_at, customer_id, server_name),
+                (_enc(new_access), _enc(new_refresh), expires_at, customer_id, server_name),
             )
             conn.commit()
         return new_access
@@ -2146,6 +2359,67 @@ def _get_mcp_server_tools_cached(customer_id: str, server: dict) -> list[dict]:
         )
         conn.commit()
     return tools
+
+
+def get_graph_tools(customer: dict) -> list[dict]:
+    """Outlook + Teams tools, backed directly by Microsoft Graph via the
+    single Curant-owned Azure app (see the module comment above the
+    /cloud/graph/connect route for the full Option-B reasoning). Same
+    "only offer it if it'll actually work" gating as get_workspace_tools —
+    no point exposing these to the model for a customer who's never
+    connected their Microsoft account."""
+    if not _get_graph_token(customer.get("id", "")):
+        return []
+    return [
+        {"qualified_name": "graph_search_emails", "raw_name": "graph_search_emails",
+         "description": "Search or list the customer's Outlook inbox (top results, most "
+                         "recent first). Pass a Microsoft Graph $search-style query, or "
+                         "leave blank to just list recent mail.",
+         "input_schema": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "Free-text search, or blank for recent mail"},
+             "limit": {"type": "integer", "description": "Max results, default 10"}},
+             "required": []}},
+        {"qualified_name": "graph_send_email", "raw_name": "graph_send_email",
+         "description": "Send an email from the customer's own Outlook account. Requires "
+                         "explicit customer confirmation first, same as gmail_send.",
+         "input_schema": {"type": "object", "properties": {
+             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
+             "confirmed": {"type": "boolean"}},
+             "required": ["to", "subject", "body"]}},
+        {"qualified_name": "graph_list_calendar_events", "raw_name": "graph_list_calendar_events",
+         "description": "List the customer's upcoming Outlook calendar events.",
+         "input_schema": {"type": "object", "properties": {
+             "days_ahead": {"type": "integer", "description": "How many days out to look, default 7"}},
+             "required": []}},
+        {"qualified_name": "graph_create_calendar_event", "raw_name": "graph_create_calendar_event",
+         "description": "Create an Outlook calendar event. Inviting attendees requires "
+                         "explicit customer confirmation first, same as calendar_create_event.",
+         "input_schema": {"type": "object", "properties": {
+             "subject": {"type": "string"},
+             "start_iso": {"type": "string", "description": "ISO 8601, e.g. 2026-09-01T14:00:00"},
+             "end_iso": {"type": "string", "description": "ISO 8601"},
+             "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses"},
+             "confirmed": {"type": "boolean"}},
+             "required": ["subject", "start_iso", "end_iso"]}},
+        {"qualified_name": "graph_list_teams_channels", "raw_name": "graph_list_teams_channels",
+         "description": "List the customer's joined Microsoft Teams and each team's channels "
+                         "— use this first to find the team_id/channel_id needed by "
+                         "graph_send_teams_message or graph_get_channel_messages.",
+         "input_schema": {"type": "object", "properties": {}, "required": []}},
+        {"qualified_name": "graph_get_channel_messages", "raw_name": "graph_get_channel_messages",
+         "description": "Read recent messages from a Teams channel (from graph_list_teams_channels).",
+         "input_schema": {"type": "object", "properties": {
+             "team_id": {"type": "string"}, "channel_id": {"type": "string"},
+             "limit": {"type": "integer", "description": "Max messages, default 20"}},
+             "required": ["team_id", "channel_id"]}},
+        {"qualified_name": "graph_send_teams_message", "raw_name": "graph_send_teams_message",
+         "description": "Post a message to a Teams channel (from graph_list_teams_channels). "
+                         "Requires explicit customer confirmation first, same as any other send.",
+         "input_schema": {"type": "object", "properties": {
+             "team_id": {"type": "string"}, "channel_id": {"type": "string"},
+             "message": {"type": "string"}, "confirmed": {"type": "boolean"}},
+             "required": ["team_id", "channel_id", "message"]}},
+    ]
 
 
 def get_mcp_tools(customer: dict) -> list[dict]:
@@ -2473,6 +2747,117 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict,
                     f"Monthly cap: ${cap:.2f} — ~${max(cap - monthly_spend, 0):.2f} remaining this month.")
         return f"This month's generation spend: ~${monthly_spend:.2f}. {cap_line}"
 
+    if tool_name == "graph_search_emails":
+        params = {"$top": arguments.get("limit", 10), "$orderby": "receivedDateTime desc"}
+        if arguments.get("query"):
+            params["$search"] = f'"{arguments["query"]}"'
+        from urllib.parse import urlencode
+        data, err = _graph_api(cid, "GET", f"/me/messages?{urlencode(params)}")
+        if err:
+            return f"[{err}]"
+        msgs = data.get("value", [])
+        if not msgs:
+            return "No matching emails found."
+        return "\n".join(
+            f"[{m['id']}] {m.get('subject', '(no subject)')} — from "
+            f"{(m.get('from') or {}).get('emailAddress', {}).get('address', 'unknown')} "
+            f"({m.get('receivedDateTime', '')})"
+            for m in msgs
+        )
+
+    if tool_name == "graph_send_email":
+        if not arguments.get("confirmed"):
+            return ("Not sent — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
+        body = {
+            "message": {
+                "subject": arguments.get("subject", ""),
+                "body": {"contentType": "Text", "content": arguments.get("body", "")},
+                "toRecipients": [{"emailAddress": {"address": arguments.get("to", "")}}],
+            }
+        }
+        _, err = _graph_api(cid, "POST", "/me/sendMail", body)
+        return f"[{err}]" if err else "Email sent."
+
+    if tool_name == "graph_list_calendar_events":
+        from datetime import datetime, timedelta
+        days_ahead = arguments.get("days_ahead", 7)
+        start = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat() + "Z"
+        data, err = _graph_api(
+            cid, "GET",
+            f"/me/calendarView?startDateTime={start}&endDateTime={end}&$orderby=start/dateTime",
+        )
+        if err:
+            return f"[{err}]"
+        events = data.get("value", [])
+        if not events:
+            return "No upcoming events in that window."
+        return "\n".join(
+            f"[{e['id']}] {e.get('subject', '(no subject)')} — "
+            f"{e.get('start', {}).get('dateTime', '?')} to {e.get('end', {}).get('dateTime', '?')}"
+            for e in events
+        )
+
+    if tool_name == "graph_create_calendar_event":
+        if arguments.get("attendees") and not arguments.get("confirmed"):
+            return ("Not created — inviting attendees requires explicit customer confirmation "
+                     "first. Ask the customer to confirm, wait for their reply, then call this "
+                     "again with confirmed=true.")
+        body = {
+            "subject": arguments.get("subject", ""),
+            "start": {"dateTime": arguments.get("start_iso", ""), "timeZone": "UTC"},
+            "end": {"dateTime": arguments.get("end_iso", ""), "timeZone": "UTC"},
+        }
+        if arguments.get("attendees"):
+            body["attendees"] = [
+                {"emailAddress": {"address": a}, "type": "required"} for a in arguments["attendees"]
+            ]
+        data, err = _graph_api(cid, "POST", "/me/events", body)
+        if err:
+            return f"[{err}]"
+        return f"Event created: {data.get('subject', '')} (id: {data.get('id', '')})"
+
+    if tool_name == "graph_list_teams_channels":
+        teams_data, err = _graph_api(cid, "GET", "/me/joinedTeams")
+        if err:
+            return f"[{err}]"
+        teams = teams_data.get("value", [])
+        if not teams:
+            return "No joined Teams found."
+        lines = []
+        for t in teams:
+            chans, cerr = _graph_api(cid, "GET", f"/teams/{t['id']}/channels")
+            chan_list = ", ".join(f"{c['displayName']} (channel_id: {c['id']})" for c in (chans or {}).get("value", [])) if not cerr else f"[{cerr}]"
+            lines.append(f"{t.get('displayName', '(unnamed)')} (team_id: {t['id']}) — channels: {chan_list}")
+        return "\n".join(lines)
+
+    if tool_name == "graph_get_channel_messages":
+        team_id, channel_id = arguments.get("team_id", ""), arguments.get("channel_id", "")
+        limit = arguments.get("limit", 20)
+        data, err = _graph_api(cid, "GET", f"/teams/{team_id}/channels/{channel_id}/messages?$top={limit}")
+        if err:
+            return f"[{err}]"
+        msgs = data.get("value", [])
+        if not msgs:
+            return "No messages found in that channel."
+        return "\n".join(
+            f"{(m.get('from') or {}).get('user', {}).get('displayName', 'unknown')}: "
+            f"{(m.get('body') or {}).get('content', '')}"
+            for m in msgs
+        )
+
+    if tool_name == "graph_send_teams_message":
+        if not arguments.get("confirmed"):
+            return ("Not sent — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
+        team_id, channel_id = arguments.get("team_id", ""), arguments.get("channel_id", "")
+        body = {"body": {"content": arguments.get("message", "")}}
+        _, err = _graph_api(cid, "POST", f"/teams/{team_id}/channels/{channel_id}/messages", body)
+        return f"[{err}]" if err else "Message posted to the channel."
+
     if tool_name == "gmail_search":
         results = search_emails(email, query=arguments.get("query", ""))
         if not results:
@@ -2772,7 +3157,7 @@ def generate_reply(customer: dict, user_message: str,
 
     tools = (get_workspace_tools(customer) + get_grading_tools(customer)
              + get_browser_automation_tools(customer) + get_august_tools(customer)
-             + get_mcp_tools(customer))
+             + get_mcp_tools(customer) + get_graph_tools(customer))
 
     try:
         if tools:
@@ -3917,6 +4302,10 @@ def vapi_webhook():
         # suggest switching to text, and logs a flagged alert so a
         # person can decide whether to intervene, same "log it, human
         # decides" pattern as device-release requests.
+        call_id = message.get("call", {}).get("id", "")
+        if customer and call_id:
+            _track_active_call(call_id, customer["id"])
+
         if customer:
             over_cap, monthly_spend, cap = is_over_voice_cap(customer)
             if over_cap:
@@ -3972,6 +4361,11 @@ def vapi_webhook():
         call_info  = message.get("call", {})
         caller     = call_info.get("customer", {}).get("number", "")
         customer   = get_customer_by_phone(caller) if caller else None
+
+        # Stop the background enforcer from polling a call that's already
+        # over — whether it ended naturally or was ended by _voice_cap_enforcer
+        # itself, there's nothing left to poll.
+        _untrack_active_call(call_info.get("id", ""))
         if customer and transcript:
             save_message(customer["id"], "user", f"[Voice call transcript]: {transcript}")
 
@@ -4850,8 +5244,8 @@ def mcp_oauth_callback():
                  token_endpoint=excluded.token_endpoint, access_token=excluded.access_token,
                  refresh_token=excluded.refresh_token, expires_at=excluded.expires_at,
                  updated_at=CURRENT_TIMESTAMP""",
-            (row["customer_id"], row["server_name"], row["client_id"], row["client_secret"],
-             row["token_endpoint"], tokens["access_token"], tokens.get("refresh_token"), expires_at),
+            (row["customer_id"], row["server_name"], row["client_id"], _enc(row["client_secret"]),
+             row["token_endpoint"], _enc(tokens["access_token"]), _enc(tokens.get("refresh_token")), expires_at),
         )
         conn.execute(
             """INSERT INTO mcp_servers (customer_id, name, url, transport, auth_mode, enabled)
@@ -4862,6 +5256,214 @@ def mcp_oauth_callback():
         conn.commit()
 
     return redirect(url_for("cloud_dashboard"))
+
+
+# ── Microsoft Graph OAuth (Outlook + Teams) ─────────────────────────────────
+# Deliberately NOT built on the discover-and-register flow above — Microsoft
+# doesn't support RFC 7591 Dynamic Client Registration for this, so there's
+# no per-connection client to create. Instead this is one fixed, Curant-
+# owned Azure AD app (MS_GRAPH_CLIENT_ID/SECRET, registered once by hand in
+# Curant's own Azure tenant, multi-tenant + personal-account support
+# enabled), and every customer does a normal OAuth 2.0 authorization-code
+# + PKCE consent against Microsoft's own login page — same "one global app,
+# per-customer consent" shape as GitHub/Figma/Atlassian, and the whole
+# reason Option B (this) was chosen over Microsoft's own official Work IQ
+# Mail/Calendar and Teams Graph MCP servers, which need a customer M365
+# Copilot license plus their own IT admin registering a per-tenant Entra
+# app — real friction most individual customers can't clear. See the
+# graph_oauth_tokens/graph_oauth_pending table comments above for the
+# schema, and get_graph_tools() below for the tools this unlocks.
+#
+# HONEST LIMITATION: like the rest of this file's OAuth code, this has NOT
+# been exercised against a real Microsoft account in this environment — no
+# live Azure app exists here to test the authorization-code exchange
+# against. Confirm against a real customer's Microsoft 365 or personal
+# account before trusting this in production, same standard as everywhere
+# else in this file.
+MS_GRAPH_AUTHORITY = "https://login.microsoftonline.com/common/oauth2/v2.0"
+MS_GRAPH_SCOPES = (
+    "offline_access User.Read Mail.ReadWrite Calendars.ReadWrite "
+    "Chat.ReadWrite ChannelMessage.Read.All ChannelMessage.Send Team.ReadBasic.All "
+    "Channel.ReadBasic.All"
+)
+
+
+@app.route("/cloud/graph/connect")
+@require_customer
+def graph_oauth_start():
+    if not MS_GRAPH_CLIENT_ID:
+        return ("Outlook/Teams isn't configured on this server yet — "
+                "MS_GRAPH_CLIENT_ID/SECRET aren't set.", 503)
+    cid = session["customer_id"]
+
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM graph_oauth_pending WHERE created_at < datetime('now', '-30 minutes')")
+        conn.commit()
+
+    verifier, challenge = _mcp_oauth_pkce_pair()
+    state = secrets.token_urlsafe(32)
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO graph_oauth_pending (state, customer_id, code_verifier) VALUES (?, ?, ?)",
+            (state, cid, verifier),
+        )
+        conn.commit()
+
+    from urllib.parse import urlencode
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/graph/callback"
+    auth_params = {
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "response_mode": "query",
+        "scope": MS_GRAPH_SCOPES,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    return redirect(f"{MS_GRAPH_AUTHORITY}/authorize?{urlencode(auth_params)}")
+
+
+@app.route("/cloud/graph/callback")
+def graph_oauth_callback():
+    """No @require_customer here for the same reason as mcp_oauth_callback
+    above — this is Microsoft's redirect landing, not the customer
+    navigating directly; the state lookup is what authenticates it."""
+    code = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        return f"Connection was not completed: {error}", 400
+    if not code or not state:
+        return "Missing code or state in callback.", 400
+
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM graph_oauth_pending WHERE state=?", (state,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM graph_oauth_pending WHERE state=?", (state,))
+            conn.commit()
+    if not row:
+        return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
+
+    row = dict(row)
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/graph/callback"
+    try:
+        resp = http.post(
+            f"{MS_GRAPH_AUTHORITY}/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": MS_GRAPH_CLIENT_ID,
+                "client_secret": MS_GRAPH_CLIENT_SECRET,
+                "code_verifier": row["code_verifier"],
+                "scope": MS_GRAPH_SCOPES,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as e:
+        return f"Couldn't complete the connection: {e}", 502
+
+    expires_at = time.time() + tokens.get("expires_in", 3600)
+    with closing(get_db()) as conn:
+        conn.execute(
+            """INSERT INTO graph_oauth_tokens (customer_id, access_token, refresh_token, expires_at, scope)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(customer_id) DO UPDATE SET
+                 access_token=excluded.access_token, refresh_token=excluded.refresh_token,
+                 expires_at=excluded.expires_at, scope=excluded.scope, updated_at=CURRENT_TIMESTAMP""",
+            (row["customer_id"], _enc(tokens["access_token"]), _enc(tokens.get("refresh_token")),
+             expires_at, tokens.get("scope", "")),
+        )
+        conn.commit()
+
+    return redirect(url_for("cloud_dashboard"))
+
+
+@app.route("/cloud/graph/disconnect", methods=["POST"])
+@require_customer
+def graph_oauth_disconnect():
+    if not check_csrf():
+        return "Bad request.", 400
+    cid = session["customer_id"]
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM graph_oauth_tokens WHERE customer_id=?", (cid,))
+        conn.commit()
+    return redirect(url_for("cloud_dashboard"))
+
+
+def _get_graph_token(customer_id: str) -> str | None:
+    """Returns a valid Graph access token, refreshing via the stored
+    refresh token first if expired. Returns None if the customer has
+    never connected, or refresh itself fails (they'll need to reconnect
+    via the dashboard) — same pattern as _refresh_mcp_token_if_needed."""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM graph_oauth_tokens WHERE customer_id=?", (customer_id,)
+        ).fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    row["access_token"] = _dec(row.get("access_token"))
+    row["refresh_token"] = _dec(row.get("refresh_token"))
+    if row.get("expires_at") and time.time() < row["expires_at"] - 60:
+        return row["access_token"]
+    if not row.get("refresh_token"):
+        return row.get("access_token")
+
+    try:
+        resp = http.post(
+            f"{MS_GRAPH_AUTHORITY}/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": row["refresh_token"],
+                "client_id": MS_GRAPH_CLIENT_ID,
+                "client_secret": MS_GRAPH_CLIENT_SECRET,
+                "scope": MS_GRAPH_SCOPES,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_access = data["access_token"]
+        new_refresh = data.get("refresh_token", row["refresh_token"])
+        new_expires_at = time.time() + data.get("expires_in", 3600)
+        with closing(get_db()) as conn:
+            conn.execute(
+                "UPDATE graph_oauth_tokens SET access_token=?, refresh_token=?, expires_at=? "
+                "WHERE customer_id=?",
+                (_enc(new_access), _enc(new_refresh), new_expires_at, customer_id),
+            )
+            conn.commit()
+        return new_access
+    except Exception as e:
+        print(f"Graph token refresh failed for {customer_id} (non-fatal): {e}", file=sys.stderr)
+        return row.get("access_token")
+
+
+def _graph_api(customer_id: str, method: str, path: str, json_body: dict | None = None) -> tuple[dict | None, str | None]:
+    """One call against https://graph.microsoft.com/v1.0{path}. Returns
+    (json_response_or_None, error_message_or_None) — never raises, so
+    every graph_* tool function below can just check which one came
+    back rather than wrapping every call in its own try/except."""
+    token = _get_graph_token(customer_id)
+    if not token:
+        return None, "Outlook/Teams isn't connected for this account yet — connect it from the Cloud dashboard first."
+    try:
+        resp = http.request(
+            method, f"https://graph.microsoft.com/v1.0{path}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=json_body, timeout=20,
+        )
+        if resp.status_code == 204:
+            return {}, None
+        resp.raise_for_status()
+        return (resp.json() if resp.content else {}), None
+    except Exception as e:
+        return None, f"Microsoft Graph request failed: {e}"
 
 
 @app.route("/cloud/mcp/disconnect/<server_name>", methods=["POST"])
@@ -5037,6 +5639,21 @@ def cloud_dashboard():
     </div>
     {% endfor %}
 
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0">
+      <div>
+        <strong>Outlook &amp; Teams</strong>
+        <div class="muted" style="font-size:.8rem">Mail, calendar, and Teams channels — via a direct Microsoft sign-in, no Microsoft 365 Copilot license needed.</div>
+      </div>
+      {% if graph_connected %}
+      <form method="post" action="/cloud/graph/disconnect" style="margin:0">
+        {{ csrf }}
+        <button type="submit" style="background:none;border:1px solid #ddd;border-radius:20px;padding:6px 14px;font-size:.8rem;cursor:pointer;color:#a33">Disconnect</button>
+      </form>
+      {% else %}
+      <a href="/cloud/graph/connect" style="background:#111;color:#fff;border-radius:20px;padding:6px 14px;font-size:.8rem;text-decoration:none">Connect</a>
+      {% endif %}
+    </div>
+
     {% if 'august' in unlocked_addons %}
     <h2>August's generation keys</h2>
     {% if not customer.workspace_email %}
@@ -5084,6 +5701,7 @@ def cloud_dashboard():
     unlocked_addons=get_unlocked_addons(customer),
     known_mcp_services=KNOWN_MCP_SERVICES,
     connected_mcp_server_names={s["name"] for s in get_mcp_servers_for_customer(cid, enabled_only=False)},
+    graph_connected=bool(_get_graph_token(cid)),
     plan_display_names={"cloud_base": "Base — $29/mo", "cloud_executive": "Executive — $149/mo"},
     csrf=CSRF_FIELD.format(get_csrf()))
 
