@@ -63,7 +63,6 @@ Everything below is real, tested code — not scaffolding or planning documents.
 **Both tiers:**
 - All ten personas, with real job-specific tool knowledge per domain (verified against current vendor documentation, not assumed — e.g. Clio for legal, Epic/athenahealth for healthcare admin, MLS/Follow Up Boss for real estate)
 - Persistent memory with real near-duplicate detection (not just exact-string matching)
-- MCP tool connections for whatever a customer already uses
 - Browser automation — fills and submits real web forms, with `confirmed: true` enforced **in code**, not just requested by prompt, and a hard, code-level block on anything that looks like a payment or sensitive-ID field, regardless of confirmation
 - August's generation tools — FLUX, Ideogram, ElevenLabs, Veo — all real, working integrations, gated by a per-customer monthly spend cap that's checked *before* any paid call fires, not just logged after
 - Aaron's grading calibration system (rubric + example-based, spread-checking, correction feedback loop)
@@ -73,6 +72,7 @@ Everything below is real, tested code — not scaffolding or planning documents.
 
 **Home specifically:**
 - Fully local — Claude is called directly from the customer's Mac; nothing about a conversation touches Curant's servers except a minimal license/billing check
+- **MCP tool connections** — a curated registry of pre-verified official servers (Linear, GitHub, Atlassian/Jira+Confluence+Bitbucket, Descript) connectable with one command, plus the ability to connect any other MCP server a customer already uses. **Not currently on Cloud** — Cloud has no MCP support at all yet, a real gap, not a documentation omission (see "What's Not Done Yet")
 - A local front-door layer (small model via Ollama, optional, fails safe if not installed): PII redaction before anything reaches Claude's API, a triviality short-circuit that skips a full API call for simple acknowledgments, and a degraded offline fallback if connectivity drops
 - Local encrypted backup and a portable, model-agnostic context export format (CPMF) — a customer's accumulated context is explicitly designed to be *their* asset, not a vendor lock-in mechanic
 
@@ -90,6 +90,7 @@ Everything below is real, tested code — not scaffolding or planning documents.
 Split honestly into two categories — what's buildable but simply hasn't been prioritized yet, and what's genuinely blocked on something outside a code editor.
 
 ### Buildable, not yet built or decided
+- **Cloud has no MCP support at all.** Home has a full MCP client with a curated registry of pre-verified official servers (Linear, GitHub, Atlassian/Jira, Descript) plus the ability to connect any other MCP server. Cloud has none of this — no equivalent registry, no connection mechanism. A real feature-parity gap, not yet scoped or started.
 - **Add-on pricing isn't finalized.** The two real gated add-ons (browser automation, August) have founder-placeholder prices ($10/mo, $15/mo) wired into Stripe, not a finished business decision.
 - **Portal-cancellation cleanup behavior is configured but defaults to the conservative option.** Cancelling in-app immediately releases the phone number and deprovisions Workspace; cancelling via Stripe's portal only disables the account unless a specific env var is deliberately flipped.
 - **The regression test suite has never actually been run against a live model.** It's real, working code (verified via import-only dry runs), but needs a real `ANTHROPIC_API_KEY` to execute for real — that hasn't happened yet.
