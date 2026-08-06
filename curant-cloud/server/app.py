@@ -212,6 +212,64 @@ def init_db():
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
+        -- MCP tool connections — customer-scoped version of Home's
+        -- mcp_servers table (Home only ever has one customer per install,
+        -- so it doesn't need this scoping; Cloud does).
+        CREATE TABLE IF NOT EXISTS mcp_servers (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id      TEXT,
+            name             TEXT,        -- matches a KNOWN_MCP_SERVICES key, or a custom name
+            url              TEXT,
+            transport        TEXT DEFAULT 'http',  -- 'http' | 'sse' — no 'stdio' on Cloud, see
+                                                      -- the module comment above KNOWN_MCP_SERVICES
+            auth_mode        TEXT DEFAULT 'oauth',  -- 'oauth' | 'none' (static header/API key)
+            headers          TEXT,        -- JSON object, only used when auth_mode='none'
+            enabled          INTEGER DEFAULT 1,
+            tools_cache      TEXT,
+            tools_cached_at  TEXT,
+            created_at       TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(customer_id, name),
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
+        -- OAuth tokens for connected MCP servers, keyed by customer AND
+        -- server (unlike Home's mcp_oauth_tokens, which only needs
+        -- server_name as the key). token_endpoint is stored alongside
+        -- the tokens themselves since refreshing later needs it and
+        -- there's no OAuthClientProvider object persisting it in memory
+        -- the way Home's synchronous flow has.
+        CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
+            customer_id     TEXT,
+            server_name     TEXT,
+            client_id       TEXT,
+            client_secret   TEXT,
+            token_endpoint  TEXT,
+            access_token    TEXT,
+            refresh_token   TEXT,
+            expires_at      REAL,
+            updated_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (customer_id, server_name)
+        );
+
+        -- Short-lived state for an OAuth flow IN PROGRESS — holds the
+        -- PKCE verifier, client credentials, and which customer/server
+        -- this is for, between the initial "Connect" redirect and the
+        -- provider's callback landing sometime later. Rows are deleted
+        -- once consumed by the callback (or left to expire — see
+        -- mcp_oauth_start's cleanup of stale rows).
+        CREATE TABLE IF NOT EXISTS mcp_oauth_pending (
+            state            TEXT PRIMARY KEY,
+            customer_id      TEXT,
+            server_name      TEXT,
+            code_verifier    TEXT,
+            client_id        TEXT,
+            client_secret    TEXT,
+            token_endpoint   TEXT,
+            server_url       TEXT,
+            transport        TEXT,
+            created_at       TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- Per-customer memories (same schema as Home)
         CREATE TABLE IF NOT EXISTS memories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -344,6 +402,8 @@ def init_db():
             ON call_usage(customer_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_generation_costs_customer
             ON generation_costs(customer_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_mcp_servers_customer
+            ON mcp_servers(customer_id, enabled);
         """)
         conn.commit()
 
@@ -1772,6 +1832,323 @@ def get_august_tools(customer: dict) -> list[dict]:
     ]
 
 
+# ── MCP tool connections — ported from Home, one real architectural ────────
+# difference: HOW the OAuth login happens.
+#
+# Home's mcp-add-oauth runs a temporary web server on 127.0.0.1 and opens
+# the customer's own browser — that only works because the CLI and the
+# browser are the SAME machine. Cloud is one shared server handling many
+# customers, so there's no "customer's machine" to do that on. Instead:
+#   - storage is keyed by (customer_id, server_name), not just server_name
+#   - the OAuth redirect points at a PUBLIC url on Cloud's own domain
+#   - the flow is triggered from the dashboard (a real browser redirect
+#     through Cloud's server), not a CLI command, and is split across two
+#     separate HTTP requests (the initial "Connect" click, and the
+#     provider's callback sometime later) rather than Home's single
+#     synchronous process
+#
+# Because of that split, this does NOT reuse the mcp SDK's
+# OAuthClientProvider (built around a single synchronous process — its
+# redirect_handler and callback_handler are both awaited within the same
+# async call, which doesn't fit "pause after redirect, resume in a
+# separate request"). Instead this implements the standard OAuth 2.1 +
+# Dynamic Client Registration (RFC 7591) + PKCE flow directly with plain
+# HTTP calls — exactly the pattern every real multi-tenant SaaS uses for
+# "connect your Jira account" (this isn't a workaround, it's the
+# architecturally correct approach for this shape of flow). Once a valid
+# access token exists, calling tools is simple again — just an
+# Authorization: Bearer header, no OAuth machinery needed — so
+# Home's HTTP/SSE client functions port over almost unchanged from there.
+#
+# HONEST LIMITATION, stated plainly: this has NOT been tested against a
+# real OAuth provider (Atlassian, Linear, etc.) — no live app is
+# registered with any of these vendors in this environment, and no real
+# browser exists to complete an interactive login here. Confirm this
+# against a real account before trusting it in front of a real customer,
+# same standard already applied to the Vapi response-shape assumptions
+# elsewhere in this file.
+
+# Same registry as Home's KNOWN_MCP_SERVICES — deliberately HTTP/SSE only
+# (no stdio entries exist in Home's registry either, so nothing was
+# dropped moving to Cloud). stdio itself — spawning an arbitrary local
+# command — is correctly NOT supported on Cloud at all: there's no
+# "customer's machine" to spawn it on, and arbitrary command execution
+# on a shared multi-tenant server is a real security concern Home simply
+# doesn't have (one customer per install there). Keep this in sync with
+# Home's registry by hand — there's no shared-code mechanism between the
+# two independently-deployed files.
+KNOWN_MCP_SERVICES = {
+    "linear": {
+        "url": "https://mcp.linear.app/mcp", "transport": "http", "official": True,
+        "description": "Linear's own official MCP server — issues, projects, teams, comments.",
+    },
+    "atlassian": {
+        "url": "https://mcp.atlassian.com/v1/mcp/authv2", "transport": "http", "official": True,
+        "description": "Atlassian's official Rovo MCP server — Jira, Confluence, Bitbucket. "
+                        "Note: does not currently support HIPAA or FedRAMP requirements, per "
+                        "Atlassian's own documentation.",
+    },
+    "github": {
+        "url": "https://api.githubcopilot.com/mcp/", "transport": "http", "official": True,
+        "description": "GitHub's official remote MCP server — repos, issues, PRs, code review, "
+                        "CI/CD workflow runs, security alerts.",
+    },
+    "figma": {
+        "url": "https://mcp.figma.com/mcp", "transport": "http", "official": True,
+        "description": "Figma's official remote MCP server — files, designs, Dev Mode context.",
+    },
+    "hubspot": {
+        "url": "https://mcp.hubspot.com", "transport": "http", "official": True,
+        "description": "HubSpot's official remote MCP server — CRM objects, records, account data.",
+    },
+    "slack": {
+        "url": "https://mcp.slack.com/mcp", "transport": "http", "official": True,
+        "description": "Slack's official remote MCP server — messages, channels, users, canvases.",
+    },
+    "notion": {
+        "url": "https://mcp.notion.com/mcp", "transport": "http", "official": True,
+        "description": "Notion's official remote MCP server — pages, databases, comments, workspace search.",
+    },
+    "sentry": {
+        "url": "https://mcp.sentry.dev/mcp", "transport": "http", "official": True,
+        "description": "Sentry's official remote MCP server — errors, issues, debugging context.",
+    },
+    "square": {
+        "url": "https://mcp.squareup.com/sse", "transport": "sse", "official": True,
+        "description": "Square's official remote MCP server — transaction, merchant, and payment "
+                        "data. Uses SSE transport specifically, not the newer Streamable HTTP.",
+    },
+}
+
+MCP_CALL_TIMEOUT_SECONDS = 20
+MCP_TOOLS_CACHE_MAX_AGE_SECONDS = 60 * 60  # same hourly cache as Home, same reasoning —
+                                             # listing tools means a full protocol handshake
+                                             # per server, too slow to redo on every message
+
+
+# --- OAuth: metadata discovery + Dynamic Client Registration + PKCE ---
+
+def _mcp_oauth_discover_metadata(server_url: str) -> dict:
+    """
+    RFC 8414 authorization server metadata discovery — the same
+    discovery step the mcp SDK's OAuthClientProvider does internally for
+    Home, replicated manually here since Cloud can't use that class (see
+    module comment above). Tries the server's own base URL first, per
+    the MCP spec's convention of colocating .well-known there.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(server_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    resp = http.get(f"{base}/.well-known/oauth-authorization-server", timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _mcp_oauth_register_client(registration_endpoint: str, redirect_uri: str) -> dict:
+    """RFC 7591 Dynamic Client Registration — gets a client_id (and
+    sometimes client_secret) without any manual per-vendor developer
+    portal setup, same automatic registration Home's flow relies on."""
+    resp = http.post(
+        registration_endpoint,
+        json={
+            "client_name": "Curant",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _mcp_oauth_pkce_pair():
+    """Generates a PKCE code_verifier/code_challenge pair (S256), per
+    OAuth 2.1's requirement — protects the authorization code exchange
+    even though this is a confidential-ish server-side flow."""
+    import hashlib
+    import base64
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    return verifier, challenge
+
+
+def get_mcp_servers_for_customer(customer_id: str, enabled_only: bool = True) -> list[dict]:
+    with closing(get_db()) as conn:
+        query = "SELECT * FROM mcp_servers WHERE customer_id=?"
+        params = [customer_id]
+        if enabled_only:
+            query += " AND enabled=1"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _get_mcp_token_row(customer_id: str, server_name: str):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM mcp_oauth_tokens WHERE customer_id=? AND server_name=?",
+            (customer_id, server_name),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | None:
+    """Returns a valid access token, refreshing via the stored refresh
+    token first if the current one has expired. Returns None if there's
+    no token on file at all, or refresh itself fails (the customer needs
+    to reconnect via the dashboard in that case)."""
+    row = _get_mcp_token_row(customer_id, server_name)
+    if not row:
+        return None
+    if row.get("expires_at") and time.time() < row["expires_at"] - 60:
+        return row["access_token"]
+    if not row.get("refresh_token") or not row.get("token_endpoint"):
+        return row.get("access_token")  # best-effort — no way to refresh, hope it's still valid
+
+    try:
+        resp = http.post(
+            row["token_endpoint"],
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": row["refresh_token"],
+                "client_id": row["client_id"],
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_access = data["access_token"]
+        new_refresh = data.get("refresh_token", row["refresh_token"])
+        expires_at = time.time() + data.get("expires_in", 3600)
+        with closing(get_db()) as conn:
+            conn.execute(
+                "UPDATE mcp_oauth_tokens SET access_token=?, refresh_token=?, expires_at=? "
+                "WHERE customer_id=? AND server_name=?",
+                (new_access, new_refresh, expires_at, customer_id, server_name),
+            )
+            conn.commit()
+        return new_access
+    except Exception as e:
+        print(f"MCP token refresh failed for {customer_id}/{server_name} (non-fatal): {e}", file=sys.stderr)
+        return row.get("access_token")
+
+
+# --- Real MCP protocol calls — ported from Home almost unchanged, since ---
+# once a valid bearer token exists, this is just plain Streamable HTTP/SSE,
+# no OAuth machinery needed at this layer at all.
+
+async def _mcp_list_tools_http_async(url, headers):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    async with streamable_http_client(url, headers=headers or None) as (read, write, _get_session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            return [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema or {}}
+                    for t in result.tools]
+
+
+async def _mcp_call_tool_http_async(url, headers, tool_name, arguments):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    async with streamable_http_client(url, headers=headers or None) as (read, write, _get_session_id):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, arguments)
+            texts = [c.text for c in result.content if hasattr(c, "text") and c.text]
+            return "\n".join(texts) if texts else "(tool returned no text output)"
+
+
+async def _mcp_list_tools_sse_async(url, headers):
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    async with sse_client(url, headers=headers or None) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            return [{"name": t.name, "description": t.description or "", "input_schema": t.inputSchema or {}}
+                    for t in result.tools]
+
+
+async def _mcp_call_tool_sse_async(url, headers, tool_name, arguments):
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+    async with sse_client(url, headers=headers or None) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, arguments)
+            texts = [c.text for c in result.content if hasattr(c, "text") and c.text]
+            return "\n".join(texts) if texts else "(tool returned no text output)"
+
+
+def list_tools_from_mcp_server(customer_id: str, server: dict) -> list[dict]:
+    """Best-effort, same as Home — an unreachable server reduces
+    capability for this message, never breaks the whole reply."""
+    try:
+        access_token = _refresh_mcp_token_if_needed(customer_id, server["name"]) if server.get("auth_mode") == "oauth" else None
+        headers = {"Authorization": f"Bearer {access_token}"} if access_token else json.loads(server.get("headers") or "{}")
+        import asyncio
+        if server.get("transport") == "sse":
+            return asyncio.run(asyncio.wait_for(_mcp_list_tools_sse_async(server["url"], headers), timeout=MCP_CALL_TIMEOUT_SECONDS))
+        return asyncio.run(asyncio.wait_for(_mcp_list_tools_http_async(server["url"], headers), timeout=MCP_CALL_TIMEOUT_SECONDS))
+    except Exception as e:
+        print(f"Could not list tools from MCP server '{server['name']}' for {customer_id} (non-fatal): {e}", file=sys.stderr)
+        return []
+
+
+def call_mcp_tool_cloud(customer_id: str, server: dict, tool_name: str, arguments: dict) -> str:
+    try:
+        access_token = _refresh_mcp_token_if_needed(customer_id, server["name"]) if server.get("auth_mode") == "oauth" else None
+        headers = {"Authorization": f"Bearer {access_token}"} if access_token else json.loads(server.get("headers") or "{}")
+        import asyncio
+        if server.get("transport") == "sse":
+            return asyncio.run(asyncio.wait_for(_mcp_call_tool_sse_async(server["url"], headers, tool_name, arguments), timeout=MCP_CALL_TIMEOUT_SECONDS))
+        return asyncio.run(asyncio.wait_for(_mcp_call_tool_http_async(server["url"], headers, tool_name, arguments), timeout=MCP_CALL_TIMEOUT_SECONDS))
+    except Exception as e:
+        return f"[Error calling this tool: {e}]"
+
+
+def _get_mcp_server_tools_cached(customer_id: str, server: dict) -> list[dict]:
+    if server.get("tools_cache") and server.get("tools_cached_at"):
+        try:
+            with closing(get_db()) as conn:
+                row = conn.execute(
+                    "SELECT (julianday('now') - julianday(?)) * 86400 AS age_seconds",
+                    (server["tools_cached_at"],),
+                ).fetchone()
+                if row and row["age_seconds"] is not None and row["age_seconds"] < MCP_TOOLS_CACHE_MAX_AGE_SECONDS:
+                    return json.loads(server["tools_cache"])
+        except Exception:
+            pass
+    tools = list_tools_from_mcp_server(customer_id, server)
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE mcp_servers SET tools_cache=?, tools_cached_at=CURRENT_TIMESTAMP WHERE customer_id=? AND name=?",
+            (json.dumps(tools), customer_id, server["name"]),
+        )
+        conn.commit()
+    return tools
+
+
+def get_mcp_tools(customer: dict) -> list[dict]:
+    """Same aggregation pattern as Home's get_all_available_tools —
+    every connected server's tools get merged into one flat list, each
+    tagged with which server it came from so a call routes back
+    correctly. Tool names prefixed server__toolname to avoid collisions."""
+    tools = []
+    for server in get_mcp_servers_for_customer(customer.get("id", "")):
+        for t in _get_mcp_server_tools_cached(customer["id"], server):
+            tools.append({
+                "qualified_name": f"{server['name']}__{t['name']}",
+                "description": f"[{server['name']}] {t['description']}",
+                "input_schema": t["input_schema"],
+                "mcp_server": server,
+                "raw_name": t["name"],
+            })
+    return tools
+
+
 def get_workspace_tools(customer: dict) -> list[dict]:
     """
     The full Workspace suite — Gmail, Calendar, Drive, Docs, Sheets,
@@ -1982,6 +2359,18 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict,
     fill_and_submit_form_hybrid) — every other tool ignores them.
     """
     cid = customer.get("id", "")
+
+    # MCP tool dispatch — checked first, same reasoning as grading/browser
+    # automation below: an MCP tool has nothing to do with Workspace and
+    # shouldn't be gated behind it. Tool names are always
+    # "servername__toolname" (see get_mcp_tools), which no built-in tool
+    # name uses, so this check is unambiguous.
+    if "__" in tool_name:
+        server_name = tool_name.split("__", 1)[0]
+        matching = [s for s in get_mcp_servers_for_customer(cid) if s["name"] == server_name]
+        if matching:
+            raw_tool_name = tool_name.split("__", 1)[1]
+            return call_mcp_tool_cloud(cid, matching[0], raw_tool_name, arguments)
 
     if tool_name == "setup_grading_assignment":
         create_or_update_grading_assignment(
@@ -2365,7 +2754,8 @@ def generate_reply(customer: dict, user_message: str,
     history.append({"role": "user", "content": user_message})
 
     tools = (get_workspace_tools(customer) + get_grading_tools(customer)
-             + get_browser_automation_tools(customer) + get_august_tools(customer))
+             + get_browser_automation_tools(customer) + get_august_tools(customer)
+             + get_mcp_tools(customer))
 
     try:
         if tools:
@@ -4093,6 +4483,15 @@ def signup_billing_success():
     return redirect(url_for("signup_provision"))
 
 
+def require_customer(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("customer_id"):
+            return redirect(url_for("customer_login"))
+        return view(*args, **kwargs)
+    return wrapped
+
+
 @app.route("/cloud/billing/portal")
 @require_customer
 def billing_portal():
@@ -4281,15 +4680,6 @@ def signup_provision():
 
 # ── Customer dashboard ─────────────────────────────────────────────────────────
 
-def require_customer(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get("customer_id"):
-            return redirect(url_for("customer_login"))
-        return view(*args, **kwargs)
-    return wrapped
-
-
 @app.route("/cloud/login", methods=["GET", "POST"])
 def customer_login():
     error = None
@@ -4318,6 +4708,156 @@ def customer_login():
     <p class="muted" style="margin-top:16px">Don't have an account?
       <a href="/cloud/signup">Sign up →</a></p>
     """, error=error, csrf=CSRF_FIELD.format(get_csrf()))
+
+
+@app.route("/cloud/mcp/connect/<server_name>")
+@require_customer
+def mcp_oauth_start(server_name):
+    """
+    The first of the two split HTTP requests that make up Cloud's MCP
+    OAuth flow (see the module comment above KNOWN_MCP_SERVICES for why
+    this can't just reuse Home's single-process flow). Discovers the
+    server's OAuth metadata, dynamically registers Curant as a client,
+    generates a PKCE pair, stashes everything needed to complete the
+    flow in mcp_oauth_pending keyed by a random state value, and
+    redirects the customer's own browser to the provider's real login
+    page. The provider redirects back to mcp_oauth_callback below,
+    sometime later, in a completely separate request.
+    """
+    if server_name not in KNOWN_MCP_SERVICES:
+        return f"Unknown MCP server '{server_name}'.", 404
+    service = KNOWN_MCP_SERVICES[server_name]
+    cid = session["customer_id"]
+
+    # Stale pending rows (an abandoned flow, never completed) shouldn't
+    # accumulate forever — anything older than 30 minutes is almost
+    # certainly dead.
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM mcp_oauth_pending WHERE created_at < datetime('now', '-30 minutes')")
+        conn.commit()
+
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/mcp/oauth/callback"
+    try:
+        metadata = _mcp_oauth_discover_metadata(service["url"])
+        client_info = _mcp_oauth_register_client(metadata["registration_endpoint"], redirect_uri)
+    except Exception as e:
+        return (f"Couldn't start connecting {server_name}: {e}. "
+                f"This may mean the server's OAuth setup has changed since this was last verified — "
+                f"worth checking against their current docs.", 502)
+
+    verifier, challenge = _mcp_oauth_pkce_pair()
+    state = secrets.token_urlsafe(32)
+
+    with closing(get_db()) as conn:
+        conn.execute(
+            """INSERT INTO mcp_oauth_pending
+               (state, customer_id, server_name, code_verifier, client_id, client_secret,
+                token_endpoint, server_url, transport)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (state, cid, server_name, verifier, client_info.get("client_id"),
+             client_info.get("client_secret"), metadata["token_endpoint"],
+             service["url"], service["transport"]),
+        )
+        conn.commit()
+
+    from urllib.parse import urlencode
+    auth_params = {
+        "response_type": "code",
+        "client_id": client_info["client_id"],
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    return redirect(f"{metadata['authorization_endpoint']}?{urlencode(auth_params)}")
+
+
+@app.route("/cloud/mcp/oauth/callback")
+def mcp_oauth_callback():
+    """
+    The second half of the split flow — the MCP server's own login page
+    redirects the customer's browser back here once they've approved
+    access. Looks up the pending row by state (also the CSRF protection
+    for this flow — an attacker without the exact state value can't
+    complete someone else's pending connection), exchanges the
+    authorization code for real tokens, and stores them keyed by
+    customer+server. No @require_customer here on purpose — the
+    provider's redirect is what's arriving, not the customer navigating
+    directly, and the state lookup is what actually authenticates this.
+    """
+    code = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        return f"Connection was not completed: {error}", 400
+    if not code or not state:
+        return "Missing code or state in callback.", 400
+
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM mcp_oauth_pending WHERE state=?", (state,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM mcp_oauth_pending WHERE state=?", (state,))
+            conn.commit()
+    if not row:
+        return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
+
+    row = dict(row)
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/mcp/oauth/callback"
+    try:
+        resp = http.post(
+            row["token_endpoint"],
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": row["client_id"],
+                "code_verifier": row["code_verifier"],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as e:
+        return f"Couldn't complete the connection: {e}", 502
+
+    expires_at = time.time() + tokens.get("expires_in", 3600)
+    with closing(get_db()) as conn:
+        conn.execute(
+            """INSERT INTO mcp_oauth_tokens
+               (customer_id, server_name, client_id, client_secret, token_endpoint,
+                access_token, refresh_token, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(customer_id, server_name) DO UPDATE SET
+                 client_id=excluded.client_id, client_secret=excluded.client_secret,
+                 token_endpoint=excluded.token_endpoint, access_token=excluded.access_token,
+                 refresh_token=excluded.refresh_token, expires_at=excluded.expires_at,
+                 updated_at=CURRENT_TIMESTAMP""",
+            (row["customer_id"], row["server_name"], row["client_id"], row["client_secret"],
+             row["token_endpoint"], tokens["access_token"], tokens.get("refresh_token"), expires_at),
+        )
+        conn.execute(
+            """INSERT INTO mcp_servers (customer_id, name, url, transport, auth_mode, enabled)
+               VALUES (?, ?, ?, ?, 'oauth', 1)
+               ON CONFLICT(customer_id, name) DO UPDATE SET enabled=1""",
+            (row["customer_id"], row["server_name"], row["server_url"], row["transport"]),
+        )
+        conn.commit()
+
+    return redirect(url_for("cloud_dashboard"))
+
+
+@app.route("/cloud/mcp/disconnect/<server_name>", methods=["POST"])
+@require_customer
+def mcp_disconnect(server_name):
+    if not check_csrf():
+        return redirect(url_for("cloud_dashboard"))
+    cid = session["customer_id"]
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM mcp_servers WHERE customer_id=? AND name=?", (cid, server_name))
+        conn.execute("DELETE FROM mcp_oauth_tokens WHERE customer_id=? AND server_name=?", (cid, server_name))
+        conn.commit()
+    return redirect(url_for("cloud_dashboard"))
 
 
 @app.route("/cloud/dashboard", methods=["GET", "POST"])
@@ -4460,6 +5000,26 @@ def cloud_dashboard():
     <p class="muted">None yet — tell Curant who matters to you in a text.</p>
     {% endif %}
 
+    <h2>Connected tools</h2>
+    <p class="muted">Connect real accounts your Curant can work with directly — Jira, Linear,
+       GitHub, and more. This is separate from the Workspace/generation settings below.</p>
+    {% for name, service in known_mcp_services.items() %}
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0">
+      <div>
+        <strong>{{ name|capitalize }}</strong>
+        <div class="muted" style="font-size:.8rem">{{ service.description }}</div>
+      </div>
+      {% if name in connected_mcp_server_names %}
+      <form method="post" action="/cloud/mcp/disconnect/{{ name }}" style="margin:0">
+        {{ csrf }}
+        <button type="submit" style="background:none;border:1px solid #ddd;border-radius:20px;padding:6px 14px;font-size:.8rem;cursor:pointer;color:#a33">Disconnect</button>
+      </form>
+      {% else %}
+      <a href="/cloud/mcp/connect/{{ name }}" style="background:#111;color:#fff;border-radius:20px;padding:6px 14px;font-size:.8rem;text-decoration:none">Connect</a>
+      {% endif %}
+    </div>
+    {% endfor %}
+
     {% if 'august' in unlocked_addons %}
     <h2>August's generation keys</h2>
     {% if not customer.workspace_email %}
@@ -4505,6 +5065,8 @@ def cloud_dashboard():
     monthly_generation_spend=get_monthly_generation_spend(cid),
     generation_cap=get_generation_cap(customer),
     unlocked_addons=get_unlocked_addons(customer),
+    known_mcp_services=KNOWN_MCP_SERVICES,
+    connected_mcp_server_names={s["name"] for s in get_mcp_servers_for_customer(cid, enabled_only=False)},
     plan_display_names={"cloud_base": "Base — $29/mo", "cloud_executive": "Executive — $149/mo"},
     csrf=CSRF_FIELD.format(get_csrf()))
 

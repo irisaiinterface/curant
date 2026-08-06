@@ -937,8 +937,8 @@ async def _mcp_call_tool_stdio_async(command, tool_name, arguments):
 
 async def _mcp_list_tools_http_async(url, headers, auth=None):
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-    async with streamablehttp_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
+    from mcp.client.streamable_http import streamable_http_client
+    async with streamable_http_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -950,8 +950,8 @@ async def _mcp_list_tools_http_async(url, headers, auth=None):
 
 async def _mcp_call_tool_http_async(url, headers, tool_name, arguments, auth=None):
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-    async with streamablehttp_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
+    from mcp.client.streamable_http import streamable_http_client
+    async with streamable_http_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
@@ -4458,8 +4458,8 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
                     result = await session.list_tools()
                     return [t.name for t in result.tools]
         else:
-            from mcp.client.streamable_http import streamablehttp_client
-            async with streamablehttp_client(url, auth=auth) as (read, write, _get_session_id):
+            from mcp.client.streamable_http import streamable_http_client
+            async with streamable_http_client(url, auth=auth) as (read, write, _get_session_id):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.list_tools()

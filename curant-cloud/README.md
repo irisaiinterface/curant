@@ -232,6 +232,53 @@ yet" instead of fabricated content. This closes a real gap: `read_email`
 previously extracted only the text body and silently dropped anything
 attached.
 
+## MCP tool connections — Jira, Linear, GitHub, and more
+
+Ported from Home, with one genuinely different piece: how the OAuth login
+happens.
+
+**Home's `mcp-add-oauth`** runs a temporary web server on `127.0.0.1` and
+opens the customer's own browser — works because the CLI and the browser
+are the same machine.
+
+**Cloud has no equivalent "customer's machine."** It's one shared server
+handling many customers, so instead:
+- Storage is keyed by `(customer_id, server_name)`, not just server name
+- The OAuth redirect points at a public URL on Cloud's own domain
+  (`{CLOUD_PUBLIC_URL}/cloud/mcp/oauth/callback`)
+- The flow is triggered from the dashboard and split across two separate
+  HTTP requests — the initial "Connect" click, and the provider's
+  callback landing sometime later — rather than Home's single
+  synchronous process
+
+Because of that split, this does **not** reuse the `mcp` SDK's
+`OAuthClientProvider` (built around a single synchronous process — its
+`redirect_handler` and `callback_handler` are both awaited within the
+same async call, which doesn't fit "pause after redirect, resume in a
+separate request"). Instead this implements the standard OAuth 2.1 +
+Dynamic Client Registration (RFC 7591) + PKCE flow directly with plain
+HTTP calls — the same pattern every real multi-tenant SaaS uses for
+"connect your Jira account." Once a valid access token exists, calling
+tools is simple again — just an `Authorization: Bearer` header — so
+Home's HTTP/SSE client functions port over almost unchanged from there.
+
+**Same registry as Home** (`KNOWN_MCP_SERVICES`) — Linear, GitHub,
+Atlassian (Jira/Confluence/Bitbucket), Figma, HubSpot, Slack, Notion,
+Sentry, Square. Deliberately HTTP/SSE only — Home's registry has no
+`stdio` entries either, and `stdio` (spawning an arbitrary local command)
+correctly isn't supported on Cloud at all: there's no "customer's
+machine" to spawn it on, and arbitrary command execution on a shared
+multi-tenant server is a real security concern Home doesn't have (one
+customer per install there).
+
+**Honest limitation, stated plainly:** this has **not** been tested
+against a real OAuth provider. No live app is registered with Atlassian,
+Linear, or any other vendor in this environment, and no browser exists
+to complete an interactive login here. Confirm this against a real
+account before trusting it in front of a real customer — same standard
+already applied to the Vapi response-shape assumptions elsewhere in this
+codebase.
+
 ## Voice — Vapi prototype
 
 Set `VAPI_API_KEY` in .env and configure Vapi to point incoming calls at:
@@ -424,6 +471,20 @@ subscription sync; kept as its own module rather than folded into
    so there's no risk of the two cleanup paths drifting apart over time.
 
 ## What's still missing before production
+
+- **A critical startup-crash bug from the Stripe merge, found and fixed** ✓
+  — `billing_portal()` used `@require_customer` at line ~4487, but
+  `require_customer` itself wasn't defined until line ~4674, nearly 200
+  lines later. Flask evaluates every route decorator at import time, top
+  to bottom — this meant the **entire server would fail to start**, for
+  every customer, completely unrelated to Stripe or MCP specifically.
+  `py_compile` (syntax-only) never catches this class of bug; it only
+  surfaced when actually import-executing the module end-to-end with
+  real dependencies installed, which is a materially stronger check than
+  "it compiles." Fixed by moving `require_customer`'s definition ahead
+  of its first real usage. Worth treating as a reminder that a clean
+  `py_compile` in this codebase's history doesn't guarantee a working
+  server — a real import/execution check is the actual bar.
 
 - **Customer dashboard API key management** ✓ — resolved this pass.
   `cloud_dashboard()` now shows a customer whether they're on Option A
