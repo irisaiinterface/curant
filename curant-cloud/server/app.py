@@ -994,7 +994,7 @@ PROVIDER_MODELS = {
     # Gemini speaks the OpenAI wire format via its compatibility endpoint
     # (GEMINI_OPENAI_BASE_URL below), so it reuses the OpenAI SDK code paths.
     # If Google renames the model, change only this string.
-    "gemini":    "gemini-2.5-flash",
+    "gemini":    "gemini-3.6-flash",
 }
 
 # One place to change if Google moves the endpoint.

@@ -23,7 +23,7 @@ Usage:
     GEMINI_API_KEY=... python3 tests/run_persona_regression.py \
         --target cloud --provider gemini
         # run the personas through Gemini (Cloud only — Home doesn't pin a
-        # gemini model). Uses gemini-2.5-flash unless --model overrides.
+        # gemini model). Uses gemini-3.6-flash unless --model overrides.
 
 Exit code is 0 if every case passes, 1 if any case fails or errors —
 CI-friendly, but per this suite's own documented limitation (see

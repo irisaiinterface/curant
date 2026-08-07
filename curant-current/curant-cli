@@ -1002,7 +1002,7 @@ PROVIDER_MODELS = {
     # Gemini has no separate cheap tier wired up here yet, so main/fast
     # both point at the same model for now — matches Cloud's single-tier
     # PROVIDER_MODELS["gemini"] entry.
-    "gemini": {"main": "gemini-2.5-flash", "fast": "gemini-2.5-flash"},
+    "gemini": {"main": "gemini-3.6-flash", "fast": "gemini-3.6-flash"},
 }
 
 DEFAULT_PROVIDER = "anthropic"
