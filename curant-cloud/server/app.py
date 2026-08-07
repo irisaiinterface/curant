@@ -989,7 +989,24 @@ PERSONA_CATEGORIES = {
 PROVIDER_MODELS = {
     "anthropic": "claude-sonnet-4-6",
     "openai":    "gpt-4o",
+    # Gemini speaks the OpenAI wire format via its compatibility endpoint
+    # (GEMINI_OPENAI_BASE_URL below), so it reuses the OpenAI SDK code paths.
+    # If Google renames the model, change only this string.
+    "gemini":    "gemini-2.5-flash",
 }
+
+# One place to change if Google moves the endpoint.
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+def _openai_compatible_client(provider: str, api_key: str):
+    """An OpenAI-SDK client pointed at Gemini's OpenAI-compatible endpoint when
+    provider == 'gemini', otherwise the default OpenAI base URL. Lets the three
+    OpenAI call paths serve Gemini too by changing only base_url + model."""
+    from openai import OpenAI
+    if provider == "gemini":
+        return OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
+    return OpenAI(api_key=api_key)
 
 # ── Voice spend tracking and monthly cap ─────────────────────────────────────
 # Previously nothing tracked voice usage at all — spend was only visible by
@@ -1539,12 +1556,11 @@ def call_llm(provider: str, api_key: str, system: str,
             messages=messages,
         )
         return resp.content[0].text
-    elif provider == "openai":
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+    elif provider in ("openai", "gemini"):
+        client = _openai_compatible_client(provider, api_key)
         full = [{"role": "system", "content": system}] + messages
         resp = client.chat.completions.create(
-            model=PROVIDER_MODELS["openai"],
+            model=PROVIDER_MODELS[provider],
             max_tokens=max_tokens,
             messages=full,
         )
@@ -1582,12 +1598,11 @@ def call_llm_streaming(provider: str, api_key: str, system: str,
             for chunk in stream:
                 if chunk.type == "content_block_delta" and chunk.delta.type == "text_delta":
                     yield chunk.delta.text
-    elif provider == "openai":
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
+    elif provider in ("openai", "gemini"):
+        client = _openai_compatible_client(provider, api_key)
         full = [{"role": "system", "content": system}] + messages
         stream = client.chat.completions.create(
-            model=PROVIDER_MODELS["openai"],
+            model=PROVIDER_MODELS[provider],
             max_tokens=max_tokens,
             messages=full,
             stream=True,
@@ -3343,9 +3358,8 @@ def _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, cus
 
 
 def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer,
-                            sms_reply_to=None, sms_reply_from=None):
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key)
+                            sms_reply_to=None, sms_reply_from=None, provider="openai"):
+    client = _openai_compatible_client(provider, api_key)
     openai_tools = [
         {"type": "function", "function": {"name": t["qualified_name"], "description": t["description"],
                                            "parameters": t["input_schema"]}}
@@ -3354,7 +3368,7 @@ def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, custom
     conversation = [{"role": "system", "content": system}] + list(messages)
     for _ in range(MAX_TOOL_CALL_ITERATIONS):
         response = client.chat.completions.create(
-            model=PROVIDER_MODELS["openai"], max_tokens=max_tokens,
+            model=PROVIDER_MODELS[provider], max_tokens=max_tokens,
             messages=conversation, tools=openai_tools,
         )
         msg = response.choices[0].message
@@ -3381,9 +3395,10 @@ def call_llm_with_tools(provider: str, api_key: str, system: str, messages: list
     if provider == "anthropic":
         return _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer,
                                           sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
-    elif provider == "openai":
+    elif provider in ("openai", "gemini"):
         return _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer,
-                                       sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
+                                       sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from,
+                                       provider=provider)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
@@ -5067,8 +5082,9 @@ def signup_server_key():
     return render_template_string(BASE_STYLE + """
     <h1>{{ "Update your API key" if is_update else "Add your API key" }}</h1>
     <p>Get a free API key from
-      <a href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic</a>
-      or <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI</a>.
+      <a href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic</a>,
+      <a href="https://platform.openai.com/api-keys" target="_blank">OpenAI</a>,
+      or <a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio</a>.
       It's stored encrypted on our server — only used to answer your messages.</p>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post">
@@ -5079,6 +5095,7 @@ def signup_server_key():
       <select name="provider" style="width:100%;padding:10px;margin-bottom:14px;border:1px solid #ddd;border-radius:6px;font-size:.95rem">
         <option value="anthropic">Anthropic (Claude)</option>
         <option value="openai">OpenAI (GPT-4o)</option>
+        <option value="gemini">Google (Gemini)</option>
       </select>
       <button class="btn" type="submit">{{ "Save" if is_update else "Continue" }}</button>
     </form>
