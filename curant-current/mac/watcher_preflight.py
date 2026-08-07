@@ -66,12 +66,18 @@ def check_cli():
         text = (out.stdout + out.stderr).strip()
     except Exception as e:
         return line("FAIL", "curant-cli status", f"Couldn't run it: {e}")
+    dev_bypass = os.environ.get("CURANT_DEV_UNLICENSED") == "1"
     if "Active" in text:
         line("PASS", "curant-cli activated", text.splitlines()[0])
+    elif dev_bypass and "DEV (unlicensed)" in text:
+        line("PASS", "curant-cli activated",
+            "CURANT_DEV_UNLICENSED=1 is set — license check intentionally bypassed for local testing.")
     else:
         return line("FAIL", "curant-cli activated",
-                    f"{text}\n         Run: curant-cli activate <license-key>")
-    # API key present?
+                    f"{text}\n         Run: curant-cli activate <license-key>, or set "
+                    f"CURANT_DEV_UNLICENSED=1 for local testing without a license server.")
+    # API key present? Checks config.json, and (under the dev bypass) the same
+    # provider env vars get_api_key() itself falls back to.
     try:
         cfg = json.load(open(CONFIG)) if os.path.exists(CONFIG) else {}
     except Exception:
@@ -80,8 +86,17 @@ def check_cli():
     if keys or cfg.get("anthropic_api_key"):
         provs = ", ".join([k for k, v in keys.items() if v] or ["anthropic (legacy field)"])
         return line("PASS", "API key set", f"providers: {provs}")
+    if dev_bypass:
+        env_provs = [p for p, names in {
+            "anthropic": ["ANTHROPIC_API_KEY"], "openai": ["OPENAI_API_KEY"],
+            "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        }.items() if any(os.environ.get(n) for n in names)]
+        if env_provs:
+            return line("PASS", "API key set", f"from environment (dev bypass): {', '.join(env_provs)}")
     return line("FAIL", "API key set",
-                "No API key in ~/.curant/config.json. Run: curant-cli set-api-key sk-ant-... ")
+                "No API key in ~/.curant/config.json, and none found in the environment either. "
+                "Run: curant-cli set-api-key sk-ant-...  (or export ANTHROPIC_API_KEY / "
+                "OPENAI_API_KEY / GEMINI_API_KEY under CURANT_DEV_UNLICENSED=1)")
 
 def check_customer_identity(_watcher_path=None):
     """The watcher keys on the customer's Apple ID, read from the env or
