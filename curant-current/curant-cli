@@ -55,6 +55,18 @@ SERVER_BASE = os.environ.get("CURANT_SERVER_BASE", "https://api.curant.app").rst
 #   CURANT_SERVER_BASE=http://127.0.0.1:5000 to point at a locally-run
 #   curant-current/server/app.py for development/self-hosted testing.
 
+# Development-only entitlement bypass. When CURANT_DEV_UNLICENSED=1, the
+# license/activation checks in relay() and status() are skipped so the brain
+# and watcher can be tested without a deployed license server. Off unless the
+# env var is explicitly "1"; it warns loudly every time it takes effect and
+# must never be set in production.
+DEV_UNLICENSED = os.environ.get("CURANT_DEV_UNLICENSED") == "1"
+
+
+def _warn_dev_unlicensed():
+    print("WARNING: CURANT_DEV_UNLICENSED=1 — license/entitlement checks are BYPASSED. "
+          "Local development only; never set this in production.", file=sys.stderr)
+
 # --- Dean's shell access ---------------------------------------------------
 # Home-only, Dean-only, by deliberate scoping decision (Aug 2026): Cloud's
 # multi-tenant architecture already treats arbitrary command execution as
@@ -1011,7 +1023,17 @@ def get_api_key(config, provider=None):
     if key:
         return key
     if provider == "anthropic":
-        return config.get("anthropic_api_key")  # legacy field, pre-multi-provider
+        legacy = config.get("anthropic_api_key")  # legacy field, pre-multi-provider
+        if legacy:
+            return legacy
+    if DEV_UNLICENSED:
+        # Local-dev convenience: read the key straight from the environment so
+        # you don't have to run set-api-key first.
+        for env_name in {"anthropic": ["ANTHROPIC_API_KEY"],
+                         "openai": ["OPENAI_API_KEY"],
+                         "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"]}.get(provider, []):
+            if os.environ.get(env_name):
+                return os.environ[env_name]
     return None
 
 
@@ -3410,6 +3432,11 @@ def report_error(error_code, component):
 def status():
     """Check whether the current install is activated and in good standing."""
     config = load_config()
+    if DEV_UNLICENSED:
+        _warn_dev_unlicensed()
+        print(f"DEV (unlicensed) — license checks bypassed. "
+              f"persona: {config.get('persona', 'curant')}, provider: {get_provider(config)}")
+        return
     key = config.get("license_key")
     if not key:
         print("Not activated. Run: curant-cli activate <your-license-key>")
@@ -3944,9 +3971,11 @@ def relay(message_text, context="", image_path=None, apple_id=None):
     """
     config = load_config()
     key = config.get("license_key")
-    if not key:
+    if not key and not DEV_UNLICENSED:
         print(json.dumps({"reply": None, "error": "not_activated"}))
         sys.exit(1)
+    if DEV_UNLICENSED:
+        _warn_dev_unlicensed()
 
     _last_generated_files.clear()  # this turn's generations only, not leftover from a prior call
 
@@ -3960,7 +3989,10 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         print(json.dumps({"reply": None, "error": "no_api_key_set"}))
         sys.exit(1)
 
-    config, active = refresh_status_if_stale(config)
+    if DEV_UNLICENSED:
+        active = True  # entitlement bypass (CURANT_DEV_UNLICENSED); warned above
+    else:
+        config, active = refresh_status_if_stale(config)
     if not active:
         report_error("inactive_or_invalid_license", "curant-cli")
         print(json.dumps({"reply": None, "error": "inactive_or_invalid_license"}))
