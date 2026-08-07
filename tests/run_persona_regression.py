@@ -20,6 +20,10 @@ Usage:
     python3 tests/run_persona_regression.py --model claude-opus-4-8
         # test a CANDIDATE version before rolling it into PROVIDER_MODELS —
         # this is the actual intended use per MODEL_VERSION_POLICY.md
+    GEMINI_API_KEY=... python3 tests/run_persona_regression.py \
+        --target cloud --provider gemini
+        # run the personas through Gemini (Cloud only — Home doesn't pin a
+        # gemini model). Uses gemini-2.5-flash unless --model overrides.
 
 Exit code is 0 if every case passes, 1 if any case fails or errors —
 CI-friendly, but per this suite's own documented limitation (see
@@ -85,17 +89,60 @@ def build_cloud_prompt(cloud_module, persona):
     return cloud_module.build_system_prompt(customer, memories=[], people=[], channel="sms")
 
 
-def call_model(system_prompt, user_prompt, model):
-    """Real call to the Anthropic API — no mocking, by design (see module docstring)."""
-    import anthropic
-    client = anthropic.Anthropic()  # picks up ANTHROPIC_API_KEY from env
-    response = client.messages.create(
+# Gemini speaks the OpenAI wire format via its compatibility endpoint, so the
+# openai SDK serves it by swapping only base_url + model — same approach the
+# Cloud server uses in _openai_compatible_client().
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+# Which env var holds the key for each provider (first match wins).
+PROVIDER_KEY_ENV = {
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "openai":    ["OPENAI_API_KEY"],
+    "gemini":    ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+}
+
+
+def _api_key_for(provider):
+    for name in PROVIDER_KEY_ENV[provider]:
+        if os.environ.get(name):
+            return os.environ[name], name
+    return None, PROVIDER_KEY_ENV[provider][0]
+
+
+def _default_model(module, provider):
+    """Each codebase pins its own model in PROVIDER_MODELS. Home stores a dict
+    ({'main': ...}); Cloud stores a plain string. A provider a given codebase
+    doesn't define (e.g. gemini on Home) raises KeyError, handled in main()."""
+    pm = module.PROVIDER_MODELS[provider]
+    return pm["main"] if isinstance(pm, dict) else pm
+
+
+def call_model(system_prompt, user_prompt, model, provider="anthropic"):
+    """Real call to the selected provider — no mocking, by design (see module
+    docstring). Gemini and OpenAI go through the OpenAI SDK; Gemini only differs
+    by base_url, exactly as the Cloud server does it."""
+    if provider == "anthropic":
+        import anthropic
+        client = anthropic.Anthropic()  # picks up ANTHROPIC_API_KEY from env
+        response = client.messages.create(
+            model=model,
+            max_tokens=500,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return "\n".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+
+    from openai import OpenAI
+    api_key, _ = _api_key_for(provider)
+    client = (OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
+              if provider == "gemini" else OpenAI(api_key=api_key))
+    resp = client.chat.completions.create(
         model=model,
         max_tokens=500,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
+        messages=[{"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt}],
     )
-    return "\n".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 def check_case(case, reply):
@@ -113,12 +160,12 @@ def check_case(case, reply):
     return False, "No expected signal phrase found — read the reply manually before concluding this is a real regression."
 
 
-def run_target(target_name, module, prompt_builder, model, results):
-    print(f"\n{'=' * 70}\n{target_name}  (model: {model})\n{'=' * 70}")
+def run_target(target_name, module, prompt_builder, model, results, provider="anthropic"):
+    print(f"\n{'=' * 70}\n{target_name}  (provider: {provider}, model: {model})\n{'=' * 70}")
     for case in ALL_CASES:
         system_prompt = prompt_builder(module, case["persona"])
         try:
-            reply = call_model(system_prompt, case["prompt"], model)
+            reply = call_model(system_prompt, case["prompt"], model, provider)
         except Exception as e:
             print(f"[ERROR] {target_name} / {case['persona']} / {case['category']}: API call failed — {e}")
             results.append((target_name, case, False, f"API call failed: {e}"))
@@ -136,28 +183,44 @@ def run_target(target_name, module, prompt_builder, model, results):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--target", choices=["home", "cloud", "both"], default="both")
+    parser.add_argument("--provider", choices=["anthropic", "openai", "gemini"], default="anthropic",
+                        help="Which provider to test the personas against. Default anthropic. "
+                             "gemini/openai run through the OpenAI-compatible path and need "
+                             "GEMINI_API_KEY / OPENAI_API_KEY set respectively.")
     parser.add_argument("--model", default=None,
                         help="Override the model to test (e.g. a candidate version before rollout). "
                              "Defaults to each codebase's own currently-pinned PROVIDER_MODELS value.")
     args = parser.parse_args()
 
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY is not set. This suite makes real, billed API calls and has "
-              "no mocked mode — set a real key before running:\n"
-              "  export ANTHROPIC_API_KEY=sk-ant-...", file=sys.stderr)
+    key, key_name = _api_key_for(args.provider)
+    if not key:
+        print(f"{key_name} is not set. This suite makes real, billed API calls and has "
+              f"no mocked mode — set a real {args.provider} key before running:\n"
+              f"  export {key_name}=...", file=sys.stderr)
         sys.exit(1)
 
     results = []
 
     if args.target in ("home", "both"):
         home = load_home()
-        home_model = args.model or home.PROVIDER_MODELS["anthropic"]["main"]
-        run_target("Home (curant-cli)", home, build_home_prompt, home_model, results)
+        try:
+            home_model = args.model or _default_model(home, args.provider)
+        except KeyError:
+            print(f"Home (curant-cli) has no '{args.provider}' entry in PROVIDER_MODELS — "
+                  f"pass --model to test it against this provider, or use --target cloud.",
+                  file=sys.stderr)
+            sys.exit(1)
+        run_target("Home (curant-cli)", home, build_home_prompt, home_model, results, args.provider)
 
     if args.target in ("cloud", "both"):
         cloud = load_cloud()
-        cloud_model = args.model or cloud.PROVIDER_MODELS["anthropic"]
-        run_target("Cloud (server/app.py)", cloud, build_cloud_prompt, cloud_model, results)
+        try:
+            cloud_model = args.model or _default_model(cloud, args.provider)
+        except KeyError:
+            print(f"Cloud (server/app.py) has no '{args.provider}' entry in PROVIDER_MODELS — "
+                  f"pass --model to test it against this provider.", file=sys.stderr)
+            sys.exit(1)
+        run_target("Cloud (server/app.py)", cloud, build_cloud_prompt, cloud_model, results, args.provider)
 
     total = len(results)
     passed = sum(1 for _, _, p, _ in results if p)
