@@ -50,7 +50,10 @@ from contextlib import closing
 CONFIG_DIR = os.path.expanduser("~/.curant")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 LOCAL_DB_PATH = os.path.join(CONFIG_DIR, "local.db")
-SERVER_BASE = "https://api.curant.app"  # placeholder — real endpoint once server is deployed
+SERVER_BASE = os.environ.get("CURANT_SERVER_BASE", "https://api.curant.app").rstrip("/")
+# ^ Real endpoint once the license server is deployed. Override with
+#   CURANT_SERVER_BASE=http://127.0.0.1:5000 to point at a locally-run
+#   curant-current/server/app.py for development/self-hosted testing.
 
 # --- Dean's shell access ---------------------------------------------------
 # Home-only, Dean-only, by deliberate scoping decision (Aug 2026): Cloud's
