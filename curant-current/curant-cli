@@ -997,9 +997,17 @@ PROVIDER_MODELS = {
     # against (Cloud has no main/fast split) and is left as-is.
     "anthropic": {"main": "claude-sonnet-4-6", "fast": "claude-haiku-4-5-20251001"},
     "openai": {"main": "gpt-4o", "fast": "gpt-4o-mini"},
+    # Gemini has no separate cheap tier wired up here yet, so main/fast
+    # both point at the same model for now — matches Cloud's single-tier
+    # PROVIDER_MODELS["gemini"] entry.
+    "gemini": {"main": "gemini-2.5-flash", "fast": "gemini-2.5-flash"},
 }
 
 DEFAULT_PROVIDER = "anthropic"
+
+# Gemini speaks the OpenAI wire format via this compatibility endpoint, so it
+# reuses the OpenAI SDK — same approach as Cloud's _openai_compatible_client().
+GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 
 def get_provider(config):
@@ -1064,6 +1072,17 @@ def _call_openai(api_key, system_prompt, messages, max_tokens, model):
     openai_messages = [{"role": "system", "content": system_prompt}] + messages
     response = client.chat.completions.create(
         model=model, max_tokens=max_tokens, messages=openai_messages,
+    )
+    return response.choices[0].message.content
+
+
+def _call_gemini(api_key, system_prompt, messages, max_tokens, model):
+    """Same wire format as OpenAI — only base_url differs."""
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
+    gemini_messages = [{"role": "system", "content": system_prompt}] + messages
+    response = client.chat.completions.create(
+        model=model, max_tokens=max_tokens, messages=gemini_messages,
     )
     return response.choices[0].message.content
 
@@ -2945,6 +2964,7 @@ def execute_tool_call(tool_name, arguments, available_tools):
 _PROVIDER_CALLERS = {
     "anthropic": _call_anthropic,
     "openai": _call_openai,
+    "gemini": _call_gemini,
 }
 
 
@@ -3037,9 +3057,51 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
     return "(I tried a few tool calls but couldn't reach a final answer — something may need a closer look.)"
 
 
+def _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model, tools, available_tools):
+    """Same wire format as OpenAI tool-calling — only base_url differs, so
+    this mirrors _call_openai_with_tools exactly."""
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
+    gemini_tools = [
+        {"type": "function", "function": {
+            "name": t["qualified_name"], "description": t["description"],
+            "parameters": t["input_schema"] or {"type": "object", "properties": {}},
+        }}
+        for t in tools
+    ]
+    conversation = [{"role": "system", "content": system_prompt}] + list(messages)
+    for _ in range(MAX_TOOL_CALL_ITERATIONS):
+        response = client.chat.completions.create(
+            model=model, max_tokens=max_tokens, messages=conversation, tools=gemini_tools,
+        )
+        msg = response.choices[0].message
+        if not msg.tool_calls:
+            return msg.content or ""
+
+        conversation.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ],
+        })
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result_text = execute_tool_call(tc.function.name, args, available_tools)
+            conversation.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+
+    return "(I tried a few tool calls but couldn't reach a final answer — something may need a closer look.)"
+
+
 _PROVIDER_TOOL_CALLERS = {
     "anthropic": _call_anthropic_with_tools,
     "openai": _call_openai_with_tools,
+    "gemini": _call_gemini_with_tools,
 }
 
 
