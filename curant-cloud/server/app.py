@@ -3391,13 +3391,78 @@ def _call_openai_with_tools(api_key, system, messages, max_tokens, tools, custom
     return "(I tried a few tool calls but couldn't reach a final answer.)"
 
 
+def _call_gemini_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                            sms_reply_to=None, sms_reply_from=None):
+    """
+    Gemini 3 models require a 'thought_signature' echoed back on every
+    function-call turn of a multi-turn tool-calling conversation. Google's
+    OpenAI-compat endpoint doesn't surface that field through the OpenAI
+    SDK's typed responses, so routing Gemini tool calls through
+    _call_openai_with_tools's dict-based history fails with 400 'Function
+    call is missing a thought_signature' on the second turn (confirmed live
+    against a real Gemini 3 model; thinking can't be disabled for Gemini 3 to
+    avoid it). The native google-genai SDK (already a dependency, used for
+    Veo) doesn't have this problem — appending its own returned `content`
+    object back into history verbatim keeps the signature intact, since it's
+    never parsed out or reconstructed by us.
+    """
+    from google import genai
+    from google.genai import types as genai_types
+
+    client = genai.Client(api_key=api_key)
+    gemini_tools = [genai_types.Tool(function_declarations=[
+        genai_types.FunctionDeclaration(
+            name=t["qualified_name"], description=t["description"],
+            parameters=t["input_schema"] or {"type": "object", "properties": {}},
+        )
+        for t in tools
+    ])]
+    conversation = [
+        genai_types.Content(
+            role=("model" if m["role"] == "assistant" else "user"),
+            parts=[genai_types.Part.from_text(text=m["content"])],
+        )
+        for m in messages
+    ]
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system, max_output_tokens=max_tokens, tools=gemini_tools,
+    )
+
+    for _ in range(MAX_TOOL_CALL_ITERATIONS):
+        response = client.models.generate_content(model=PROVIDER_MODELS["gemini"], contents=conversation, config=config)
+        candidate_content = response.candidates[0].content
+        function_calls = [p.function_call for p in (candidate_content.parts or []) if p.function_call]
+
+        if not function_calls:
+            return response.text or ""
+
+        conversation.append(candidate_content)
+
+        response_parts = []
+        for fc in function_calls:
+            try:
+                result_text = execute_cloud_tool_call(fc.name, dict(fc.args or {}), customer,
+                                                       sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
+            except Exception as e:
+                result_text = f"Tool call failed: {e}"
+            response_parts.append(genai_types.Part.from_function_response(
+                name=fc.name, response={"result": result_text},
+            ))
+        conversation.append(genai_types.Content(role="user", parts=response_parts))
+
+    return "(I tried a few tool calls but couldn't reach a final answer.)"
+
+
 def call_llm_with_tools(provider: str, api_key: str, system: str, messages: list,
                         tools: list, customer: dict, max_tokens: int = 800,
                         sms_reply_to: str | None = None, sms_reply_from: str | None = None) -> str:
     if provider == "anthropic":
         return _call_anthropic_with_tools(api_key, system, messages, max_tokens, tools, customer,
                                           sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
-    elif provider in ("openai", "gemini"):
+    elif provider == "gemini":
+        return _call_gemini_with_tools(api_key, system, messages, max_tokens, tools, customer,
+                                       sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from)
+    elif provider == "openai":
         return _call_openai_with_tools(api_key, system, messages, max_tokens, tools, customer,
                                        sms_reply_to=sms_reply_to, sms_reply_from=sms_reply_from,
                                        provider=provider)

@@ -3060,42 +3060,71 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
 
 
 def _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model, tools, available_tools):
-    """Same wire format as OpenAI tool-calling — only base_url differs, so
-    this mirrors _call_openai_with_tools exactly."""
-    from openai import OpenAI
-    client = OpenAI(api_key=api_key, base_url=GEMINI_OPENAI_BASE_URL)
-    gemini_tools = [
-        {"type": "function", "function": {
-            "name": t["qualified_name"], "description": t["description"],
-            "parameters": t["input_schema"] or {"type": "object", "properties": {}},
-        }}
-        for t in tools
-    ]
-    conversation = [{"role": "system", "content": system_prompt}] + list(messages)
-    for _ in range(MAX_TOOL_CALL_ITERATIONS):
-        response = client.chat.completions.create(
-            model=model, max_tokens=max_tokens, messages=conversation, tools=gemini_tools,
-        )
-        msg = response.choices[0].message
-        if not msg.tool_calls:
-            return msg.content or ""
+    """
+    Gemini 3 models require a 'thought_signature' to be echoed back on every
+    function-call turn of a multi-turn tool-calling conversation — Google's
+    own OpenAI-compat endpoint does not surface that field through the
+    OpenAI SDK's typed response objects, so round-tripping tool calls through
+    _call_openai_with_tools's dict-based conversation history causes every
+    second turn to fail with 400 'Function call is missing a thought_signature'
+    (confirmed live, and matches widely-reported issues in other OpenAI-compat
+    clients hitting Gemini 3 — this is not fixable by adjusting request
+    parameters, and thinking cannot be disabled for Gemini 3 models to avoid
+    it). google-genai (the native SDK, already a dependency for Veo) doesn't
+    have this problem: appending the SDK's own returned `content` object back
+    into history verbatim (rather than re-serializing through OpenAI's
+    tool_calls dict shape) keeps the thought signature intact, because it's
+    never parsed out or reconstructed.
+    """
+    from google import genai
+    from google.genai import types as genai_types
 
-        conversation.append({
-            "role": "assistant",
-            "content": msg.content,
-            "tool_calls": [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in msg.tool_calls
-            ],
-        })
-        for tc in msg.tool_calls:
+    client = genai.Client(api_key=api_key)
+    gemini_tools = [genai_types.Tool(function_declarations=[
+        genai_types.FunctionDeclaration(
+            name=t["qualified_name"],
+            description=t["description"],
+            parameters=t["input_schema"] or {"type": "object", "properties": {}},
+        )
+        for t in tools
+    ])]
+    # Translate the common {"role": "user"/"assistant", "content": str} history
+    # into genai Content objects. Gemini uses "model" where the rest of this
+    # file says "assistant".
+    conversation = [
+        genai_types.Content(
+            role=("model" if m["role"] == "assistant" else "user"),
+            parts=[genai_types.Part.from_text(text=m["content"])],
+        )
+        for m in messages
+    ]
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_prompt, max_output_tokens=max_tokens, tools=gemini_tools,
+    )
+
+    for _ in range(MAX_TOOL_CALL_ITERATIONS):
+        response = client.models.generate_content(model=model, contents=conversation, config=config)
+        candidate_content = response.candidates[0].content
+        function_calls = [p.function_call for p in (candidate_content.parts or []) if p.function_call]
+
+        if not function_calls:
+            return response.text or ""
+
+        # Append the model's OWN returned Content object unmodified — this is
+        # what preserves its thought_signature, rather than reconstructing an
+        # equivalent-looking turn ourselves.
+        conversation.append(candidate_content)
+
+        response_parts = []
+        for fc in function_calls:
             try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            result_text = execute_tool_call(tc.function.name, args, available_tools)
-            conversation.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+                result_text = execute_tool_call(fc.name, dict(fc.args or {}), available_tools)
+            except Exception as e:
+                result_text = f"Tool call failed: {e}"
+            response_parts.append(genai_types.Part.from_function_response(
+                name=fc.name, response={"result": result_text},
+            ))
+        conversation.append(genai_types.Content(role="user", parts=response_parts))
 
     return "(I tried a few tool calls but couldn't reach a final answer — something may need a closer look.)"
 
