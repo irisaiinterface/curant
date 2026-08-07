@@ -4040,6 +4040,10 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         sys.exit(1)
     if DEV_UNLICENSED:
         _warn_dev_unlicensed()
+        # Normal activation calls init_local_db() once; the bypass skips
+        # activation entirely, so do it here instead. Idempotent (CREATE
+        # TABLE IF NOT EXISTS throughout) — safe to call on every relay().
+        init_local_db()
 
     _last_generated_files.clear()  # this turn's generations only, not leftover from a prior call
 
