@@ -5101,6 +5101,24 @@ def mcp_connect_cmd(service_name):
         print(f"  4. Then: curant-cli mcp-add {service_name.lower()} /path/to/the/binary")
         return
 
+    if service.get("transport") == "stdio" and service.get("command"):
+        # Registry entries that ARE one-command connectable but use a local
+        # stdio process rather than a hosted URL (testrail, outlook, teams) —
+        # distinct from canvas/schoology above, which need real manual setup
+        # first. This branch was previously missing entirely: mcp-connect on
+        # any of these three crashed on service["url"], which doesn't exist
+        # for stdio entries. mcp_add_cmd already does exactly what's needed
+        # (spawn the known command, verify it lists tools).
+        if "TESTRAIL_INSTANCE_URL" not in os.environ and service_name.lower() == "testrail":
+            print("Note: this server needs TESTRAIL_INSTANCE_URL, TESTRAIL_USERNAME, and "
+                  "TESTRAIL_API_KEY set in your shell environment before it will actually work — "
+                  "set those first if you haven't. Curant never stores them itself.")
+        if service_name.lower() in ("outlook", "teams"):
+            print("First run will prompt an interactive device-code sign-in against Microsoft "
+                  "in this terminal — follow the printed URL/code once.")
+        mcp_add_cmd(service_name.lower(), service["command"])
+        return
+
     mcp_add_oauth_cmd(service_name.lower(), service["url"], transport=service.get("transport", "http"))
 
 
