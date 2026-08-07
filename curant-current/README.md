@@ -240,7 +240,27 @@ rather than re-fetched every time.
 
 **Managing connections:** `curant-cli mcp-list` / `mcp-remove` /
 `mcp-toggle <name> on|off` work the same regardless of which transport
-a given server uses.
+a given server uses. `mcp-list` shows an `[OFFICIAL]` or `[UNOFFICIAL]`
+badge next to any connected server that matches something in the
+curated registry below.
+
+**The curated registry (`KNOWN_MCP_SERVICES`)** — `curant-cli
+mcp-connect <name>` for one-command setup of a pre-verified service
+(Linear, GitHub, Atlassian/Jira, Figma, HubSpot, Slack, Notion, Sentry,
+Square, Descript — all official, vendor-hosted). Two entries are
+deliberately different: **Canvas and Schoology are unofficial,
+community-built servers**, included at explicit request rather than
+excluded on principle. Every entry carries an `"official": True/False`
+field, and `mcp-connect` prints the trust label plainly before doing
+anything — Canvas and Schoology can't be one-command connected at all
+(no OAuth exists for either), so `mcp-connect` instead prints real
+setup steps: install the community package yourself, put your own
+credentials in *its* config (never Curant's), then `mcp-add` the
+resulting binary like any other local server. Schoology's entry carries
+a stronger warning than Canvas's — it has no public API at all, so
+every existing option works via browser-cookie capture or automated SSO
+login, not a sanctioned access method the way Canvas's real API token
+is. Read the full description before connecting either.
 
 ### When Curant can't do something: call for a quote, not a free feature request
 

@@ -4347,6 +4347,54 @@ KNOWN_MCP_SERVICES = {
     # sources actively disagreeing is a stronger signal of uncertainty
     # than "unverified" — worth a dedicated confirmation pass (checking
     # DocuSign's own current developer docs directly) before adding.
+
+    # ── Unofficial, community-built servers — included deliberately, ──────
+    # not despite the risk, at the customer's explicit request. Every
+    # entry below is "official": False and MUST stay clearly labeled as
+    # such everywhere it's shown to a customer — this is the actual
+    # mechanism that makes including them responsible: the customer sees
+    # exactly what they're connecting to and decides, rather than Curant
+    # silently vouching for something unverified. Home-only — both need
+    # stdio (a locally-run process), which Cloud correctly can't support
+    # (no "customer's own machine" to run it on; see Cloud's KNOWN_MCP_SERVICES
+    # comment for the full reasoning).
+    "canvas": {
+        "transport": "stdio",
+        "official": False,
+        "install_command": ["pip", "install", "canvas-mcp"],
+        "binary_hint": "canvas-mcp-server (installed into your Python environment's bin/ directory)",
+        "requires_local_setup": True,
+        "description": "UNOFFICIAL, community-built (vishalsachdev/canvas-mcp, MIT licensed, "
+                        "142+ stars, actively maintained as of this writing) — NOT published by "
+                        "Instructure (Canvas's owner). That said, it's built on a real, sanctioned "
+                        "access method: your own Canvas API personal access token (Canvas → "
+                        "Account → Settings → New Access Token), not scraping or shared "
+                        "credentials. Has real FERPA-oriented safeguards (student-data "
+                        "anonymization, PII log redaction). Canvas itself disclosed a real data "
+                        "breach in April-May 2026 (unrelated to this MCP server specifically, "
+                        "but worth knowing given this would touch the same account). Setup: "
+                        "install with pip, put your CANVAS_API_TOKEN and CANVAS_API_URL in the "
+                        "server's own .env file (per its README), then "
+                        "`curant-cli mcp-add canvas /path/to/canvas-mcp-server`.",
+    },
+    "schoology": {
+        "transport": "stdio",
+        "official": False,
+        "requires_local_setup": True,
+        "description": "UNOFFICIAL and HIGHER RISK than every other entry in this registry, "
+                        "flagged explicitly rather than softened: Schoology has NO public API at "
+                        "all. Every existing option (including this one) works by capturing your "
+                        "browser login cookie or automating a headless-browser login through your "
+                        "school's SSO — NOT a sanctioned access method the way Canvas's API token "
+                        "or the official OAuth servers above are. This plausibly conflicts with "
+                        "Schoology's own terms of service, depends on scraping techniques that can "
+                        "silently break whenever Schoology changes its login flow, and (for the "
+                        "variant automating SSO login) requires storing your actual password "
+                        "locally, even if done via the OS keychain rather than a plaintext file. "
+                        "Included at explicit customer request, not a recommendation. If used: "
+                        "review the specific server's source before trusting it with real "
+                        "credentials, same as you would any unofficial tool handling a password.",
+    },
 }
 
 
@@ -4364,8 +4412,32 @@ def mcp_connect_cmd(service_name):
               f"If it has its own MCP server, connect it manually with mcp-add-oauth or "
               f"mcp-add-http once you have its real URL from the vendor's own docs.")
         return
-    trust_label = "official, vendor-hosted" if service["official"] else "third-party community server"
-    print(f"Connecting to {service_name} ({trust_label}): {service['description']}")
+
+    trust_label = "OFFICIAL, vendor-hosted" if service["official"] else "UNOFFICIAL, community-built"
+    print(f"{service_name} — {trust_label}")
+    print(service["description"])
+    print()
+
+    if service.get("requires_local_setup"):
+        # stdio-transport, unofficial entries (Canvas, Schoology) can't be
+        # one-click connected — they need local installation with the
+        # customer's OWN credentials, which Curant deliberately never
+        # touches or stores itself (the server reads them from its own
+        # .env file, per its own setup docs). This just points the
+        # customer at the real next step rather than pretending a
+        # one-command flow exists for something that structurally can't
+        # have one.
+        install_hint = " ".join(service["install_command"]) if service.get("install_command") else "(see the project's own README)"
+        print(f"This one needs local setup first — Curant never sees or stores your credentials for it:")
+        print(f"  1. Install: {install_hint}")
+        if service.get("binary_hint"):
+            print(f"  2. Find the installed binary: {service['binary_hint']}")
+        print(f"  3. Follow the project's own README to add your credentials to ITS config "
+              f"(not Curant's) — a personal API token for Canvas, or whatever Schoology's "
+              f"specific server variant requires")
+        print(f"  4. Then: curant-cli mcp-add {service_name.lower()} /path/to/the/binary")
+        return
+
     mcp_add_oauth_cmd(service_name.lower(), service["url"], transport=service.get("transport", "http"))
 
 
@@ -4481,10 +4553,18 @@ def mcp_list_cmd():
         return
     for s in servers:
         state = "enabled" if s["enabled"] else "disabled"
+        # Badge only applies to entries that match something in the
+        # curated registry — a customer's own custom mcp-add of a server
+        # not in KNOWN_MCP_SERVICES at all has no official/unofficial
+        # claim to make either way, since Curant never evaluated it.
+        known = KNOWN_MCP_SERVICES.get(s["name"].lower())
+        badge = ""
+        if known is not None:
+            badge = " [OFFICIAL]" if known["official"] else " [UNOFFICIAL — community-built, see mcp-connect for details]"
         if s["transport"] == "http":
-            print(f"{s['name']} ({state}, http): {s['url']}")
+            print(f"{s['name']}{badge} ({state}, http): {s['url']}")
         else:
-            print(f"{s['name']} ({state}, stdio): {' '.join(s['command'])}")
+            print(f"{s['name']}{badge} ({state}, stdio): {' '.join(s['command'])}")
 
 
 def mcp_remove_cmd(name):

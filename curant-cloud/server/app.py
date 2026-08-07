@@ -1868,14 +1868,23 @@ def get_august_tools(customer: dict) -> list[dict]:
 # same standard already applied to the Vapi response-shape assumptions
 # elsewhere in this file.
 
-# Same registry as Home's KNOWN_MCP_SERVICES — deliberately HTTP/SSE only
-# (no stdio entries exist in Home's registry either, so nothing was
-# dropped moving to Cloud). stdio itself — spawning an arbitrary local
-# command — is correctly NOT supported on Cloud at all: there's no
-# "customer's machine" to spawn it on, and arbitrary command execution
-# on a shared multi-tenant server is a real security concern Home simply
-# doesn't have (one customer per install there). Keep this in sync with
-# Home's registry by hand — there's no shared-code mechanism between the
+# Same registry as Home's KNOWN_MCP_SERVICES for the HTTP/SSE entries.
+# stdio itself — spawning an arbitrary local command — is correctly NOT
+# supported on Cloud at all: there's no "customer's machine" to spawn it
+# on, and arbitrary command execution on a shared multi-tenant server is
+# a real security concern Home simply doesn't have (one customer per
+# install there).
+#
+# REAL, HONEST GAP as of this pass: Home's registry also has two stdio
+# entries — "canvas" and "schoology" (both unofficial, community-built,
+# requiring local installation with the customer's own credentials in
+# the server's own .env file) — that genuinely cannot be offered here at
+# all, not because of an oversight but because the underlying mechanism
+# (a locally-run process reading a locally-stored credentials file)
+# has no equivalent on a shared server. A teacher wanting either of
+# these needs Curant Home specifically. Keep this file in sync with
+# Home's registry by hand for everything that CAN be shared (the
+# HTTP/SSE entries below) — there's no shared-code mechanism between the
 # two independently-deployed files.
 KNOWN_MCP_SERVICES = {
     "linear": {
@@ -5007,6 +5016,11 @@ def cloud_dashboard():
     <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0">
       <div>
         <strong>{{ name|capitalize }}</strong>
+        {% if service.official %}
+        <span style="font-size:.7rem;background:#e6f4ea;color:#1a7a3c;border-radius:10px;padding:2px 8px;margin-left:6px">OFFICIAL</span>
+        {% else %}
+        <span style="font-size:.7rem;background:#fdecea;color:#a33;border-radius:10px;padding:2px 8px;margin-left:6px">UNOFFICIAL</span>
+        {% endif %}
         <div class="muted" style="font-size:.8rem">{{ service.description }}</div>
       </div>
       {% if name in connected_mcp_server_names %}
