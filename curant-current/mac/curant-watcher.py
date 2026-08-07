@@ -35,9 +35,50 @@ import os
 import sys
 import json
 
-# --- Configuration — fill these in per-deployment ---
+# --- Configuration ---
 CHAT_DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
-CUSTOMER_APPLE_ID = "REPLACE_WITH_CUSTOMER_APPLE_ID"  # who this Mac's Curant listens to
+
+# Who this Mac's Curant listens to. Keyed on the customer's APPLE ID (the
+# email their iMessage account uses), not a phone number — the Apple ID is
+# the stable identity; a number can change hands or fall back to SMS.
+#
+# iMessage may still deliver one person's texts under more than one "handle"
+# (their Apple ID email AND phone numbers tied to that account), so
+# CUSTOMER_HANDLES holds every handle that maps to this one customer: a text
+# from any of them is answered, and the reply always goes back to whichever
+# handle they actually used (handle_message replies to msg["sender"]).
+#
+# Set WITHOUT editing this file — environment takes precedence, else
+# ~/.curant/config.json:
+#   env:    CURANT_CUSTOMER_APPLE_ID="name@icloud.com"
+#           CURANT_CUSTOMER_HANDLES="+15551234567,alt@me.com"   (optional extras)
+#   config: {"customer_apple_id": "name@icloud.com",
+#            "customer_handles": ["+15551234567"]}
+def _read_customer_handles():
+    cfg = {}
+    _cfg_path = os.path.expanduser("~/.curant/config.json")
+    if os.path.exists(_cfg_path):
+        try:
+            with open(_cfg_path) as _f:
+                cfg = json.load(_f)
+        except Exception:
+            cfg = {}
+    primary = (os.environ.get("CURANT_CUSTOMER_APPLE_ID")
+               or cfg.get("customer_apple_id") or "").strip()
+    extra = os.environ.get("CURANT_CUSTOMER_HANDLES") or cfg.get("customer_handles") or ""
+    extra = extra if isinstance(extra, list) else [h.strip() for h in str(extra).split(",")]
+    ordered, seen = [], set()
+    for h in [primary, *extra]:
+        h = (h or "").strip()
+        if h and h not in seen:
+            seen.add(h); ordered.append(h)
+    # Primary (used as the proactive-message target) defaults to the first
+    # handle if only CUSTOMER_HANDLES was provided.
+    primary = primary or (ordered[0] if ordered else "")
+    return primary, ordered
+
+
+CUSTOMER_APPLE_ID, CUSTOMER_HANDLES = _read_customer_handles()
 POLL_INTERVAL_SECONDS = 5
 LAST_SEEN_ROWID_FILE = os.path.expanduser("~/.curant/last_seen_rowid")
 
@@ -72,10 +113,14 @@ def fetch_new_messages(since_rowid):
     common structure; verify column names against your OS version with
     `sqlite3 ~/Library/Messages/chat.db ".schema message"` if this breaks.
     """
+    if not CUSTOMER_HANDLES:
+        return []  # no customer identity configured — nothing to match (see main()'s guard)
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    # placeholders is our own controlled "?,?" string — values stay parameterized.
+    placeholders = ",".join("?" for _ in CUSTOMER_HANDLES)
     cur = conn.execute(
-        """
+        f"""
         SELECT message.ROWID as rowid,
                message.text as text,
                message.is_from_me as is_from_me,
@@ -85,10 +130,10 @@ def fetch_new_messages(since_rowid):
         JOIN handle ON message.handle_id = handle.ROWID
         WHERE message.ROWID > ?
           AND message.is_from_me = 0
-          AND handle.id = ?
+          AND handle.id IN ({placeholders})
         ORDER BY message.ROWID ASC
         """,
-        (since_rowid, CUSTOMER_APPLE_ID),
+        (since_rowid, *CUSTOMER_HANDLES),
     )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -579,6 +624,14 @@ def deliver_completed_background_jobs():
 
 def main():
     print("curant-watcher starting — polling for new messages")
+    if not CUSTOMER_HANDLES:
+        print("No customer identity configured. Set the customer's Apple ID via the "
+              "CURANT_CUSTOMER_APPLE_ID env var or 'customer_apple_id' in "
+              "~/.curant/config.json (add CURANT_CUSTOMER_HANDLES / 'customer_handles' for "
+              "extra phone/email handles). Refusing to run with no one to listen to.",
+              file=sys.stderr)
+        sys.exit(1)
+    print(f"Listening for Apple ID / handles: {', '.join(CUSTOMER_HANDLES)}")
     last_rowid = get_last_seen_rowid()
 
     while True:
