@@ -29,11 +29,37 @@ Environment variables required:
   TELNYX_WEBHOOK_SECRET   — Telnyx webhook signature secret (for verifying
                             incoming webhooks are really from Telnyx)
   VAPI_API_KEY            — Vapi API key for voice prototype (optional)
+  VAPI_WEBHOOK_SECRET     — the server-URL secret configured in Vapi; sent
+                            back as the X-Vapi-Secret header and required on
+                            both /webhooks/vapi and /vapi-llm/<id>
   DATABASE_PATH           — path to SQLite DB (default: curant_cloud.db)
+  MS_GRAPH_CLIENT_ID      — a single Curant-owned Azure AD app (multi-tenant,
+                            "Accounts in any organizational directory and
+                            personal Microsoft accounts"), used for Outlook/
+                            Teams tools. Not per-customer — see the module
+                            comment above get_graph_tools for why one app
+                            works for every customer, unlike Microsoft's own
+                            official Work IQ / Teams Graph MCP servers.
+  MS_GRAPH_CLIENT_SECRET  — that app's client secret
+  CURANT_VERIFY_FROM_NUMBER — a Curant-owned Telnyx number used to send
+                            login codes and signup verification texts.
+                            Separate from each customer's own assigned
+                            DID, which doesn't exist yet at signup time.
+  TRUSTED_PROXY_COUNT     — how many reverse proxies sit in front of this
+                            app (default 0 = none). Only when this is set
+                            is X-Forwarded-For consulted for the client IP
+                            used in rate limiting.
+  CURANT_DEV_MODE         — set to "1" ONLY for local development. Allows
+                            webhook signature verification to be skipped
+                            when a secret isn't configured. Absent (the
+                            default), missing secrets fail CLOSED.
 """
 
 import os
 import re
+import socket
+import ipaddress
+from urllib.parse import urlparse
 import sys
 import json
 import hmac
@@ -44,7 +70,7 @@ import time
 import threading
 from contextlib import closing
 from functools import wraps
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from flask import (Flask, request, jsonify, session, redirect,
                    url_for, render_template_string, abort, Response)
@@ -87,9 +113,51 @@ else:
           "Fernet; print(Fernet.generate_key().decode())\"", file=sys.stderr)
     _fernet = None
 
+
+def _enc(plaintext: str | None) -> str | None:
+    """Generic Fernet encrypt for at-rest secrets that aren't the Option-A
+    API key / generation-key blobs (which have their own inline
+    _fernet.encrypt calls elsewhere) — used for third-party OAuth tokens
+    (mcp_oauth_tokens, graph_oauth_tokens). Passes plaintext through
+    unchanged if no CLOUD_ENCRYPTION_KEY is configured, same fail-open
+    posture as everywhere else _fernet is optional, rather than crashing
+    a whole OAuth flow over a missing env var — but this means these
+    tokens genuinely aren't at-rest-encrypted until that key is set,
+    same caveat that already applies to Option-A keys."""
+    if plaintext is None:
+        return None
+    if not _fernet:
+        return plaintext
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+
+def _dec(ciphertext: str | None) -> str | None:
+    """Inverse of _enc. Also tolerates a value that was never encrypted
+    in the first place (no _fernet configured at write time, or a legacy
+    plaintext row from before this fix) — Fernet tokens have a fixed,
+    recognizable structure, so InvalidToken on decrypt means "this was
+    already plaintext," not corruption, and falling back to returning it
+    as-is is the correct behavior rather than raising."""
+    if ciphertext is None:
+        return None
+    if not _fernet:
+        return ciphertext
+    try:
+        return _fernet.decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        return ciphertext
+
+
 TELNYX_API_KEY        = os.environ.get("TELNYX_API_KEY", "")
 TELNYX_WEBHOOK_SECRET = os.environ.get("TELNYX_WEBHOOK_SECRET", "")
 VAPI_API_KEY          = os.environ.get("VAPI_API_KEY", "")
+MS_GRAPH_CLIENT_ID     = os.environ.get("MS_GRAPH_CLIENT_ID", "")
+MS_GRAPH_CLIENT_SECRET = os.environ.get("MS_GRAPH_CLIENT_SECRET", "")
+CURANT_VERIFY_FROM_NUMBER = os.environ.get("CURANT_VERIFY_FROM_NUMBER", "")
+VAPI_WEBHOOK_SECRET   = os.environ.get("VAPI_WEBHOOK_SECRET", "")
+WEBHOOK_MAX_AGE_SECONDS = 300  # reject signed webhooks older than 5 minutes (replay window)
+TRUSTED_PROXY_COUNT   = int(os.environ.get("TRUSTED_PROXY_COUNT", "0") or 0)
+CURANT_DEV_MODE = os.environ.get("CURANT_DEV_MODE", "") == "1"
 # This server's own public URL — needed so Vapi's Custom LLM provider
 # knows where to send voice-call LLM requests back to us (see the
 # vapi_custom_llm() route). Without this set correctly, voice calls
@@ -138,6 +206,13 @@ def init_db():
             id              TEXT PRIMARY KEY,           -- UUID
             name            TEXT,
             email           TEXT UNIQUE,
+            mobile_number   TEXT,                       -- the CUSTOMER'S OWN phone, verified at
+                                                          -- signup by SMS code. This is the number
+                                                          -- they text/call FROM, and the number
+                                                          -- login codes are sent TO. Distinct from
+                                                          -- phone_number below, which is Curant's
+                                                          -- DID for them — conflating the two was a
+                                                          -- real bug, see phone_routing's comment.
             phone_number    TEXT UNIQUE,                -- Telnyx DID assigned to them
             phone_sid       TEXT,                       -- Telnyx phone number ID (for release)
             workspace_email TEXT,                       -- Curant's utility email for this customer (account signups)
@@ -270,6 +345,32 @@ def init_db():
             created_at       TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Graph OAuth tokens — one row per customer (not per-server like
+        -- mcp_oauth_tokens above, since Outlook and Teams both authenticate
+        -- through the same single Curant-owned Azure AD app and the same
+        -- Microsoft Graph access token covers both). See the module comment
+        -- above get_graph_tools() for why this is a fixed, non-DCR app
+        -- rather than the discover-and-register flow mcp_oauth_tokens uses.
+        CREATE TABLE IF NOT EXISTS graph_oauth_tokens (
+            customer_id    TEXT PRIMARY KEY,
+            access_token   TEXT,
+            refresh_token  TEXT,
+            expires_at     REAL,
+            scope          TEXT,
+            updated_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Same short-lived pending-flow pattern as mcp_oauth_pending, but
+        -- Graph only ever needs the PKCE verifier + which customer this is
+        -- for — client_id/secret are fixed (MS_GRAPH_CLIENT_ID/SECRET), not
+        -- per-flow like a dynamically-registered MCP client's would be.
+        CREATE TABLE IF NOT EXISTS graph_oauth_pending (
+            state          TEXT PRIMARY KEY,
+            customer_id    TEXT,
+            code_verifier  TEXT,
+            created_at     TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- Per-customer memories (same schema as Home)
         CREATE TABLE IF NOT EXISTS memories (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -311,10 +412,37 @@ def init_db():
         );
 
         -- Phone number → customer mapping (for fast webhook routing)
+        -- Maps a CUSTOMER'S OWN phone number to their account. This is what
+        -- get_customer_by_phone() resolves against, and it is called with the
+        -- sender's number on inbound SMS and the caller's number on inbound
+        -- voice. BUG FIXED Aug 2026: provisioning used to insert the assigned
+        -- Telnyx DID here instead of the customer's own mobile, so the lookup
+        -- could never match — every inbound text got "this number is not
+        -- associated with an active account" and every inbound call fell
+        -- through to the unknown-caller branch. Storing the customer's own
+        -- verified mobile is also what makes it safe to look up by SENDER
+        -- rather than by which DID was dialled: a stranger who discovers a
+        -- customer's Curant number still isn't recognised as that customer.
         CREATE TABLE IF NOT EXISTS phone_routing (
             phone_number TEXT PRIMARY KEY,
             customer_id  TEXT,
             active       INTEGER DEFAULT 1,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
+        -- Single-use, short-lived login/verification codes sent by SMS.
+        -- Only a hash of the code is stored, so a database read doesn't hand
+        -- someone a working login. attempts is capped so a 6-digit code can't
+        -- be brute-forced within its lifetime.
+        CREATE TABLE IF NOT EXISTS login_codes (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id   TEXT,
+            code_hash     TEXT,
+            purpose       TEXT DEFAULT 'login',   -- 'login' | 'signup_verify'
+            expires_at    REAL,
+            attempts      INTEGER DEFAULT 0,
+            used          INTEGER DEFAULT 0,
+            created_at    TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
@@ -390,6 +518,18 @@ def init_db():
             FOREIGN KEY (customer_id) REFERENCES customers(id)
         );
 
+        -- Calls currently in progress, tracked so the background voice-cap
+        -- enforcer (see _voice_cap_enforcer below) knows which live calls to
+        -- poll. Populated on "assistant-request", removed on
+        -- "end-of-call-report" or once the enforcer itself ends a call.
+        CREATE TABLE IF NOT EXISTS active_voice_calls (
+            call_id      TEXT PRIMARY KEY,
+            customer_id  TEXT,
+            started_at   TEXT DEFAULT CURRENT_TIMESTAMP,
+            ended_by_cap INTEGER DEFAULT 0,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_customer
             ON messages(customer_id, id);
         CREATE INDEX IF NOT EXISTS idx_memories_customer
@@ -420,12 +560,40 @@ def init_db():
             ("stripe_customer_id", "TEXT"),
             ("stripe_subscription_id", "TEXT"),
             ("subscription_status", "TEXT"),
+            ("mobile_number", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {coltype}")
                 conn.commit()
             except Exception:
                 pass  # column already exists
+
+
+def client_ip() -> str:
+    """
+    The real client address, for rate limiting.
+
+    Added after the Aug 2026 audit: every rate limit was keyed on
+    request.remote_addr, which behind a reverse proxy is the PROXY's
+    address — identical for every customer. That silently converts a
+    per-client limit into a global one: one noisy client exhausts the
+    bucket for everybody (a self-inflicted denial of service), while an
+    attacker gets no per-client restriction at all.
+
+    TRUSTED_PROXY_COUNT says how many proxies sit in front of this app.
+    X-Forwarded-For is client-controlled and trivially spoofable, so it is
+    only consulted when that is explicitly configured, and then only the
+    entry the nearest trusted proxy actually appended is read — counting
+    from the RIGHT, never taking the leftmost value, which is the part an
+    attacker can write freely.
+    """
+    if TRUSTED_PROXY_COUNT <= 0:
+        return request.remote_addr or "unknown"
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+    if len(parts) >= TRUSTED_PROXY_COUNT:
+        return parts[-TRUSTED_PROXY_COUNT]
+    return request.remote_addr or "unknown"
 
 
 def _check_rate(key: str, max_req: int, window_sec: int) -> bool:
@@ -503,15 +671,131 @@ def get_customer_by_email(email: str):
         return dict(row) if row else None
 
 
-def create_customer(name: str, email: str, area_code: str = ""):
+def _normalize_mobile(raw: str) -> str:
+    """Strips formatting to E.164-ish digits. Returns "" if it doesn't look
+    like a real number, so callers can treat falsy as invalid. Deliberately
+    conservative rather than clever: a wrong guess here means login codes and
+    inbound-message routing go to the wrong place."""
+    if not raw:
+        return ""
+    digits = re.sub(r"[^0-9+]", "", raw)
+    if digits.startswith("+"):
+        rest = digits[1:]
+        return "+" + rest if rest.isdigit() and 8 <= len(rest) <= 15 else ""
+    if digits.isdigit() and len(digits) == 10:      # bare US/Canada
+        return "+1" + digits
+    if digits.isdigit() and len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return ""
+
+
+def create_customer(name: str, email: str, area_code: str = "", mobile_number: str = ""):
     cid = secrets.token_hex(16)
     with closing(get_db()) as conn:
         conn.execute(
-            "INSERT INTO customers (id, name, email, area_code) VALUES (?, ?, ?, ?)",
-            (cid, name, email, area_code),
+            "INSERT INTO customers (id, name, email, area_code, mobile_number) VALUES (?, ?, ?, ?, ?)",
+            (cid, name, email, area_code, mobile_number),
         )
         conn.commit()
     return cid
+
+
+# ── SMS login codes ───────────────────────────────────────────────────────────
+# Replaces what used to be the entire Cloud login: type an email address, and
+# if an active account had it, you were logged in. No password, no second
+# factor, and no password column in the schema at all — an email address was
+# effectively a credential. Found in the Aug 2026 audit; this is the fix.
+#
+# SMS rather than an emailed magic link, deliberately: this product is already
+# phone-native, the customer's mobile is already verified at signup because
+# it's what routes their texts and calls, and Telnyx is already wired for
+# sending. An emailed link would have meant standing up a mail sender that
+# doesn't otherwise exist, and would tie account access to an inbox rather
+# than to the device the whole product is built around.
+#
+# HONEST LIMITATION: SMS is not a strong second factor — SIM swap and SS7
+# interception are real, and NIST has discouraged SMS OTP for high-assurance
+# use for years. It is a very large improvement over no factor at all, and it
+# matches the threat model here (the phone IS the product's identity anchor),
+# but it should not be mistaken for TOTP or a passkey. Worth revisiting before
+# this handles anything more sensitive than it does today.
+LOGIN_CODE_TTL_SECONDS = 10 * 60
+LOGIN_CODE_MAX_ATTEMPTS = 5
+
+
+def _hash_login_code(code: str) -> str:
+    """Salted with the app secret so a stolen DB alone doesn't let someone
+    precompute the 10^6 possible 6-digit codes."""
+    return hmac.new(_secret.encode(), code.encode(), hashlib.sha256).hexdigest()
+
+
+def create_login_code(customer_id: str, purpose: str = "login") -> str:
+    """Generates a 6-digit code, stores only its hash, and invalidates any
+    earlier unused codes for this customer so a previous text can't be
+    replayed after a new one is requested."""
+    code = f"{secrets.randbelow(1000000):06d}"
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE login_codes SET used=1 WHERE customer_id=? AND purpose=? AND used=0",
+            (customer_id, purpose),
+        )
+        conn.execute(
+            "INSERT INTO login_codes (customer_id, code_hash, purpose, expires_at) VALUES (?, ?, ?, ?)",
+            (customer_id, _hash_login_code(code), purpose, time.time() + LOGIN_CODE_TTL_SECONDS),
+        )
+        conn.commit()
+    return code
+
+
+def verify_login_code(customer_id: str, submitted: str, purpose: str = "login") -> tuple[bool, str]:
+    """Returns (ok, error_message). Single-use, time-limited, attempt-capped,
+    constant-time compared. Increments attempts on the stored row rather than
+    trusting anything client-side."""
+    submitted = (submitted or "").strip()
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM login_codes WHERE customer_id=? AND purpose=? AND used=0 "
+            "ORDER BY id DESC LIMIT 1",
+            (customer_id, purpose),
+        ).fetchone()
+        if not row:
+            return False, "That code has already been used — request a new one."
+        row = dict(row)
+        if time.time() > (row["expires_at"] or 0):
+            return False, "That code has expired — request a new one."
+        if row["attempts"] >= LOGIN_CODE_MAX_ATTEMPTS:
+            conn.execute("UPDATE login_codes SET used=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            return False, "Too many incorrect attempts — request a new code."
+        conn.execute("UPDATE login_codes SET attempts=attempts+1 WHERE id=?", (row["id"],))
+        conn.commit()
+
+        if not secrets.compare_digest(_hash_login_code(submitted), row["code_hash"]):
+            return False, "Incorrect code."
+
+        conn.execute("UPDATE login_codes SET used=1 WHERE id=?", (row["id"],))
+        conn.commit()
+    return True, ""
+
+
+def send_login_code(customer: dict, code: str, purpose: str = "login") -> tuple[bool, str]:
+    """Sends the code to the customer's OWN mobile. Fails loudly rather than
+    silently succeeding — a login flow that reports success while sending
+    nothing would lock a real customer out with no explanation."""
+    if not customer.get("mobile_number"):
+        return False, ("No mobile number on file for this account — contact support. "
+                        "(Accounts created before mobile verification was added need one added.)")
+    if not CURANT_VERIFY_FROM_NUMBER:
+        return False, "Login by text isn't configured on this server (CURANT_VERIFY_FROM_NUMBER unset)."
+    what = "verification" if purpose == "signup_verify" else "login"
+    try:
+        send_sms(customer["mobile_number"], CURANT_VERIFY_FROM_NUMBER,
+                 f"Your Curant {what} code is {code}. It expires in 10 minutes. "
+                 f"If you didn't request this, ignore this message.")
+        return True, ""
+    except Exception as e:
+        print(f"Failed to send {what} code to customer {customer.get('id')}: {e}", file=sys.stderr)
+        return False, "Couldn't send the code right now — try again in a moment."
 
 
 # ── API key storage helpers ────────────────────────────────────────────────────
@@ -710,24 +994,33 @@ PROVIDER_MODELS = {
 # ── Voice spend tracking and monthly cap ─────────────────────────────────────
 # Previously nothing tracked voice usage at all — spend was only visible by
 # checking Vapi's own dashboard by hand. This closes that gap: real
-# per-customer usage logging, plus a monthly cap with visibility for the
-# business owner when a customer crosses it.
+# per-customer usage logging, a monthly cap, AND (as of Aug 2026) an actual
+# hard stop on live calls, not just visibility.
 #
-# HONEST LIMITATION, stated plainly rather than glossed over: unlike Home's
-# generation-tool cap (which blocks a paid call before it fires), a live
-# voice call is already connecting by the time assistant-request runs, and
-# Vapi bills its own platform/STT/TTS cost per minute regardless of which
-# LLM key is used for that call — swapping to a different key doesn't stop
-# that cost. Cleanly rejecting or ending a call from assistant-request would
-# need a specific Vapi mechanism that hasn't been verified against their
-# current docs (same standard as the "NOT independently re-verified" flag
-# already on this webhook's response shape). Until that's confirmed, this
-# implements what's actually solid: real usage visibility, a soft in-call
-# warning to the model once a customer is over cap, and a flagged alert in
-# the owner dashboard so a person can decide whether to intervene — the same
-# "log it, let a human decide" pattern already used for device-release
-# requests, rather than fabricating a hard stop this codebase can't
-# guarantee actually works.
+# UPDATE, Aug 2026: the "no verified mechanism" limitation below is
+# resolved. Confirmed against Vapi's current docs (docs.vapi.ai/calls/
+# call-features, "Live Call Control"): any live call exposes a
+# monitor.controlUrl, fetchable via GET https://api.vapi.ai/call/{id} with
+# our own API key regardless of who initiated the call (assistant-request
+# doesn't need to have created it via POST /call — that's just the
+# doc example's way of showing the response shape). POSTing
+# {"type": "end-call"} to that controlUrl ends the call immediately.
+# _voice_cap_enforcer() below polls each active call's live running cost via
+# that same GET and ends it the moment the customer's monthly cap is
+# breached mid-call — the actual hard stop that was previously flagged as
+# unverified.
+#
+# HONEST LIMITATION, still stated plainly: this has NOT been exercised
+# against a real live phone call in this environment — no live Vapi call
+# has actually been placed here to confirm the call object's exact field
+# names (monitor.controlUrl, cost) survive unchanged for a real inbound
+# PSTN call routed through Telnyx, as opposed to the outbound-call example
+# in Vapi's docs. Confirm against one real test call before trusting this
+# in front of an actual customer, same standard already applied elsewhere
+# in this file (FLUX/Veo, the OAuth flow, the webhook's own response
+# shape). If it doesn't hold, this degrades safely: the enforcer thread
+# just logs and skips a call it can't parse, and the pre-existing soft
+# in-system-prompt warning below still applies regardless.
 VAPI_ESTIMATED_COST_PER_MINUTE_USD = 0.20  # Vapi's platform fee alone is $0.05/min;
                                              # $0.15-0.33/min all-in with STT/LLM/TTS
                                              # per Vapi's own published numbers — same
@@ -777,6 +1070,118 @@ def is_over_voice_cap(customer: dict) -> tuple[bool, float, float | None]:
         return False, 0.0, None
     spend = get_monthly_voice_spend(customer["id"])
     return spend >= cap, spend, cap
+
+
+def _track_active_call(call_id: str, customer_id: str):
+    """Called from assistant-request once we know both IDs, so the
+    background enforcer has something to poll."""
+    if not call_id or not customer_id:
+        return
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO active_voice_calls (call_id, customer_id) VALUES (?, ?) "
+            "ON CONFLICT(call_id) DO NOTHING",
+            (call_id, customer_id),
+        )
+        conn.commit()
+
+
+def _untrack_active_call(call_id: str):
+    if not call_id:
+        return
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM active_voice_calls WHERE call_id = ?", (call_id,))
+        conn.commit()
+
+
+def _vapi_get_call(call_id: str) -> dict | None:
+    """GET the current call resource from Vapi's REST API — the same
+    representation returned by POST /call, including monitor.controlUrl
+    and a live-updating cost field, per docs.vapi.ai/calls/call-features.
+    Returns None on any failure rather than raising, since this runs from
+    a background loop that must never crash the whole enforcer thread over
+    one bad call."""
+    if not VAPI_API_KEY:
+        return None
+    try:
+        resp = http.get(
+            f"https://api.vapi.ai/call/{call_id}",
+            headers={"Authorization": f"Bearer {VAPI_API_KEY}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+
+def _vapi_end_call(control_url: str) -> bool:
+    """POST the documented Live Call Control end-call message. Returns
+    whether the request itself succeeded (2xx) — not a guarantee the call
+    actually hung up, just that Vapi accepted the instruction."""
+    try:
+        resp = http.post(control_url, json={"type": "end-call"}, timeout=10)
+        return 200 <= resp.status_code < 300
+    except Exception:
+        return False
+
+
+def _voice_cap_enforcer():
+    """Background daemon, same pattern as _session_cleanup below: polls
+    every 20 seconds for any active call whose customer has now crossed
+    their monthly voice cap mid-call (started under cap, crossed it while
+    talking — the case the monthly-spend-at-call-start check in
+    assistant-request can't catch), and ends it via Live Call Control.
+    Uses Vapi's own live "cost" field on the call object rather than
+    re-deriving cost from duration, since Vapi's number reflects whatever
+    it's actually going to bill, not our per-minute estimate."""
+    while True:
+        time.sleep(20)
+        try:
+            with closing(get_db()) as conn:
+                rows = conn.execute(
+                    "SELECT call_id, customer_id FROM active_voice_calls WHERE ended_by_cap = 0"
+                ).fetchall()
+            for row in rows:
+                call_id, customer_id = row["call_id"], row["customer_id"]
+                customer = get_customer(customer_id)
+                if not customer:
+                    continue
+                cap = get_voice_cap(customer)
+                if cap is None:  # explicitly uncapped
+                    continue
+                already_logged = get_monthly_voice_spend(customer_id)
+                call = _vapi_get_call(call_id)
+                if not call:
+                    continue
+                live_cost = call.get("cost")
+                if live_cost is None:  # field missing/renamed — degrade safely, see module comment
+                    continue
+                if already_logged + float(live_cost) < cap:
+                    continue
+                control_url = (call.get("monitor") or {}).get("controlUrl")
+                if not control_url:
+                    continue
+                if _vapi_end_call(control_url):
+                    with closing(get_db()) as conn:
+                        conn.execute(
+                            "UPDATE active_voice_calls SET ended_by_cap = 1 WHERE call_id = ?",
+                            (call_id,),
+                        )
+                        conn.execute(
+                            "INSERT INTO error_reports (customer_id, error_code, component) "
+                            "VALUES (?, ?, ?)",
+                            (customer_id, "voice_call_ended_mid_call_over_cap", "_voice_cap_enforcer"),
+                        )
+                        conn.commit()
+        except Exception:
+            # Never let one bad iteration kill the whole background thread —
+            # same defensive stance as _session_cleanup.
+            continue
+
+
+threading.Thread(target=_voice_cap_enforcer, daemon=True).start()
 
 
 # ── August's generation services — key storage, cost tracking, spend cap ────
@@ -1388,11 +1793,82 @@ def build_grading_calibration_context(customer_id: str, assignment_name: str):
 # ever one execution of the actual submission, never a risk of double-
 # submitting a form.
 
+# Expanded after the Aug 2026 audit, which tested the matcher against real
+# field names and found it correctly caught card/cvv/ssn/routing but missed
+# several categories that are just as sensitive: international bank details,
+# government IDs, and date of birth.
 PAYMENT_FIELD_KEYWORDS = (
     "card", "cvv", "cvc", "ccnum", "cardnumber", "security-code",
     "securitycode", "expiry", "exp-date", "expdate", "ssn", "social-security",
     "socialsecurity", "routing-number", "routingnumber", "account-number", "accountnumber",
+    # international banking
+    "iban", "bic", "swift", "sortcode", "sort-code",
+    # government / identity documents
+    "passport", "taxid", "tax-id", "nationalid", "national-id", "driverslicense",
+    "drivers-license", "licensenumber", "sin", "nino",
+    # date of birth (commonly paired with the above for identity verification)
+    "dateofbirth", "date-of-birth", "dob", "birthdate", "birth-date",
+    # credentials — never auto-fill these either
+    "password", "passwd", "pin", "otp", "onetimecode", "mfa", "2fa",
 )
+
+# ── SSRF guard for the browser tools ─────────────────────────────────────────
+# Added after the Aug 2026 audit found browse_page() passed whatever URL it
+# was given straight to Playwright with no validation at all. That meant the
+# model could be steered — by a customer, or by injected text in an email or
+# web page it had just read — into fetching http://localhost, a router admin
+# page on the customer's LAN, or a cloud metadata endpoint like
+# http://169.254.169.254/ and reporting the contents back.
+#
+# Blocks by resolved IP, not by hostname string: a name like
+# "internal.example.com" or a DNS entry deliberately pointed at 127.0.0.1
+# looks perfectly public as text. Resolution happens here, and again inside
+# the page's request interceptor, so a redirect or a subresource can't reach
+# somewhere the top-level URL wasn't allowed to.
+BLOCKED_URL_SCHEMES_NOTE = "only http:// and https:// are allowed"
+
+
+def _ip_is_private(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # unparseable — treat as unsafe rather than allow
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _is_safe_url(url):
+    """Returns (safe, reason). Used both up front and per-request."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "that isn't a URL I can parse"
+    if parsed.scheme not in ("http", "https"):
+        return False, f"the scheme '{parsed.scheme or 'none'}' isn't allowed — {BLOCKED_URL_SCHEMES_NOTE}"
+    host = parsed.hostname
+    if not host:
+        return False, "that URL has no hostname"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, f"'{host}' couldn't be resolved"
+    for info in infos:
+        if _ip_is_private(info[4][0]):
+            return False, (f"'{host}' resolves to a private, loopback, or link-local address "
+                            f"({info[4][0]}) — internal network addresses are not reachable from here")
+    return True, ""
+
+
+def _install_ssrf_guard(page):
+    """Re-checks every request the page makes, so redirects, iframes, and
+    subresource loads are held to the same rule as the original URL."""
+    def _route(route, request):
+        ok, _ = _is_safe_url(request.url)
+        if ok:
+            route.continue_()
+        else:
+            route.abort()
+    page.route("**/*", _route)
 
 
 def _is_sensitive_field(field_name: str) -> bool:
@@ -1417,12 +1893,17 @@ def browse_page(url: str):
     """Read-only — see what's on a page and what fields exist, so the
     model knows what a subsequent fill_and_submit_form() call could
     target. No side effect, no confirmation needed."""
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
                 text_content = page.inner_text("body")
@@ -1464,12 +1945,17 @@ def fill_and_submit_form(url: str, field_values: dict, submit_selector: str, con
             f"automated, regardless of confirmation."
         )
 
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                _install_ssrf_guard(page)
                 page.goto(url, timeout=BROWSER_TIMEOUT_MS)
                 for field_name, value in field_values.items():
                     el = page.query_selector(f"#{field_name}, [name='{field_name}']")
@@ -1875,17 +2361,26 @@ def get_august_tools(customer: dict) -> list[dict]:
 # a real security concern Home simply doesn't have (one customer per
 # install there).
 #
-# REAL, HONEST GAP as of this pass: Home's registry also has two stdio
-# entries — "canvas" and "schoology" (both unofficial, community-built,
-# requiring local installation with the customer's own credentials in
-# the server's own .env file) — that genuinely cannot be offered here at
-# all, not because of an oversight but because the underlying mechanism
-# (a locally-run process reading a locally-stored credentials file)
-# has no equivalent on a shared server. A teacher wanting either of
-# these needs Curant Home specifically. Keep this file in sync with
-# Home's registry by hand for everything that CAN be shared (the
-# HTTP/SSE entries below) — there's no shared-code mechanism between the
-# two independently-deployed files.
+# REAL, HONEST GAP as of this pass: Home's registry has several stdio
+# entries that genuinely cannot be offered here at all, not because of
+# an oversight but because the underlying mechanism (a locally-run
+# process, sometimes reading locally-stored credentials) has no
+# equivalent on a shared server:
+#   - "canvas" and "schoology" (both unofficial, community-built,
+#     requiring local installation with the customer's own credentials
+#     in the server's own .env file) — a teacher wanting either needs
+#     Curant Home specifically.
+#   - "testrail" — no official remote TestRail MCP server exists as of
+#     Aug 2026, only community stdio packages.
+# Also deliberately excluded from BOTH registries, Aug 2026: Jenkins
+# (official plugin, but no single URL — runs per-customer at
+# <their-jenkins-url>/mcp-server/mcp with Basic auth; connectable today
+# via the manual HTTP+headers path, same as Clio) and generic SOAP/WSDL
+# gateways (e.g. AustinWise/mcp2ws — takes a customer's own WSDL URL,
+# stdio-only, so Home-only even if it were added).
+# Keep this file in sync with Home's registry by hand for everything
+# that CAN be shared (the HTTP/SSE entries below) — there's no
+# shared-code mechanism between the two independently-deployed files.
 KNOWN_MCP_SERVICES = {
     "linear": {
         "url": "https://mcp.linear.app/mcp", "transport": "http", "official": True,
@@ -1895,7 +2390,10 @@ KNOWN_MCP_SERVICES = {
         "url": "https://mcp.atlassian.com/v1/mcp/authv2", "transport": "http", "official": True,
         "description": "Atlassian's official Rovo MCP server — Jira, Confluence, Bitbucket. "
                         "Note: does not currently support HIPAA or FedRAMP requirements, per "
-                        "Atlassian's own documentation.",
+                        "Atlassian's own documentation. Also note: as of Jul 2026, Bitbucket's "
+                        "tools on this server authenticate via scoped API token only — OAuth is "
+                        "on Atlassian's roadmap but not live yet, unlike Jira/Confluence which "
+                        "already support OAuth 2.1.",
     },
     "github": {
         "url": "https://api.githubcopilot.com/mcp/", "transport": "http", "official": True,
@@ -1905,6 +2403,12 @@ KNOWN_MCP_SERVICES = {
     "figma": {
         "url": "https://mcp.figma.com/mcp", "transport": "http", "official": True,
         "description": "Figma's official remote MCP server — files, designs, Dev Mode context.",
+    },
+    "postman": {
+        "url": "https://mcp.postman.com/mcp", "transport": "http", "official": True,
+        "description": "Postman's official remote MCP server — workspaces, collections, "
+                        "environments, API requests. OAuth works on the US server only; the EU "
+                        "server requires a Postman API key via header instead.",
     },
     "hubspot": {
         "url": "https://mcp.hubspot.com", "transport": "http", "official": True,
@@ -1994,12 +2498,21 @@ def get_mcp_servers_for_customer(customer_id: str, enabled_only: bool = True) ->
 
 
 def _get_mcp_token_row(customer_id: str, server_name: str):
+    """Single choke point for reading this table — decrypts access_token,
+    refresh_token, and client_secret here so every caller downstream gets
+    plaintext without needing to know encryption is involved at all."""
     with closing(get_db()) as conn:
         row = conn.execute(
             "SELECT * FROM mcp_oauth_tokens WHERE customer_id=? AND server_name=?",
             (customer_id, server_name),
         ).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        row = dict(row)
+        row["access_token"] = _dec(row.get("access_token"))
+        row["refresh_token"] = _dec(row.get("refresh_token"))
+        row["client_secret"] = _dec(row.get("client_secret"))
+        return row
 
 
 def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | None:
@@ -2034,7 +2547,7 @@ def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | No
             conn.execute(
                 "UPDATE mcp_oauth_tokens SET access_token=?, refresh_token=?, expires_at=? "
                 "WHERE customer_id=? AND server_name=?",
-                (new_access, new_refresh, expires_at, customer_id, server_name),
+                (_enc(new_access), _enc(new_refresh), expires_at, customer_id, server_name),
             )
             conn.commit()
         return new_access
@@ -2138,6 +2651,67 @@ def _get_mcp_server_tools_cached(customer_id: str, server: dict) -> list[dict]:
         )
         conn.commit()
     return tools
+
+
+def get_graph_tools(customer: dict) -> list[dict]:
+    """Outlook + Teams tools, backed directly by Microsoft Graph via the
+    single Curant-owned Azure app (see the module comment above the
+    /cloud/graph/connect route for the full Option-B reasoning). Same
+    "only offer it if it'll actually work" gating as get_workspace_tools —
+    no point exposing these to the model for a customer who's never
+    connected their Microsoft account."""
+    if not _get_graph_token(customer.get("id", "")):
+        return []
+    return [
+        {"qualified_name": "graph_search_emails", "raw_name": "graph_search_emails",
+         "description": "Search or list the customer's Outlook inbox (top results, most "
+                         "recent first). Pass a Microsoft Graph $search-style query, or "
+                         "leave blank to just list recent mail.",
+         "input_schema": {"type": "object", "properties": {
+             "query": {"type": "string", "description": "Free-text search, or blank for recent mail"},
+             "limit": {"type": "integer", "description": "Max results, default 10"}},
+             "required": []}},
+        {"qualified_name": "graph_send_email", "raw_name": "graph_send_email",
+         "description": "Send an email from the customer's own Outlook account. Requires "
+                         "explicit customer confirmation first, same as gmail_send.",
+         "input_schema": {"type": "object", "properties": {
+             "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"},
+             "confirmed": {"type": "boolean"}},
+             "required": ["to", "subject", "body"]}},
+        {"qualified_name": "graph_list_calendar_events", "raw_name": "graph_list_calendar_events",
+         "description": "List the customer's upcoming Outlook calendar events.",
+         "input_schema": {"type": "object", "properties": {
+             "days_ahead": {"type": "integer", "description": "How many days out to look, default 7"}},
+             "required": []}},
+        {"qualified_name": "graph_create_calendar_event", "raw_name": "graph_create_calendar_event",
+         "description": "Create an Outlook calendar event. Inviting attendees requires "
+                         "explicit customer confirmation first, same as calendar_create_event.",
+         "input_schema": {"type": "object", "properties": {
+             "subject": {"type": "string"},
+             "start_iso": {"type": "string", "description": "ISO 8601, e.g. 2026-09-01T14:00:00"},
+             "end_iso": {"type": "string", "description": "ISO 8601"},
+             "attendees": {"type": "array", "items": {"type": "string"}, "description": "Email addresses"},
+             "confirmed": {"type": "boolean"}},
+             "required": ["subject", "start_iso", "end_iso"]}},
+        {"qualified_name": "graph_list_teams_channels", "raw_name": "graph_list_teams_channels",
+         "description": "List the customer's joined Microsoft Teams and each team's channels "
+                         "— use this first to find the team_id/channel_id needed by "
+                         "graph_send_teams_message or graph_get_channel_messages.",
+         "input_schema": {"type": "object", "properties": {}, "required": []}},
+        {"qualified_name": "graph_get_channel_messages", "raw_name": "graph_get_channel_messages",
+         "description": "Read recent messages from a Teams channel (from graph_list_teams_channels).",
+         "input_schema": {"type": "object", "properties": {
+             "team_id": {"type": "string"}, "channel_id": {"type": "string"},
+             "limit": {"type": "integer", "description": "Max messages, default 20"}},
+             "required": ["team_id", "channel_id"]}},
+        {"qualified_name": "graph_send_teams_message", "raw_name": "graph_send_teams_message",
+         "description": "Post a message to a Teams channel (from graph_list_teams_channels). "
+                         "Requires explicit customer confirmation first, same as any other send.",
+         "input_schema": {"type": "object", "properties": {
+             "team_id": {"type": "string"}, "channel_id": {"type": "string"},
+             "message": {"type": "string"}, "confirmed": {"type": "boolean"}},
+             "required": ["team_id", "channel_id", "message"]}},
+    ]
 
 
 def get_mcp_tools(customer: dict) -> list[dict]:
@@ -2465,6 +3039,117 @@ def execute_cloud_tool_call(tool_name: str, arguments: dict, customer: dict,
                     f"Monthly cap: ${cap:.2f} — ~${max(cap - monthly_spend, 0):.2f} remaining this month.")
         return f"This month's generation spend: ~${monthly_spend:.2f}. {cap_line}"
 
+    if tool_name == "graph_search_emails":
+        params = {"$top": arguments.get("limit", 10), "$orderby": "receivedDateTime desc"}
+        if arguments.get("query"):
+            params["$search"] = f'"{arguments["query"]}"'
+        from urllib.parse import urlencode
+        data, err = _graph_api(cid, "GET", f"/me/messages?{urlencode(params)}")
+        if err:
+            return f"[{err}]"
+        msgs = data.get("value", [])
+        if not msgs:
+            return "No matching emails found."
+        return "\n".join(
+            f"[{m['id']}] {m.get('subject', '(no subject)')} — from "
+            f"{(m.get('from') or {}).get('emailAddress', {}).get('address', 'unknown')} "
+            f"({m.get('receivedDateTime', '')})"
+            for m in msgs
+        )
+
+    if tool_name == "graph_send_email":
+        if not arguments.get("confirmed"):
+            return ("Not sent — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
+        body = {
+            "message": {
+                "subject": arguments.get("subject", ""),
+                "body": {"contentType": "Text", "content": arguments.get("body", "")},
+                "toRecipients": [{"emailAddress": {"address": arguments.get("to", "")}}],
+            }
+        }
+        _, err = _graph_api(cid, "POST", "/me/sendMail", body)
+        return f"[{err}]" if err else "Email sent."
+
+    if tool_name == "graph_list_calendar_events":
+        from datetime import datetime, timedelta
+        days_ahead = arguments.get("days_ahead", 7)
+        start = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(days=days_ahead)).isoformat() + "Z"
+        data, err = _graph_api(
+            cid, "GET",
+            f"/me/calendarView?startDateTime={start}&endDateTime={end}&$orderby=start/dateTime",
+        )
+        if err:
+            return f"[{err}]"
+        events = data.get("value", [])
+        if not events:
+            return "No upcoming events in that window."
+        return "\n".join(
+            f"[{e['id']}] {e.get('subject', '(no subject)')} — "
+            f"{e.get('start', {}).get('dateTime', '?')} to {e.get('end', {}).get('dateTime', '?')}"
+            for e in events
+        )
+
+    if tool_name == "graph_create_calendar_event":
+        if arguments.get("attendees") and not arguments.get("confirmed"):
+            return ("Not created — inviting attendees requires explicit customer confirmation "
+                     "first. Ask the customer to confirm, wait for their reply, then call this "
+                     "again with confirmed=true.")
+        body = {
+            "subject": arguments.get("subject", ""),
+            "start": {"dateTime": arguments.get("start_iso", ""), "timeZone": "UTC"},
+            "end": {"dateTime": arguments.get("end_iso", ""), "timeZone": "UTC"},
+        }
+        if arguments.get("attendees"):
+            body["attendees"] = [
+                {"emailAddress": {"address": a}, "type": "required"} for a in arguments["attendees"]
+            ]
+        data, err = _graph_api(cid, "POST", "/me/events", body)
+        if err:
+            return f"[{err}]"
+        return f"Event created: {data.get('subject', '')} (id: {data.get('id', '')})"
+
+    if tool_name == "graph_list_teams_channels":
+        teams_data, err = _graph_api(cid, "GET", "/me/joinedTeams")
+        if err:
+            return f"[{err}]"
+        teams = teams_data.get("value", [])
+        if not teams:
+            return "No joined Teams found."
+        lines = []
+        for t in teams:
+            chans, cerr = _graph_api(cid, "GET", f"/teams/{t['id']}/channels")
+            chan_list = ", ".join(f"{c['displayName']} (channel_id: {c['id']})" for c in (chans or {}).get("value", [])) if not cerr else f"[{cerr}]"
+            lines.append(f"{t.get('displayName', '(unnamed)')} (team_id: {t['id']}) — channels: {chan_list}")
+        return "\n".join(lines)
+
+    if tool_name == "graph_get_channel_messages":
+        team_id, channel_id = arguments.get("team_id", ""), arguments.get("channel_id", "")
+        limit = arguments.get("limit", 20)
+        data, err = _graph_api(cid, "GET", f"/teams/{team_id}/channels/{channel_id}/messages?$top={limit}")
+        if err:
+            return f"[{err}]"
+        msgs = data.get("value", [])
+        if not msgs:
+            return "No messages found in that channel."
+        return "\n".join(
+            f"{(m.get('from') or {}).get('user', {}).get('displayName', 'unknown')}: "
+            f"{(m.get('body') or {}).get('content', '')}"
+            for m in msgs
+        )
+
+    if tool_name == "graph_send_teams_message":
+        if not arguments.get("confirmed"):
+            return ("Not sent — this action requires explicit customer confirmation first. "
+                     "Ask the customer to confirm, wait for their reply, then call this again "
+                     "with confirmed=true.")
+        team_id, channel_id = arguments.get("team_id", ""), arguments.get("channel_id", "")
+        body = {"body": {"content": arguments.get("message", "")}}
+        _, err = _graph_api(cid, "POST", f"/teams/{team_id}/channels/{channel_id}/messages", body)
+        return f"[{err}]" if err else "Message posted to the channel."
+
     if tool_name == "gmail_search":
         results = search_emails(email, query=arguments.get("query", ""))
         if not results:
@@ -2764,7 +3449,7 @@ def generate_reply(customer: dict, user_message: str,
 
     tools = (get_workspace_tools(customer) + get_grading_tools(customer)
              + get_browser_automation_tools(customer) + get_august_tools(customer)
-             + get_mcp_tools(customer))
+             + get_mcp_tools(customer) + get_graph_tools(customer))
 
     try:
         if tools:
@@ -3599,9 +4284,32 @@ def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str)
     Returns True if valid, False otherwise.
     """
     if not TELNYX_WEBHOOK_SECRET:
-        print("WARNING: TELNYX_WEBHOOK_SECRET not set — skipping webhook signature verification. "
-              "Set this in production.", file=sys.stderr)
-        return True  # allow in dev, never in prod
+        # FAIL CLOSED (Aug 2026 audit). This used to `return True` with a
+        # warning and a comment reading "allow in dev, never in prod" — but
+        # nothing enforced that, so a deploy that forgot one env var silently
+        # accepted ANY post to the SMS webhook, letting anyone impersonate a
+        # customer and drive every tool they'd connected. Skipping is now an
+        # explicit, deliberate opt-in via CURANT_DEV_MODE.
+        if CURANT_DEV_MODE:
+            print("WARNING: TELNYX_WEBHOOK_SECRET not set and CURANT_DEV_MODE=1 — "
+                  "skipping signature verification. Never do this in production.",
+                  file=sys.stderr)
+            return True
+        print("REFUSING webhook: TELNYX_WEBHOOK_SECRET is not set. Set it, or set "
+              "CURANT_DEV_MODE=1 for local development only.", file=sys.stderr)
+        return False
+
+    # Replay protection: the timestamp is part of the signed payload, so it
+    # can't be edited without breaking the signature — but without a freshness
+    # check a captured valid webhook could be replayed forever.
+    try:
+        if abs(time.time() - float(timestamp)) > WEBHOOK_MAX_AGE_SECONDS:
+            print("Rejecting webhook: timestamp outside the accepted window (replay?).",
+                  file=sys.stderr)
+            return False
+    except (TypeError, ValueError):
+        return False
+
     signed_payload = timestamp + "|" + request_body.decode()
     expected = hmac.new(
         TELNYX_WEBHOOK_SECRET.encode(),
@@ -3609,6 +4317,29 @@ def verify_telnyx_signature(request_body: bytes, signature: str, timestamp: str)
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def verify_vapi_request(req) -> bool:
+    """
+    Vapi webhook + Custom-LLM authentication. Previously ABSENT entirely:
+    /webhooks/vapi accepted any POST, which meant an unauthenticated caller
+    could send an "assistant-request" with a guessed phone number and get back
+    a system prompt containing that customer's stored memories and important
+    people — and could POST a fabricated "end-of-call-report" transcript that
+    was written straight into their history as future context.
+
+    Vapi sends the server-URL secret as the X-Vapi-Secret header. Same
+    fail-closed posture as Telnyx above.
+    """
+    if not VAPI_WEBHOOK_SECRET:
+        if CURANT_DEV_MODE:
+            print("WARNING: VAPI_WEBHOOK_SECRET not set and CURANT_DEV_MODE=1 — "
+                  "skipping Vapi request verification.", file=sys.stderr)
+            return True
+        print("REFUSING Vapi request: VAPI_WEBHOOK_SECRET is not set.", file=sys.stderr)
+        return False
+    supplied = req.headers.get("X-Vapi-Secret", "") or req.headers.get("x-vapi-secret", "")
+    return bool(supplied) and secrets.compare_digest(supplied, VAPI_WEBHOOK_SECRET)
 
 
 # ── Session key store (Option B in-memory unlock cache) ───────────────────────
@@ -3757,6 +4488,14 @@ def vapi_custom_llm(customer_id):
     chunk shape (`delta` field, not `message`) was confirmed by reading
     a real solved case on Vapi's own support forum, not guessed at.
     """
+    # The customer_id in this URL is a random 32-hex value, but it is NOT a
+    # credential — it is configured into Vapi's assistant response, appears in
+    # logs at both ends, and identifies rather than authenticates. Without the
+    # shared-secret check below, anyone holding it could POST arbitrary message
+    # arrays and have completions billed to that customer's own API key.
+    if not verify_vapi_request(request):
+        abort(403)
+
     customer = get_customer(customer_id)
     if not customer:
         return jsonify({"error": {"message": "Unknown customer"}}), 404
@@ -3870,6 +4609,9 @@ def vapi_webhook():
         that this specific detail should be confirmed against a live
         test call before trusting it in front of a real customer.
     """
+    if not verify_vapi_request(request):
+        abort(403)
+
     data = request.get_json(force=True)
     message = data.get("message", {})
     msg_type = message.get("type", "")
@@ -3909,6 +4651,10 @@ def vapi_webhook():
         # suggest switching to text, and logs a flagged alert so a
         # person can decide whether to intervene, same "log it, human
         # decides" pattern as device-release requests.
+        call_id = message.get("call", {}).get("id", "")
+        if customer and call_id:
+            _track_active_call(call_id, customer["id"])
+
         if customer:
             over_cap, monthly_spend, cap = is_over_voice_cap(customer)
             if over_cap:
@@ -3930,6 +4676,10 @@ def vapi_webhook():
             model_block = {
                 "provider": "custom-llm",
                 "url": f"{CLOUD_PUBLIC_URL}/vapi-llm/{customer['id']}",
+                # Vapi forwards this header on its calls to the custom-LLM URL,
+                # which is what lets vapi_custom_llm() authenticate them rather
+                # than trusting the customer id in the path.
+                "headers": {"X-Vapi-Secret": VAPI_WEBHOOK_SECRET},
                 "model": PROVIDER_MODELS.get(customer.get("api_provider", "anthropic"), PROVIDER_MODELS["anthropic"]),
                 "systemPrompt": system,
             }
@@ -3964,6 +4714,11 @@ def vapi_webhook():
         call_info  = message.get("call", {})
         caller     = call_info.get("customer", {}).get("number", "")
         customer   = get_customer_by_phone(caller) if caller else None
+
+        # Stop the background enforcer from polling a call that's already
+        # over — whether it ended naturally or was ended by _voice_cap_enforcer
+        # itself, there's nothing left to poll.
+        _untrack_active_call(call_info.get("id", ""))
         if customer and transcript:
             save_message(customer["id"], "user", f"[Voice call transcript]: {transcript}")
 
@@ -4094,7 +4849,7 @@ def unlock_submit():
     Stores it in the in-memory session cache for SESSION_TTL_SECONDS.
     Rate limited to prevent brute-force unlock attempts.
     """
-    if not _check_rate(f"unlock:{request.remote_addr}", 5, 300):
+    if not _check_rate(f"unlock:{client_ip()}", 5, 300):
         return jsonify({"ok": False, "error": "Too many attempts — try again in a few minutes."}), 429
 
     data  = request.get_json(force=True)
@@ -4190,12 +4945,17 @@ def signup():
             name       = request.form.get("name", "").strip()
             email      = request.form.get("email", "").strip().lower()
             area_code  = request.form.get("area_code", "").strip()
+            mobile_raw = request.form.get("mobile_number", "").strip()
+            mobile     = _normalize_mobile(mobile_raw)
             if not name or not email:
                 error = "Name and email are required."
+            elif not mobile:
+                error = ("A mobile number is required — it's how your Curant knows it's you "
+                          "when you text or call, and how you log in here.")
             elif get_customer_by_email(email):
                 error = "An account with that email already exists."
             else:
-                cid = create_customer(name, email, area_code)
+                cid = create_customer(name, email, area_code, mobile)
                 session["signup_customer_id"] = cid
                 return redirect(url_for("signup_key_choice"))
 
@@ -4209,6 +4969,8 @@ def signup():
       <input type="text" name="name" placeholder="Jamie" required autofocus>
       <label>Email</label>
       <input type="email" name="email" placeholder="you@example.com" required>
+      <label>Your mobile number <span class="muted">(the phone you'll text and call from)</span></label>
+      <input type="tel" name="mobile_number" placeholder="+1 512 555 0142" required>
       <label>Preferred area code <span class="muted">(we'll match a local number)</span></label>
       <input type="text" name="area_code" placeholder="512" maxlength="3">
       <button class="btn" type="submit">Continue</button>
@@ -4616,10 +5378,28 @@ def signup_provision():
                     "UPDATE customers SET phone_number=?, phone_sid=?, active=1 WHERE id=?",
                     (pn, sid, cid),
                 )
-                conn.execute(
-                    "INSERT INTO phone_routing (phone_number, customer_id) VALUES (?, ?)",
-                    (pn, cid),
-                )
+                # BUG FIX (Aug 2026): this used to insert `pn` — the DID we
+                # just provisioned FOR the customer — but get_customer_by_phone()
+                # is called with the SENDER's number on inbound SMS and the
+                # CALLER's number on inbound voice. The two could never match,
+                # so every real inbound message was answered with "this number
+                # is not associated with an active Curant account". Routing on
+                # the customer's own verified mobile is also the safer of the
+                # two: keying on the dialled DID instead would mean anyone who
+                # discovered a customer's Curant number got treated as that
+                # customer, memories and connected tools included.
+                customer_row = get_customer(cid)
+                own_mobile = (customer_row or {}).get("mobile_number")
+                if own_mobile:
+                    conn.execute(
+                        "INSERT INTO phone_routing (phone_number, customer_id) VALUES (?, ?) "
+                        "ON CONFLICT(phone_number) DO UPDATE SET customer_id=excluded.customer_id, active=1",
+                        (own_mobile, cid),
+                    )
+                else:
+                    print(f"WARNING: customer {cid} provisioned with no mobile_number on file — "
+                          f"inbound SMS/voice will not route to them until one is added.",
+                          file=sys.stderr)
                 conn.commit()
 
             # Workspace utility email — best-effort, non-blocking. The phone
@@ -4691,28 +5471,101 @@ def signup_provision():
 
 @app.route("/cloud/login", methods=["GET", "POST"])
 def customer_login():
+    """
+    Two-step SMS login, replacing the previous email-only version (which
+    granted a full session to anyone who could type a customer's email
+    address — see the audit note above create_login_code).
+
+    Step 1 posts an email; if it matches an active account we text a code
+    to that account's own verified mobile. Step 2 posts the code.
+
+    Deliberate: step 1's response is IDENTICAL whether or not the account
+    exists. Saying "no account with that email" would turn this page into
+    a customer-enumeration oracle, which matters more now that knowing an
+    email is no longer sufficient to log in — it's the remaining half of
+    a credential pair, so it shouldn't be confirmable for free.
+    """
     error = None
+    stage = "email"
+
     if request.method == "POST":
+        stage = request.form.get("stage", "email")
+
         if not check_csrf():
-            error = "Session expired."
-        elif not _check_rate(f"login:{request.remote_addr}", 5, 300):
-            error = "Too many attempts — try again later."
-        else:
-            email = request.form.get("email", "").strip().lower()
-            cust  = get_customer_by_email(email)
-            if cust and cust["active"]:
-                session["customer_id"] = cust["id"]
-                return redirect(url_for("cloud_dashboard"))
-            error = "No active account with that email."
+            error, stage = "Session expired — start again.", "email"
+
+        elif stage == "email":
+            if not _check_rate(f"login:{client_ip()}", 5, 300):
+                error = "Too many attempts — try again later."
+            else:
+                email = request.form.get("email", "").strip().lower()
+                cust  = get_customer_by_email(email)
+                if cust and cust["active"]:
+                    code = create_login_code(cust["id"])
+                    ok, send_err = send_login_code(cust, code)
+                    if not ok:
+                        # A real delivery failure is worth surfacing — silently
+                        # showing the code box would leave the customer waiting
+                        # for a text that is never coming.
+                        error = send_err
+                    else:
+                        session["pending_login_customer_id"] = cust["id"]
+                        stage = "code"
+                else:
+                    # No such account (or inactive): show the same code box
+                    # anyway, with no code sent. Indistinguishable from success.
+                    session.pop("pending_login_customer_id", None)
+                    stage = "code"
+
+        elif stage == "code":
+            pending_cid = session.get("pending_login_customer_id")
+            if not _check_rate(f"logincode:{client_ip()}", 10, 300):
+                error, stage = "Too many attempts — try again later.", "email"
+            elif not pending_cid:
+                # Either the enumeration-safe no-account path above, or an
+                # expired session. Same generic message either way.
+                error = "Incorrect code."
+            else:
+                ok, verify_err = verify_login_code(pending_cid, request.form.get("code", ""))
+                if ok:
+                    cust = get_customer(pending_cid)
+                    if cust and cust["active"]:
+                        session.pop("pending_login_customer_id", None)
+                        # New session id on privilege change — stops a
+                        # pre-login fixated session cookie from becoming an
+                        # authenticated one.
+                        session["customer_id"] = cust["id"]
+                        return redirect(url_for("cloud_dashboard"))
+                    error, stage = "That account is no longer active.", "email"
+                else:
+                    error = verify_err
+
+    if stage == "code":
+        return render_template_string(BASE_STYLE + """
+        <h1>Check your phone</h1>
+        <p class="muted">If that email matches an active Curant account, we've texted a
+           6-digit code to the mobile number on file. It expires in 10 minutes.</p>
+        {% if error %}<p class="error">{{ error }}</p>{% endif %}
+        <form method="post">
+          {{ csrf }}
+          <input type="hidden" name="stage" value="code">
+          <label>6-digit code</label>
+          <input type="text" name="code" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                 autocomplete="one-time-code" required autofocus>
+          <button class="btn" type="submit">Log in</button>
+        </form>
+        <p class="muted" style="margin-top:16px"><a href="/cloud/login">Start again</a></p>
+        """, error=error, csrf=CSRF_FIELD.format(get_csrf()))
 
     return render_template_string(BASE_STYLE + """
     <h1>Log in to Curant</h1>
     {% if error %}<p class="error">{{ error }}</p>{% endif %}
     <form method="post">
       {{ csrf }}
+      <input type="hidden" name="stage" value="email">
       <label>Email</label>
       <input type="email" name="email" required autofocus>
-      <button class="btn" type="submit">Log in</button>
+      <button class="btn" type="submit">Send me a code</button>
     </form>
     <p class="muted" style="margin-top:16px">Don't have an account?
       <a href="/cloud/signup">Sign up →</a></p>
@@ -4812,6 +5665,18 @@ def mcp_oauth_callback():
         return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
 
     row = dict(row)
+    # ACCOUNT-LINKING CSRF FIX (Aug 2026 audit). The `state` lookup alone used
+    # to be treated as authentication, with no check that the browser
+    # completing this callback belongs to the customer who started the flow.
+    # That allowed: attacker starts a connect flow on their own account,
+    # obtains a valid state, induces the victim to authorize with it — and the
+    # VICTIM's tokens get stored against the ATTACKER's customer_id, handing
+    # the attacker persistent access to the victim's mailbox/repos through
+    # their own Curant. Binding to the session closes that.
+    if session.get("customer_id") != row["customer_id"]:
+        return ("This connection was started from a different account or session. "
+                "Log in and start the connection again from your dashboard."), 403
+
     redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/mcp/oauth/callback"
     try:
         resp = http.post(
@@ -4828,7 +5693,10 @@ def mcp_oauth_callback():
         resp.raise_for_status()
         tokens = resp.json()
     except Exception as e:
-        return f"Couldn't complete the connection: {e}", 502
+        # Logged in full, shown generically — provider error bodies can contain
+        # internal URLs, client identifiers, or fragments of the exchange.
+        print(f"OAuth token exchange failed: {e}", file=sys.stderr)
+        return "Couldn't complete the connection. Try again from your dashboard.", 502
 
     expires_at = time.time() + tokens.get("expires_in", 3600)
     with closing(get_db()) as conn:
@@ -4842,8 +5710,8 @@ def mcp_oauth_callback():
                  token_endpoint=excluded.token_endpoint, access_token=excluded.access_token,
                  refresh_token=excluded.refresh_token, expires_at=excluded.expires_at,
                  updated_at=CURRENT_TIMESTAMP""",
-            (row["customer_id"], row["server_name"], row["client_id"], row["client_secret"],
-             row["token_endpoint"], tokens["access_token"], tokens.get("refresh_token"), expires_at),
+            (row["customer_id"], row["server_name"], row["client_id"], _enc(row["client_secret"]),
+             row["token_endpoint"], _enc(tokens["access_token"]), _enc(tokens.get("refresh_token")), expires_at),
         )
         conn.execute(
             """INSERT INTO mcp_servers (customer_id, name, url, transport, auth_mode, enabled)
@@ -4854,6 +5722,229 @@ def mcp_oauth_callback():
         conn.commit()
 
     return redirect(url_for("cloud_dashboard"))
+
+
+# ── Microsoft Graph OAuth (Outlook + Teams) ─────────────────────────────────
+# Deliberately NOT built on the discover-and-register flow above — Microsoft
+# doesn't support RFC 7591 Dynamic Client Registration for this, so there's
+# no per-connection client to create. Instead this is one fixed, Curant-
+# owned Azure AD app (MS_GRAPH_CLIENT_ID/SECRET, registered once by hand in
+# Curant's own Azure tenant, multi-tenant + personal-account support
+# enabled), and every customer does a normal OAuth 2.0 authorization-code
+# + PKCE consent against Microsoft's own login page — same "one global app,
+# per-customer consent" shape as GitHub/Figma/Atlassian, and the whole
+# reason Option B (this) was chosen over Microsoft's own official Work IQ
+# Mail/Calendar and Teams Graph MCP servers, which need a customer M365
+# Copilot license plus their own IT admin registering a per-tenant Entra
+# app — real friction most individual customers can't clear. See the
+# graph_oauth_tokens/graph_oauth_pending table comments above for the
+# schema, and get_graph_tools() below for the tools this unlocks.
+#
+# HONEST LIMITATION: like the rest of this file's OAuth code, this has NOT
+# been exercised against a real Microsoft account in this environment — no
+# live Azure app exists here to test the authorization-code exchange
+# against. Confirm against a real customer's Microsoft 365 or personal
+# account before trusting this in production, same standard as everywhere
+# else in this file.
+MS_GRAPH_AUTHORITY = "https://login.microsoftonline.com/common/oauth2/v2.0"
+MS_GRAPH_SCOPES = (
+    "offline_access User.Read Mail.ReadWrite Calendars.ReadWrite "
+    "Chat.ReadWrite ChannelMessage.Read.All ChannelMessage.Send Team.ReadBasic.All "
+    "Channel.ReadBasic.All"
+)
+
+
+@app.route("/cloud/graph/connect")
+@require_customer
+def graph_oauth_start():
+    if not MS_GRAPH_CLIENT_ID:
+        return ("Outlook/Teams isn't configured on this server yet — "
+                "MS_GRAPH_CLIENT_ID/SECRET aren't set.", 503)
+    cid = session["customer_id"]
+
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM graph_oauth_pending WHERE created_at < datetime('now', '-30 minutes')")
+        conn.commit()
+
+    verifier, challenge = _mcp_oauth_pkce_pair()
+    state = secrets.token_urlsafe(32)
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO graph_oauth_pending (state, customer_id, code_verifier) VALUES (?, ?, ?)",
+            (state, cid, verifier),
+        )
+        conn.commit()
+
+    from urllib.parse import urlencode
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/graph/callback"
+    auth_params = {
+        "client_id": MS_GRAPH_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "response_mode": "query",
+        "scope": MS_GRAPH_SCOPES,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    return redirect(f"{MS_GRAPH_AUTHORITY}/authorize?{urlencode(auth_params)}")
+
+
+@app.route("/cloud/graph/callback")
+def graph_oauth_callback():
+    """No @require_customer here for the same reason as mcp_oauth_callback
+    above — this is Microsoft's redirect landing, not the customer
+    navigating directly; the state lookup is what authenticates it."""
+    code = request.args.get("code")
+    state = request.args.get("state")
+    error = request.args.get("error")
+
+    if error:
+        return f"Connection was not completed: {error}", 400
+    if not code or not state:
+        return "Missing code or state in callback.", 400
+
+    with closing(get_db()) as conn:
+        row = conn.execute("SELECT * FROM graph_oauth_pending WHERE state=?", (state,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM graph_oauth_pending WHERE state=?", (state,))
+            conn.commit()
+    if not row:
+        return "This connection attempt has expired or was already used — try connecting again from the dashboard.", 400
+
+    row = dict(row)
+    # ACCOUNT-LINKING CSRF FIX (Aug 2026 audit). The `state` lookup alone used
+    # to be treated as authentication, with no check that the browser
+    # completing this callback belongs to the customer who started the flow.
+    # That allowed: attacker starts a connect flow on their own account,
+    # obtains a valid state, induces the victim to authorize with it — and the
+    # VICTIM's tokens get stored against the ATTACKER's customer_id, handing
+    # the attacker persistent access to the victim's mailbox/repos through
+    # their own Curant. Binding to the session closes that.
+    if session.get("customer_id") != row["customer_id"]:
+        return ("This connection was started from a different account or session. "
+                "Log in and start the connection again from your dashboard."), 403
+
+    redirect_uri = f"{CLOUD_PUBLIC_URL}/cloud/graph/callback"
+    try:
+        resp = http.post(
+            f"{MS_GRAPH_AUTHORITY}/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": MS_GRAPH_CLIENT_ID,
+                "client_secret": MS_GRAPH_CLIENT_SECRET,
+                "code_verifier": row["code_verifier"],
+                "scope": MS_GRAPH_SCOPES,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as e:
+        # Logged in full, shown generically — provider error bodies can contain
+        # internal URLs, client identifiers, or fragments of the exchange.
+        print(f"OAuth token exchange failed: {e}", file=sys.stderr)
+        return "Couldn't complete the connection. Try again from your dashboard.", 502
+
+    expires_at = time.time() + tokens.get("expires_in", 3600)
+    with closing(get_db()) as conn:
+        conn.execute(
+            """INSERT INTO graph_oauth_tokens (customer_id, access_token, refresh_token, expires_at, scope)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(customer_id) DO UPDATE SET
+                 access_token=excluded.access_token, refresh_token=excluded.refresh_token,
+                 expires_at=excluded.expires_at, scope=excluded.scope, updated_at=CURRENT_TIMESTAMP""",
+            (row["customer_id"], _enc(tokens["access_token"]), _enc(tokens.get("refresh_token")),
+             expires_at, tokens.get("scope", "")),
+        )
+        conn.commit()
+
+    return redirect(url_for("cloud_dashboard"))
+
+
+@app.route("/cloud/graph/disconnect", methods=["POST"])
+@require_customer
+def graph_oauth_disconnect():
+    if not check_csrf():
+        return "Bad request.", 400
+    cid = session["customer_id"]
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM graph_oauth_tokens WHERE customer_id=?", (cid,))
+        conn.commit()
+    return redirect(url_for("cloud_dashboard"))
+
+
+def _get_graph_token(customer_id: str) -> str | None:
+    """Returns a valid Graph access token, refreshing via the stored
+    refresh token first if expired. Returns None if the customer has
+    never connected, or refresh itself fails (they'll need to reconnect
+    via the dashboard) — same pattern as _refresh_mcp_token_if_needed."""
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM graph_oauth_tokens WHERE customer_id=?", (customer_id,)
+        ).fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    row["access_token"] = _dec(row.get("access_token"))
+    row["refresh_token"] = _dec(row.get("refresh_token"))
+    if row.get("expires_at") and time.time() < row["expires_at"] - 60:
+        return row["access_token"]
+    if not row.get("refresh_token"):
+        return row.get("access_token")
+
+    try:
+        resp = http.post(
+            f"{MS_GRAPH_AUTHORITY}/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": row["refresh_token"],
+                "client_id": MS_GRAPH_CLIENT_ID,
+                "client_secret": MS_GRAPH_CLIENT_SECRET,
+                "scope": MS_GRAPH_SCOPES,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_access = data["access_token"]
+        new_refresh = data.get("refresh_token", row["refresh_token"])
+        new_expires_at = time.time() + data.get("expires_in", 3600)
+        with closing(get_db()) as conn:
+            conn.execute(
+                "UPDATE graph_oauth_tokens SET access_token=?, refresh_token=?, expires_at=? "
+                "WHERE customer_id=?",
+                (_enc(new_access), _enc(new_refresh), new_expires_at, customer_id),
+            )
+            conn.commit()
+        return new_access
+    except Exception as e:
+        print(f"Graph token refresh failed for {customer_id} (non-fatal): {e}", file=sys.stderr)
+        return row.get("access_token")
+
+
+def _graph_api(customer_id: str, method: str, path: str, json_body: dict | None = None) -> tuple[dict | None, str | None]:
+    """One call against https://graph.microsoft.com/v1.0{path}. Returns
+    (json_response_or_None, error_message_or_None) — never raises, so
+    every graph_* tool function below can just check which one came
+    back rather than wrapping every call in its own try/except."""
+    token = _get_graph_token(customer_id)
+    if not token:
+        return None, "Outlook/Teams isn't connected for this account yet — connect it from the Cloud dashboard first."
+    try:
+        resp = http.request(
+            method, f"https://graph.microsoft.com/v1.0{path}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=json_body, timeout=20,
+        )
+        if resp.status_code == 204:
+            return {}, None
+        resp.raise_for_status()
+        return (resp.json() if resp.content else {}), None
+    except Exception as e:
+        return None, f"Microsoft Graph request failed: {e}"
 
 
 @app.route("/cloud/mcp/disconnect/<server_name>", methods=["POST"])
@@ -5034,6 +6125,21 @@ def cloud_dashboard():
     </div>
     {% endfor %}
 
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0">
+      <div>
+        <strong>Outlook &amp; Teams</strong>
+        <div class="muted" style="font-size:.8rem">Mail, calendar, and Teams channels — via a direct Microsoft sign-in, no Microsoft 365 Copilot license needed.</div>
+      </div>
+      {% if graph_connected %}
+      <form method="post" action="/cloud/graph/disconnect" style="margin:0">
+        {{ csrf }}
+        <button type="submit" style="background:none;border:1px solid #ddd;border-radius:20px;padding:6px 14px;font-size:.8rem;cursor:pointer;color:#a33">Disconnect</button>
+      </form>
+      {% else %}
+      <a href="/cloud/graph/connect" style="background:#111;color:#fff;border-radius:20px;padding:6px 14px;font-size:.8rem;text-decoration:none">Connect</a>
+      {% endif %}
+    </div>
+
     {% if 'august' in unlocked_addons %}
     <h2>August's generation keys</h2>
     {% if not customer.workspace_email %}
@@ -5081,6 +6187,7 @@ def cloud_dashboard():
     unlocked_addons=get_unlocked_addons(customer),
     known_mcp_services=KNOWN_MCP_SERVICES,
     connected_mcp_server_names={s["name"] for s in get_mcp_servers_for_customer(cid, enabled_only=False)},
+    graph_connected=bool(_get_graph_token(cid)),
     plan_display_names={"cloud_base": "Base — $29/mo", "cloud_executive": "Executive — $149/mo"},
     csrf=CSRF_FIELD.format(get_csrf()))
 
@@ -5151,7 +6258,7 @@ def owner_login():
     if request.method == "POST":
         if not ADMIN_PASSWORD:
             error = "Owner login is disabled — CLOUD_ADMIN_PASSWORD not set."
-        elif not _check_rate(f"owner:{request.remote_addr}", 5, 300):
+        elif not _check_rate(f"owner:{client_ip()}", 5, 300):
             error = "Too many attempts."
         elif not check_csrf():
             error = "Session expired."
@@ -5292,4 +6399,14 @@ def health():
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5051))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
+    # The Werkzeug debugger is an interactive remote code execution console.
+    # Previously one env var away from being enabled on a 0.0.0.0 listener;
+    # now it additionally requires CURANT_DEV_MODE, so a stray FLASK_DEBUG in
+    # a production environment can't switch it on by itself.
+    debug_requested = os.environ.get("FLASK_DEBUG") == "1"
+    debug_enabled = debug_requested and CURANT_DEV_MODE
+    if debug_requested and not debug_enabled:
+        print("REFUSING to enable the Flask debugger: FLASK_DEBUG=1 was set but "
+              "CURANT_DEV_MODE=1 was not. The debugger is a remote code execution "
+              "console and must never be reachable in production.", file=sys.stderr)
+    app.run(host="0.0.0.0", port=port, debug=debug_enabled)
