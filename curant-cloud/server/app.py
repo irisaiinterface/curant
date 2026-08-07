@@ -55,6 +55,8 @@ Environment variables required:
                             default), missing secrets fail CLOSED.
 """
 
+from __future__ import annotations  # PEP 604 `X | Y` unions used throughout this file need this on Python < 3.10 (e.g. the Xcode Command Line Tools' bundled python3.9).
+
 import os
 import re
 import socket

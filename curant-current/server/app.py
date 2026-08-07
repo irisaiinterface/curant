@@ -67,6 +67,8 @@ dependency — this server never holds a secret worth encrypting or calls
 Claude on anyone's behalf.
 """
 
+from __future__ import annotations  # PEP 604 `X | Y` unions used throughout this file need this on Python < 3.10 (e.g. the Xcode Command Line Tools' bundled python3.9).
+
 import os
 import sqlite3
 import secrets
