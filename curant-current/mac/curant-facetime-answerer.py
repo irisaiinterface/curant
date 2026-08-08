@@ -138,7 +138,13 @@ CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
 TURN_RECORD_SECONDS = 5          # length of each caller-audio recording chunk
-MAX_CALL_TURNS = 60              # hard safety cap so a stuck call can't run forever
+RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state after a failed recording
+
+# NOTE: there is deliberately no MAX_CALL_TURNS anymore. Per explicit
+# direction, Curant must never be the one to end a call — only the human
+# can, by hanging up on their own end. handle_call()'s loop is unbounded
+# and exits only when _facetime_is_frontmost() reports the call has
+# already ended; see handle_call() for the full reasoning.
 
 # BlackHole device names set up per SETUP_FACETIME_CALLS.md.
 TTS_OUTPUT_DEVICE = "BlackHole 2ch"     # fed to FaceTime as its Microphone
@@ -910,7 +916,17 @@ def get_reply(text, apple_id):
 
 
 def hang_up():
-    """Best-effort. Unlike accept_call(), this targets FaceTime.app's own
+    """NOT CALLED FROM ANYWHERE IN THIS FILE ANYMORE, DELIBERATELY. Per
+    explicit direction, Curant must never be the one to end a call —
+    only the human can, by hanging up on their own end. handle_call()
+    used to call this both on a "bye"-style keyword match and when its
+    turn budget ran out; both of those were removed so nothing in this
+    script can ever trigger a hangup anymore. Kept here, unused, only in
+    case an explicit, human-initiated hangup control (e.g. a dashboard
+    button, a different kind of command) is added later — do not wire
+    this back into the automatic call-handling flow.
+
+    Best-effort. Unlike accept_call(), this targets FaceTime.app's own
     window via Accessibility — plausible this actually works, since once
     a call is answered, control genuinely transfers to a normal in-call
     FaceTime window (confirmed FaceTime.app becomes the active app then,
@@ -1046,12 +1062,51 @@ def handle_call(window_desc, apple_id, dry_run):
 
     speak("Hi, this is Curant. I'm listening.")
 
-    for turn in range(MAX_CALL_TURNS):
+    # CURANT NEVER ENDS THE CALL — only the human can, by hanging up on
+    # their own end. Per explicit direction. Two things changed to make
+    # that true, not just claimed:
+    #   1. No more keyword-triggered hangup. The old code broke out of
+    #      the loop (and then called hang_up()) the moment the caller's
+    #      transcribed speech contained "bye"/"goodbye"/"hang up"/"that's
+    #      all" — but a misheard or hallucinated word (see _wav_has_speech
+    #      and the silence-gate history above) could trigger that
+    #      wrongly, and even a correct transcript is still Curant
+    #      deciding to end a call a human didn't actually ask it to end.
+    #      Gone entirely — nothing the caller says can end the call now.
+    #   2. No more MAX_CALL_TURNS hangup. The old loop ran for a bounded
+    #      number of turns and then called hang_up() unconditionally when
+    #      it ran out — that's still Curant ending the call, just on a
+    #      timer instead of a keyword. Loop is unbounded now (while True)
+    #      — the ONLY way this function returns is detecting the human
+    #      has already ended the call themselves (see below), never by
+    #      actively hanging up itself. hang_up() (still defined above)
+    #      is intentionally never called from anywhere in this file
+    #      anymore — kept only in case a future, explicit, human-
+    #      initiated hangup control is added.
+    while True:
+        if not _facetime_is_frontmost():
+            # FaceTime dropping out of frontmost mid-call is the same
+            # signal accept_call() uses (in reverse) to confirm a call
+            # connected — here it means the call ended, and since we
+            # never click anything, it can only mean the human (either
+            # end) ended it. Nothing left to do; return without ever
+            # invoking hang_up().
+            print("  Call ended (FaceTime no longer in the foreground) — "
+                  "the user ended it, Curant did not.")
+            return
+
         try:
             wav_path = record_caller_audio(TURN_RECORD_SECONDS)
         except Exception as e:
-            print(f"  Recording failed: {e}", file=sys.stderr)
-            break
+            # Could be a genuinely broken recording setup, but could also
+            # just be the call having ended between the frontmost check
+            # above and now. Either way, Curant still doesn't hang up —
+            # re-check frontmost state and loop; if the call is really
+            # gone, the check at the top of the next iteration returns.
+            print(f"  Recording failed (will re-check whether the call is "
+                  f"still up): {e}", file=sys.stderr)
+            time.sleep(RECORDING_FAILURE_RETRY_SECONDS)  # avoid a tight busy-loop if this keeps failing
+            continue
         try:
             if not _wav_has_speech(wav_path):
                 continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
@@ -1070,11 +1125,6 @@ def handle_call(window_desc, apple_id, dry_run):
         if reply:
             print(f"  Curant says: {reply}")
             speak(reply)
-        if any(word in text.lower() for word in ("bye", "goodbye", "hang up", "that's all")):
-            break
-
-    print("  Ending call.")
-    print(f"  hang_up(): {hang_up()}")
 
 
 def main():
