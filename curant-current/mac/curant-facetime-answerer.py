@@ -915,6 +915,48 @@ def get_reply(text, apple_id):
     return data.get("reply") or ""
 
 
+def _call_is_still_connected():
+    """Read-only counterpart to hang_up() — checks whether FaceTime's
+    in-call Decline/End controls still exist, WITHOUT clicking anything.
+    This is what handle_call()'s loop uses to detect the human has ended
+    the call, deliberately NOT _facetime_is_frontmost().
+
+    Real bug found live: _facetime_is_frontmost() checks which app
+    currently has WINDOW FOCUS, not whether a call is connected — it was
+    built and validated for a different, narrower purpose (confirming a
+    click just answered a call, checked immediately after clicking, when
+    FaceTime SHOULD momentarily grab focus if it worked). Reusing it as
+    an ongoing "is the call still active" check throughout the whole
+    call was wrong: simply clicking into Terminal to read logs makes
+    FaceTime stop being frontmost with the call still perfectly
+    connected, which handle_call() was then misreading as "the call
+    ended" and silently going quiet — a real, reported bug ("it cuts
+    itself, right before talking"), not an actual FaceTime disconnect.
+
+    Checking for the presence of the actual in-call buttons instead
+    doesn't care about window focus at all — only whether the call
+    itself is still live."""
+    script = '''
+    tell application "System Events"
+        tell process "FaceTime"
+            repeat with w in windows
+                try
+                    if exists (button "Decline" of w) then
+                        return "connected"
+                    end if
+                    if exists (button "End" of w) then
+                        return "connected"
+                    end if
+                end try
+            end repeat
+        end tell
+    end tell
+    return "not_connected"
+    '''
+    r = _run_osascript(script)
+    return r.returncode == 0 and (r.stdout or "").strip() == "connected"
+
+
 def hang_up():
     """NOT CALLED FROM ANYWHERE IN THIS FILE ANYMORE, DELIBERATELY. Per
     explicit direction, Curant must never be the one to end a call —
@@ -1084,14 +1126,14 @@ def handle_call(window_desc, apple_id, dry_run):
     #      anymore — kept only in case a future, explicit, human-
     #      initiated hangup control is added.
     while True:
-        if not _facetime_is_frontmost():
-            # FaceTime dropping out of frontmost mid-call is the same
-            # signal accept_call() uses (in reverse) to confirm a call
-            # connected — here it means the call ended, and since we
-            # never click anything, it can only mean the human (either
-            # end) ended it. Nothing left to do; return without ever
-            # invoking hang_up().
-            print("  Call ended (FaceTime no longer in the foreground) — "
+        if not _call_is_still_connected():
+            # Deliberately _call_is_still_connected() here, NOT
+            # _facetime_is_frontmost() — see the former's docstring for
+            # the real bug that distinction fixes (window focus was
+            # being misread as "call ended"). This checks the actual
+            # in-call controls, not who has keyboard focus, so reading
+            # logs in Terminal mid-call no longer looks like a hangup.
+            print("  Call ended (FaceTime's in-call controls are gone) — "
                   "the user ended it, Curant did not.")
             return
 
