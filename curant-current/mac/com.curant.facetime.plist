@@ -7,7 +7,24 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <!-- Deliberately NOT /usr/bin/python3 (Apple's system Python).
+             macOS's Accessibility/Screen Recording grants (System
+             Settings → Privacy & Security) are tied to the exact
+             executable path that requests them, not to whichever
+             terminal/parent launched it. Confirmed live: running via
+             /usr/bin/python3 under launchd hit "Accessibility
+             privileges not enabled" and "could not create image from
+             display" even though the SAME script running under
+             Homebrew's python3 in a foreground Terminal worked fine —
+             because that's a genuinely different binary that had never
+             been granted anything. This path matches sys.executable
+             from a working foreground run (`python3 -c "import sys;
+             print(sys.executable)"`), reusing the grants already given
+             to it. If you reinstall/upgrade python@3.12 via Homebrew
+             and this path changes, re-run that command and update this
+             plist to match, and re-grant Accessibility/Screen Recording
+             to the new path if prompted. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
         <!-- -u: unbuffered stdout/stderr. Without it, Python fully
              block-buffers output when it isn't attached to a real
              terminal (which a launchd job never is) — the process runs
