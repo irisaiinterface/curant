@@ -1171,14 +1171,25 @@ def _config_api_key(cfg, provider):
     return (cfg.get("api_keys", {}) or {}).get(provider)
 
 
+GEMINI_CALL_MODEL = "gemini-3.5-flash-lite"
+# Live calls need a model with a generous free-tier daily quota, not the
+# highest-quality one — gemini-3.6-flash's free tier is capped at only
+# 20 requests/day (confirmed live: hit RESOURCE_EXHAUSTED after a single
+# test turn), while gemini-3.5-flash-lite's free tier allows far more
+# requests/day. A live caller generates one transcription request per
+# turn, so a multi-turn call burns through the 3.6-flash cap almost
+# immediately. Texts (curant-cli relay's "main" tier) stay on the
+# higher-quality gemini-3.6-flash since they aren't latency/quota
+# constrained the same way — see PROVIDER_MODELS in curant-cli.
+
+
 def _transcribe_gemini(wav_path, api_key):
     """Gemini's native audio understanding — no separate transcription
     service needed if you're already on Gemini for replies. Uses the
     same native google-genai SDK as curant-cli's Gemini tool-calling
     path (not the OpenAI-compat shim, which doesn't reliably support
-    audio input) and the same model curant-cli's PROVIDER_MODELS
-    already pins for Gemini, so behavior stays consistent with the
-    rest of Curant rather than picking a different model here."""
+    audio input). Deliberately pins a cheaper/higher-quota model than
+    curant-cli's "main" tier — see GEMINI_CALL_MODEL comment above."""
     from google import genai
     from google.genai import types as genai_types
 
@@ -1187,7 +1198,7 @@ def _transcribe_gemini(wav_path, api_key):
         audio_bytes = f.read()
 
     response = client.models.generate_content(
-        model="gemini-3.6-flash",
+        model=GEMINI_CALL_MODEL,
         contents=[
             "Transcribe this audio verbatim. Reply with ONLY the transcript "
             "text, nothing else — no commentary, no quotation marks. If "
