@@ -1134,7 +1134,14 @@ async def _mcp_call_tool_stdio_async(command, tool_name, arguments):
 async def _mcp_list_tools_http_async(url, headers, auth=None):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    async with streamable_http_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
+    # mcp>=2.0 dropped streamable_http_client's headers=/auth= kwargs in
+    # favor of an injected httpx2.AsyncClient — headers/auth (including
+    # our OAuthClientProvider, which is an httpx2.Auth) now configure
+    # that client directly instead. See CHANGELOG note in
+    # MODEL_VERSION_POLICY.md-adjacent commit for why this changed.
+    import httpx2
+    http_client = httpx2.AsyncClient(headers=headers or None, auth=auth)
+    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -1147,7 +1154,9 @@ async def _mcp_list_tools_http_async(url, headers, auth=None):
 async def _mcp_call_tool_http_async(url, headers, tool_name, arguments, auth=None):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    async with streamable_http_client(url, headers=headers or None, auth=auth) as (read, write, _get_session_id):
+    import httpx2
+    http_client = httpx2.AsyncClient(headers=headers or None, auth=auth)
+    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
@@ -5217,7 +5226,9 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
                     return [t.name for t in result.tools]
         else:
             from mcp.client.streamable_http import streamable_http_client
-            async with streamable_http_client(url, auth=auth) as (read, write, _get_session_id):
+            import httpx2
+            http_client = httpx2.AsyncClient(auth=auth)
+            async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.list_tools()

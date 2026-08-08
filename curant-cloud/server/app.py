@@ -2580,7 +2580,12 @@ def _refresh_mcp_token_if_needed(customer_id: str, server_name: str) -> str | No
 async def _mcp_list_tools_http_async(url, headers):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    async with streamable_http_client(url, headers=headers or None) as (read, write, _get_session_id):
+    # mcp>=2.0 dropped headers=/auth= kwargs on streamable_http_client in
+    # favor of an injected httpx2.AsyncClient — mirrors the same fix made
+    # in curant-cli's Home version.
+    import httpx2
+    http_client = httpx2.AsyncClient(headers=headers or None)
+    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -2591,7 +2596,9 @@ async def _mcp_list_tools_http_async(url, headers):
 async def _mcp_call_tool_http_async(url, headers, tool_name, arguments):
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    async with streamable_http_client(url, headers=headers or None) as (read, write, _get_session_id):
+    import httpx2
+    http_client = httpx2.AsyncClient(headers=headers or None)
+    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
