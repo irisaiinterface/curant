@@ -269,19 +269,49 @@ def _display_scale_factor(screenshot_width):
     """screencapture saves at actual pixel resolution (2x on Retina
     displays), but click coordinates (cliclick, CGEvent) are in logical
     'point' space — this converts between them. Cached after first call
-    since it won't change mid-run."""
+    since it won't change mid-run.
+
+    CHANGED after live testing: the original system_profiler text-parse
+    approach was a likely culprit for clicks landing in the wrong place
+    (found live — a template match reported as correct still didn't
+    dismiss the call banner, and the click was visibly off to the
+    side). system_profiler's "Resolution:" line isn't guaranteed to be
+    the MAIN display, or in the exact format expected, and there's no
+    guarantee screencapture's un-targeted default output matches
+    whichever line the regex happened to grab. Finder's own desktop
+    window bounds are a much more direct, main-display-specific source
+    of the logical point resolution."""
     global _display_scale_cache
     if _display_scale_cache is not None:
         return _display_scale_cache
+    logical_w = None
     try:
-        r = subprocess.run(["system_profiler", "SPDisplaysDataType"],
-                            capture_output=True, text=True, timeout=15)
-        import re
-        m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", r.stdout or "")
-        logical_w = int(m.group(1)) if m else screenshot_width
+        r = subprocess.run(
+            ["osascript", "-e", 'tell application "Finder" to get bounds of window of desktop'],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Output looks like: "0, 0, 1470, 956" (left, top, right, bottom) in POINTS
+        parts = [p.strip() for p in (r.stdout or "").split(",")]
+        if len(parts) == 4:
+            logical_w = int(parts[2]) - int(parts[0])
     except Exception:
-        logical_w = screenshot_width
+        logical_w = None
+
+    if not logical_w:
+        # Fallback to the old text-parse approach only if Finder's bounds
+        # couldn't be read at all.
+        try:
+            r = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                                capture_output=True, text=True, timeout=15)
+            import re
+            m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", r.stdout or "")
+            logical_w = int(m.group(1)) if m else screenshot_width
+        except Exception:
+            logical_w = screenshot_width
+
     _display_scale_cache = (screenshot_width / logical_w) if logical_w else 1.0
+    print(f"  [scale] screenshot width={screenshot_width}px, logical width={logical_w}pt, "
+          f"scale factor={_display_scale_cache:.3f}", file=sys.stderr)
     return _display_scale_cache
 
 
@@ -367,14 +397,113 @@ def _click_at(x_point, y_point):
     subprocess.run(["cliclick", f"c:{x_point},{y_point}"], check=True, timeout=10)
 
 
+CLICK_CACHE_PATH = os.path.expanduser("~/.curant/facetime_accept_click_cache.json")
+CLICK_VERIFY_WAIT_SECONDS = 1.5   # how long to wait after a click before checking if it worked
+MAX_ACCEPT_ATTEMPTS = 6           # hard cap so a persistently-wrong click can't loop forever
+
+
+def _load_click_cache():
+    try:
+        with open(CLICK_CACHE_PATH) as f:
+            data = json.load(f)
+        return tuple(data["xy"])
+    except Exception:
+        return None
+
+
+def _save_click_cache(xy):
+    try:
+        os.makedirs(os.path.dirname(CLICK_CACHE_PATH), exist_ok=True)
+        with open(CLICK_CACHE_PATH, "w") as f:
+            json.dump({"xy": list(xy)}, f)
+    except Exception as e:
+        print(f"  Could not save click cache (non-fatal): {e}", file=sys.stderr)
+
+
+def _call_still_ringing():
+    """Same signal poll_for_incoming_call() uses, called again after a
+    click to check whether it actually worked — if the banner and call
+    daemon are both gone, the click landed on something real."""
+    r = _run_osascript(
+        'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
+    )
+    if r.returncode != 0:
+        return False  # can't tell — assume it's gone rather than retry forever on an error
+    names = [n.strip() for n in (r.stdout or "").split(",")]
+    return "Notification Center" in names and _facetime_call_daemon_active()
+
+
+def _click_and_verify(x_point, y_point, attempt_label):
+    """Clicks, waits, then checks whether the call actually got answered
+    — not just whether cliclick exited 0. A "successful" click that
+    doesn't move the actual call state is exactly the failure mode found
+    in live testing (logged as accepted, banner never went away)."""
+    try:
+        _click_at(x_point, y_point)
+    except Exception as e:
+        print(f"  [{attempt_label}] click at ({x_point},{y_point}) failed to execute: {e}", file=sys.stderr)
+        return False
+    time.sleep(CLICK_VERIFY_WAIT_SECONDS)
+    still_ringing = _call_still_ringing()
+    print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — "
+          f"{'still ringing, click did not work' if still_ringing else 'banner gone, click worked'}",
+          file=sys.stderr)
+    return not still_ringing
+
+
+def _local_search_offsets(center, radii=(0, 15, 30, 50)):
+    """Small expanding-radius grid around a point, for when a click at
+    the 'right' coordinate still doesn't register — covers the
+    possibility that detection/scale math is slightly off rather than
+    completely wrong. Ordered nearest-first."""
+    cx, cy = center
+    seen = set()
+    for r in radii:
+        if r == 0:
+            offsets = [(0, 0)]
+        else:
+            offsets = [(r, 0), (-r, 0), (0, r), (0, -r), (r, r), (-r, -r), (r, -r), (-r, r)]
+        for dx, dy in offsets:
+            point = (cx + dx, cy + dy)
+            if point not in seen:
+                seen.add(point)
+                yield point
+
+
 def accept_call():
-    """Two-tier: try to visually locate and click the real accept button;
-    if that fails, fall back to a hardcoded coordinate you've found
-    yourself (see ACCEPT_BUTTON_FALLBACK_XY_ENV above). Both are
-    genuinely fragile compared to the rest of Curant — a banner in a
-    different position, a stacked second notification, screen
-    resolution/display changes, or a macOS visual update could all break
-    either one. Test with --dry-run's detection working reliably first."""
+    """
+    Verify-retry-and-remember: a click 'succeeding' (cliclick exiting 0,
+    or even landing on a template-matched coordinate) doesn't mean the
+    call actually got answered — confirmed live, where a logged
+    "Accepted" click left the banner on screen the whole time. So every
+    click here is followed by a real check (_call_still_ringing) before
+    it's trusted.
+
+    Order of attempts:
+      1. A previously-successful coordinate, if one is cached on disk
+         (fast path — skips screenshotting/matching entirely once this
+         Mac's actual working spot is known).
+      2. Fresh visual template matching, with a small expanding local
+         search around the detected point if the exact match doesn't
+         verify (covers slightly-off scale/detection math, not just
+         totally-wrong guesses).
+      3. The hardcoded ACCEPT_BUTTON_FALLBACK_XY_ENV coordinate, same
+         local-search treatment.
+
+    Whichever coordinate is first VERIFIED to work gets saved to
+    CLICK_CACHE_PATH — the next call tries that first before anything
+    else. If the cached spot ever stops working (banner style changes,
+    resolution changes), this naturally falls through to fresh
+    detection again and re-caches whatever works this time.
+    """
+    attempts = 0
+
+    cached = _load_click_cache()
+    if cached:
+        attempts += 1
+        if _click_and_verify(*cached, f"attempt {attempts}/cache"):
+            return True, f"clicked cached working coordinate {cached}"
+
     screenshot_path = _capture_screenshot()
     try:
         found = _find_accept_button_visually(screenshot_path)
@@ -382,26 +511,35 @@ def accept_call():
         os.remove(screenshot_path)
 
     if found:
-        try:
-            _click_at(*found)
-            return True, f"clicked visually-detected accept button at point {found}"
-        except Exception as e:
-            return False, f"found button at {found} but click failed: {e}"
+        for point in _local_search_offsets(found):
+            if attempts >= MAX_ACCEPT_ATTEMPTS:
+                break
+            attempts += 1
+            if _click_and_verify(*point, f"attempt {attempts}/visual"):
+                _save_click_cache(point)
+                return True, f"clicked visually-detected accept button (verified) at point {point}"
 
     fallback = os.environ.get(ACCEPT_BUTTON_FALLBACK_XY_ENV)
     if fallback:
         try:
             x_str, y_str = fallback.split(",")
-            _click_at(int(x_str), int(y_str))
-            return True, f"clicked hardcoded fallback coordinates ({fallback})"
-        except Exception as e:
-            return False, f"hardcoded fallback ({fallback}) invalid or click failed: {e}"
+            fallback_xy = (int(x_str), int(y_str))
+        except Exception:
+            return False, f"{ACCEPT_BUTTON_FALLBACK_XY_ENV} ({fallback}) is not valid 'x,y'"
+        for point in _local_search_offsets(fallback_xy):
+            if attempts >= MAX_ACCEPT_ATTEMPTS:
+                break
+            attempts += 1
+            if _click_and_verify(*point, f"attempt {attempts}/fallback"):
+                _save_click_cache(point)
+                return True, f"clicked hardcoded-fallback-derived coordinate (verified) at point {point}"
 
     return False, (
-        f"could not visually locate the accept button, and no "
-        f"{ACCEPT_BUTTON_FALLBACK_XY_ENV} fallback is set — hover your mouse over "
-        f"the real button during a live call and run `cliclick p` to get coordinates, "
-        f"then export {ACCEPT_BUTTON_FALLBACK_XY_ENV}=\"x,y\""
+        f"exhausted {attempts} click attempt(s) (cache, visual detection + local search, "
+        f"and{' ' if fallback else ' no '}{ACCEPT_BUTTON_FALLBACK_XY_ENV} fallback) — none "
+        f"verified as actually answering the call. If {ACCEPT_BUTTON_FALLBACK_XY_ENV} isn't "
+        f"set yet, hover your mouse over the real button during a live call and run "
+        f"`cliclick p` to get coordinates, then export {ACCEPT_BUTTON_FALLBACK_XY_ENV}=\"x,y\""
     )
 
 
