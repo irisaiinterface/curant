@@ -226,22 +226,23 @@ def poll_for_incoming_call(dry_run):
     corroborating ps check below (FTConversationService actively
     running) narrows this back down to calls specifically.
 
-    GUARD added after a real, confirmed-live bug: if a call is already
-    connected (FaceTime.app's own process exists — see
-    _call_is_still_connected()), never report a "new" incoming call no
-    matter what the banner/daemon signals say. Root cause found via a
-    user-submitted screen recording: after a real successful accept, the
-    NotificationCenter window and FTConversationService daemon can both
-    stay lingering/stale for a few seconds into the already-connected
-    call, which previously caused this function to report a phantom
-    SECOND "incoming call" — leading handle_call() to call accept_call()
-    again and click the (by then relocated) accept coordinate a second
-    time, landing on the in-call toolbar's End Call button instead and
-    hanging up a call that had already connected successfully. Checking
-    connection state FIRST closes that hole even if the click-
-    verification race in _click_and_verify() is ever imperfect again."""
-    if _call_is_still_connected():
-        return None  # already connected — don't treat stale banner/daemon state as a new call
+    REVERTED: this briefly had a guard here that skipped detection
+    entirely whenever _call_is_still_connected() (FaceTime.app process
+    existence) reported "connected," meant to stop a stale banner from
+    being mistaken for a second incoming call. Live testing (no call
+    placed at all) found that guard was actually unsafe to keep: this
+    Mac's FaceTime.app can sit open in the background for unrelated
+    reasons (confirmed via `ps aux` — it had been running for over two
+    hours with no call in progress), and FTConversationService can also
+    stay resident well beyond any single call. "FaceTime process
+    exists" is NOT a reliable signal that a call is connected — it also
+    made this function permanently return None (never detect a real
+    incoming call) for as long as FaceTime.app happened to be open, and
+    spammed the log every 2 seconds with _call_is_still_connected()'s
+    diagnostic print. The actual phantom-second-click bug this was
+    meant to guard against is fixed at its real source instead — see
+    _click_and_verify()'s docstring — so this extra guard was removed
+    rather than papered over with a better process check."""
     r = _run_osascript(
         'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
     )
