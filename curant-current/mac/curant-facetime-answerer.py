@@ -682,16 +682,51 @@ def set_system_input_device(device_name):
         return False
 
 
-def speak(text):
+_SOX_AVAILABLE = None  # cached shutil.which("sox") result
+
+
+def _sox_available():
+    global _SOX_AVAILABLE
+    if _SOX_AVAILABLE is None:
+        import shutil
+        _SOX_AVAILABLE = shutil.which("sox") is not None
+    return _SOX_AVAILABLE
+
+
+def speak(text, device_name=None):
     """Same free, local 'standard' tier as curant-watcher.py's
-    _tts_macos_say — generates speech and plays it, which (per the
-    SETUP_FACETIME_CALLS.md routing) goes out through BlackHole 2ch into
-    FaceTime's selected Microphone."""
+    _tts_macos_say — generates speech and plays it into BlackHole 2ch so
+    FaceTime picks it up as the caller-facing "microphone" (see
+    set_system_input_device's docstring for why that loopback works).
+
+    Uses SoX (`sox file -t coreaudio "<device>"`) to target that device
+    DIRECTLY, deliberately NOT via the system default output. Real bug
+    found live: switching the SYSTEM default output mid-call (even after
+    the call is already answered) reliably cut the call -- the same
+    class of problem input hot-swapping caused, just for output. SoX's
+    explicit device targeting means playback never touches the system
+    default at all, so there is nothing left to hot-swap once the call
+    is live -- output can now stay fixed at CALLER_AUDIO_DEVICE for the
+    ENTIRE session (set once at startup, see main()) with zero further
+    switching, for either direction, ever.
+
+    Falls back to the old afplay+system-output approach ONLY if SoX
+    isn't installed, with a loud warning -- that path is known to risk
+    dropping the call and is a stopgap, not a fix, if you land here."""
     fd, aiff_path = tempfile.mkstemp(suffix=".aiff")
     os.close(fd)
     try:
         subprocess.run(["say", "-o", aiff_path, text], check=True, timeout=30)
-        subprocess.run(["afplay", aiff_path], check=True, timeout=60)
+        target_device = device_name or TTS_OUTPUT_DEVICE
+        if _sox_available():
+            subprocess.run(["sox", aiff_path, "-t", "coreaudio", target_device],
+                            check=True, timeout=60)
+        else:
+            print("  sox not found (brew install sox) — falling back to afplay via "
+                  "system default output, which can drop a live call if the system "
+                  "default isn't already this device. Install sox to fix properly.",
+                  file=sys.stderr)
+            subprocess.run(["afplay", aiff_path], check=True, timeout=60)
     finally:
         if os.path.exists(aiff_path):
             os.remove(aiff_path)
@@ -984,41 +1019,24 @@ def handle_call(window_desc, apple_id, dry_run):
         print("  [dry-run] would click Accept now. Stopping here.")
         return
 
-    # FaceTime AUDIO calls (confirmed live: this feature targets audio
-    # calls, not video — see set_system_output_device's docstring for
-    # why) have no per-call device picker at all, so BOTH directions are
-    # driven by SYSTEM default input/output. CRITICAL ORDERING, found
-    # live: this MUST happen BEFORE accept_call(), not after. Setting it
-    # after caused every single call to drop at almost exactly 4 seconds
-    # in, every time -- a suspiciously fixed, repeatable duration that
-    # points at FaceTime's own audio-session negotiation, not a script
-    # bug: FaceTime very likely locks in its input device at the moment
-    # the call connects, and hot-swapping the system default input out
-    # from under it a moment later (while the call is already live)
-    # looks to FaceTime like the microphone disappeared, so it tears the
-    # call down after a short grace period. Setting the devices BEFORE
-    # accepting means FaceTime negotiates the call with BlackHole
-    # already in place, with nothing to hot-swap once it's live.
-    #   - input is set ONCE, for the whole call, to TTS_OUTPUT_DEVICE —
-    #     that's what lets FaceTime treat Curant's speech as "the mic".
-    #   - output flips per-turn, AFTER acceptance: TTS_OUTPUT_DEVICE
-    #     while Curant is talking (so afplay's audio loops into what
-    #     FaceTime treats as the mic), CALLER_AUDIO_DEVICE while
-    #     listening (so FaceTime's own call audio -- the caller's voice
-    #     -- plays into a device this script can actually record from,
-    #     instead of your speakers). Output toggling AFTER connection
-    #     hasn't shown the same drop behavior as the input hot-swap did,
-    #     but keep an eye on it if calls start dropping mid-conversation
-    #     instead of at the 4-second mark specifically.
-    if not set_system_input_device(TTS_OUTPUT_DEVICE):
-        print("  Continuing anyway, but the caller likely won't hear Curant "
-              "at all until system input is fixed — see SETUP_FACETIME_CALLS.md.",
-              file=sys.stderr)
-
-    if not set_system_output_device(TTS_OUTPUT_DEVICE):
-        print("  Continuing anyway, but TTS likely won't reach the caller "
-              "until system output is fixed — see SETUP_FACETIME_CALLS.md.",
-              file=sys.stderr)
+    # System input/output are set ONCE at startup, in main(), and never
+    # touched again for the rest of this process's life — NOT per-call,
+    # NOT per-turn. Two real bugs found live got us here, in order:
+    #   1. Switching input AFTER accept_call() dropped every call at a
+    #      fixed ~4 seconds in (FaceTime locks its mic in at connect
+    #      time; changing it after looks like the mic vanished).
+    #   2. Even after fixing #1 (input set before accept), switching
+    #      OUTPUT per-turn (to CALLER_AUDIO_DEVICE for listening, back
+    #      to TTS_OUTPUT_DEVICE for speaking) ALSO dropped the call —
+    #      same class of problem, just for the other direction and
+    #      later in the flow.
+    # Fix: output now stays fixed at CALLER_AUDIO_DEVICE (BlackHole
+    # 16ch) for the ENTIRE time this script runs, same as input at
+    # TTS_OUTPUT_DEVICE (BlackHole 2ch) — see main(). Nothing left to
+    # hot-swap mid-call, in either direction. speak() plays Curant's own
+    # voice into BlackHole 2ch directly via SoX (device-targeted,
+    # bypassing the system default entirely) instead of relying on
+    # system output ever pointing there — see speak()'s docstring.
 
     ok, detail = accept_call()
     if not ok:
@@ -1029,7 +1047,6 @@ def handle_call(window_desc, apple_id, dry_run):
     speak("Hi, this is Curant. I'm listening.")
 
     for turn in range(MAX_CALL_TURNS):
-        set_system_output_device(CALLER_AUDIO_DEVICE)
         try:
             wav_path = record_caller_audio(TURN_RECORD_SECONDS)
         except Exception as e:
@@ -1052,7 +1069,6 @@ def handle_call(window_desc, apple_id, dry_run):
             reply = "Sorry, I ran into a problem there — could you say that again?"
         if reply:
             print(f"  Curant says: {reply}")
-            set_system_output_device(TTS_OUTPUT_DEVICE)
             speak(reply)
         if any(word in text.lower() for word in ("bye", "goodbye", "hang up", "that's all")):
             break
@@ -1090,35 +1106,46 @@ def main():
         _preflight_check_apis(cfg)
 
         # Set BlackHole as the SYSTEM default input/output BEFORE the poll
-        # loop even starts, not per-call. Reasoning, from a live test: even
-        # with handle_call() switching devices before accept_call() (fixed
-        # the 4-second-drop bug), the caller still heard nothing at all --
-        # despite `SwitchAudioSource -c` confirming the devices WERE
-        # correctly set to BlackHole by the time the call was answered.
-        # That points at FaceTime negotiating a call's audio session
-        # earlier than "Accept" is clicked -- most likely the moment it
-        # starts ringing, before this script's poll loop even detects and
-        # reacts to it. Setting the defaults here, once, at startup, closes
-        # that whole timing window: by the time ANY call comes in -- from
-        # its very first ring -- BlackHole is already the system default,
-        # nothing to race against.
+        # loop even starts, and NEVER touch either again for the rest of
+        # this process's life — not per-call, not per-turn. Two real bugs
+        # found live, in order, got us here:
+        #   1. Switching devices per-call, even before accept_call(),
+        #      wasn't early enough — the caller heard nothing, despite
+        #      `SwitchAudioSource -c` confirming correct devices by
+        #      accept time. FaceTime most likely negotiates its audio
+        #      session the moment a call starts RINGING, before this
+        #      script's poll loop even reacts. Moving the switch to
+        #      startup closes that timing window entirely.
+        #   2. Per-turn OUTPUT switching (input was already fixed, but
+        #      output still flipped between TTS_OUTPUT_DEVICE and
+        #      CALLER_AUDIO_DEVICE each turn) dropped every call anyway —
+        #      turns out hot-swapping output mid-call is just as
+        #      disruptive to FaceTime as hot-swapping input was. So
+        #      output is now ALSO fixed here, permanently, at
+        #      CALLER_AUDIO_DEVICE (not TTS_OUTPUT_DEVICE) — Curant's own
+        #      speech instead goes directly to TTS_OUTPUT_DEVICE via SoX
+        #      in speak(), bypassing the system default output so it
+        #      never needs to change.
         #
         # REAL TRADEOFF, not hidden: while this script is running, this
-        # Mac's system microphone input is BlackHole 2ch, i.e. effectively
-        # silent/dead for anything else that wants the real mic (Zoom,
-        # Voice Memos, etc.) until you stop the script. Acceptable for a
+        # Mac's system microphone input is BlackHole 2ch and its output
+        # is BlackHole 16ch — both silent/dead as far as anything else on
+        # this Mac (Zoom, Voice Memos, actually hearing your own speakers)
+        # is concerned, until you stop the script. Acceptable for a
         # dedicated always-on answering Mac; worth knowing if this Mac is
-        # also used for other calls.
-        print("  Setting system audio devices to BlackHole at startup "
-              "(input+output stay on BlackHole the whole time this runs — "
-              "see comment above main()'s poll loop).")
+        # also used for other calls or everyday audio.
+        print("  Setting system audio devices at startup — input: "
+              f"{TTS_OUTPUT_DEVICE}, output: {CALLER_AUDIO_DEVICE}. Both stay "
+              "fixed for as long as this process runs (see comment above).")
         if not set_system_input_device(TTS_OUTPUT_DEVICE):
             print("  System input device switch failed at startup — calls "
                   "will likely answer but the caller won't hear anything "
                   "until this is fixed. See SETUP_FACETIME_CALLS.md.",
                   file=sys.stderr)
-        if not set_system_output_device(TTS_OUTPUT_DEVICE):
-            print("  System output device switch failed at startup.",
+        if not set_system_output_device(CALLER_AUDIO_DEVICE):
+            print("  System output device switch failed at startup — "
+                  "recording the caller's voice likely won't work until "
+                  "this is fixed. See SETUP_FACETIME_CALLS.md.",
                   file=sys.stderr)
 
     while True:

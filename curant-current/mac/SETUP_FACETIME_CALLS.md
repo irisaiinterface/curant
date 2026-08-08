@@ -16,12 +16,13 @@ Do steps 1–3 in order once. Step 4 is per-call.
 ## 1. Install everything
 
 ```bash
-brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg cliclick
+brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg cliclick sox
 pip3 install pillow numpy google-genai requests --break-system-packages
 ```
 
-- **BlackHole 2ch / 16ch** — two separate virtual audio devices, kept separate so your outgoing synthesized voice and the caller's incoming voice never mix: 2ch carries Curant's speech *to* FaceTime (set as FaceTime's Microphone), 16ch carries the caller's voice *out of* FaceTime for transcription (set as FaceTime's Speaker/Output).
-- **switchaudio-osx** — lets the script flip your system's default output device programmatically.
+- **BlackHole 2ch / 16ch** — two separate virtual audio devices, kept separate so your outgoing synthesized voice and the caller's incoming voice never mix: 2ch carries Curant's speech *to* FaceTime (its system-default microphone the whole time the script runs), 16ch carries the caller's voice *out of* FaceTime (its system-default output the whole time) for transcription.
+- **switchaudio-osx** — sets the system default input/output devices ONCE at startup (see step 5) — deliberately not per-call or per-turn anymore; hot-swapping either mid-call was confirmed live to drop the call.
+- **sox** — plays Curant's synthesized speech directly into BlackHole 2ch (`sox file -t coreaudio "BlackHole 2ch"`), bypassing the system default output entirely. This is what makes it safe to leave the system output fixed at BlackHole 16ch for the whole call instead of switching it — confirmed live, switching output mid-call dropped calls the same way switching input did.
 - **cliclick** — synthesizes the actual mouse click on the detected Accept button.
 - **pillow** (PIL) — screenshot loading/cropping.
 - **numpy** — real template matching against `assets/facetime_accept_button.png` (a genuine screenshot crop of the actual button, not a mockup) to find the Accept button's exact position, rather than guessing at a color range. Verified: a true match scores ~74 (normalized SSD) vs. ~6600 for no match at all.
@@ -92,11 +93,16 @@ The script tries to find the Accept button visually on its own — but since thi
 
 This feature targets **FaceTime Audio calls**, not Video calls. Confirmed against Apple's own FaceTime User Guide and live testing: an audio-only call's menu bar shows an "Audio" menu with only Mic Mode (Voice Isolation/Wide Spectrum) — there's no per-call camera/microphone/output device picker the way FaceTime Video's **Video menu** has. So there's no manual per-call selection to make here at all; FaceTime Audio just uses whatever your Mac's SYSTEM default input/output devices are, the same fallback behavior Apple documents for when no explicit device is chosen.
 
-The script drives that automatically now — no manual step needed each call:
-- Once a call is accepted, it sets your **system default input** to `BlackHole 2ch` for the whole call — this is what makes FaceTime treat Curant's synthesized speech as if it were your real microphone (BlackHole loops whatever's played to its output side back out as its input side).
-- It flips your **system default output** back and forth per conversational turn: `BlackHole 2ch` while Curant is speaking (so `afplay` feeds the "microphone" loop above), `BlackHole 16ch` while listening (so FaceTime's own call audio — the caller's voice — plays into a device the script can record from, instead of your speakers).
+The script drives that automatically now — no manual step needed each call, and no per-call or per-turn switching either (both were tried and both dropped live calls — see below):
 
-You won't hear either side of the call through your normal speakers while this is running — that's expected, both directions are being routed through BlackHole. If you place a FaceTime **Video** call instead, detection/accept should still work (the banner looks the same either way), but this automatic routing has NOT been verified for video calls — they may still need the old manual **Video menu → Microphone/Speaker** approach instead, since a video call's Video menu could override the system defaults this script is setting.
+- At **startup** (before it even starts polling for calls, not per-call), it fixes your **system default input** to `BlackHole 2ch` and your **system default output** to `BlackHole 16ch` — and leaves both alone for as long as the process runs.
+  - Input stuck on `BlackHole 2ch` the whole time is what lets FaceTime treat Curant's synthesized speech as if it were your real microphone.
+  - Output stuck on `BlackHole 16ch` the whole time is what lets FaceTime's own call audio (the caller's voice) always be available for the script to record, with nothing to switch.
+- Curant's own speech instead goes directly into `BlackHole 2ch` via **SoX** (`sox file -t coreaudio "BlackHole 2ch"`), targeting that device explicitly rather than relying on the system default output — that's what makes it safe to leave output fixed at `BlackHole 16ch` instead of switching it during playback.
+
+This landed here after two real, live-confirmed failure modes: switching input *after* `Accept` (instead of before) dropped every call at a fixed ~4 seconds in — FaceTime appears to lock its microphone in at connect time, and changing it afterward looks like the mic disappeared. Fixing that but still switching *output* per-turn dropped calls too, just later. Fixing both devices permanently at startup, with SoX bypassing the need to ever touch output at all, was the combination that actually held.
+
+You won't hear either side of the call through your normal speakers while this is running, and neither will any other app that wants your real microphone (Zoom, Voice Memos, etc.) — that's expected the whole time the script is running, not just during a call. If you place a FaceTime **Video** call instead, detection/accept should still work (the banner looks the same either way), but this routing has NOT been verified for video calls — they may still need the old manual **Video menu → Microphone/Speaker** approach instead, since a video call's Video menu could override the system defaults this script sets.
 
 ---
 
