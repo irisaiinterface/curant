@@ -2585,7 +2585,7 @@ async def _mcp_list_tools_http_async(url, headers):
     # in curant-cli's Home version.
     import httpx2
     http_client = httpx2.AsyncClient(headers=headers or None)
-    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
+    async with streamable_http_client(url, http_client=http_client) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.list_tools()
@@ -2598,7 +2598,7 @@ async def _mcp_call_tool_http_async(url, headers, tool_name, arguments):
     from mcp.client.streamable_http import streamable_http_client
     import httpx2
     http_client = httpx2.AsyncClient(headers=headers or None)
-    async with streamable_http_client(url, http_client=http_client) as (read, write, _get_session_id):
+    async with streamable_http_client(url, http_client=http_client) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(tool_name, arguments)
