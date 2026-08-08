@@ -5198,7 +5198,11 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
             raise RuntimeError(f"Authorization failed: {result_holder['error']}")
         if not result_holder["code"]:
             raise RuntimeError("Timed out waiting for the browser login to complete.")
-        return result_holder["code"], result_holder["state"]
+        # mcp>=2.0 expects an AuthorizationCodeResult object here, not a
+        # plain (code, state) tuple — found live testing GitHub's OAuth
+        # flow ("AttributeError: 'tuple' object has no attribute 'state'").
+        from mcp.shared.auth import AuthorizationCodeResult
+        return AuthorizationCodeResult(code=result_holder["code"], state=result_holder["state"])
 
     async def run_flow():
         from mcp import ClientSession
