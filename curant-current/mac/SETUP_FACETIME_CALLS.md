@@ -17,7 +17,7 @@ Do steps 1–3 in order once. Step 4 is per-call.
 
 ```bash
 brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg cliclick
-pip3 install pillow numpy --break-system-packages
+pip3 install pillow numpy google-genai requests --break-system-packages
 ```
 
 - **BlackHole 2ch / 16ch** — two separate virtual audio devices, kept separate so your outgoing synthesized voice and the caller's incoming voice never mix: 2ch carries Curant's speech *to* FaceTime (set as FaceTime's Microphone), 16ch carries the caller's voice *out of* FaceTime for transcription (set as FaceTime's Speaker/Output).
@@ -25,6 +25,8 @@ pip3 install pillow numpy --break-system-packages
 - **cliclick** — synthesizes the actual mouse click on the detected Accept button.
 - **pillow** (PIL) — screenshot loading/cropping.
 - **numpy** — real template matching against `assets/facetime_accept_button.png` (a genuine screenshot crop of the actual button, not a mockup) to find the Accept button's exact position, rather than guessing at a color range. Verified: a true match scores ~74 (normalized SSD) vs. ~6600 for no match at all.
+- **google-genai** — Gemini's native audio SDK, used to both transcribe the caller (step 6) and, separately, generate replies if your configured provider is Gemini. Skip only if you're using OpenAI Whisper for transcription AND Anthropic/OpenAI for replies.
+- **requests** — used for the OpenAI Whisper transcription fallback.
 
 After installing, **restart your Mac** (or at least log out/in) — BlackHole devices sometimes don't appear in Sound settings until CoreAudio restarts.
 
@@ -99,21 +101,33 @@ The script automates one piece of this automatically: it sets your **system defa
 
 ---
 
-## 6. Confirm the transcription dependency
+## 6. Confirm the transcription AND reply-generation keys — these are two separate things
 
-Call transcription tries Gemini first (native audio understanding — no separate service needed if that's already your provider), and falls back to OpenAI's Whisper only if no Gemini key is configured:
+Getting a call to actually hear, understand, and speak needs THREE pieces working together, and it's easy to wire up only one or two of them without noticing until mid-call:
+
+1. **Hear** (transcribe the caller) — tries Gemini's native audio understanding first, falls back to OpenAI's Whisper only if no Gemini key is configured. Set with:
+   ```bash
+   curant-cli set-api-key <key> --provider gemini
+   ```
+   or, for Whisper instead:
+   ```bash
+   curant-cli set-api-key sk-... --provider openai
+   ```
+2. **Understand/reply** (generate what to say back) — routes through `curant-cli relay`, which uses whichever provider is currently configured (`curant-cli set-provider ...`, defaults to Anthropic if you've never set one) — **not necessarily the same provider as step 1's transcription key.** If you set only a Gemini key for transcription but the configured provider is still Anthropic with no Anthropic key stored, the call will answer and transcribe correctly, then fail on every reply. To use Gemini for both:
+   ```bash
+   curant-cli set-provider gemini
+   ```
+   (Same key from step 1 above covers both, once the provider is switched — no need to set it twice.) If instead you want to keep Anthropic (or OpenAI) for replies and only use Gemini/Whisper for transcription, that's fine too — just make sure whichever provider `curant-cli set-provider` currently points to also has its own key set.
+3. **Speak** — local `say`/`afplay`, no API key or account needed.
+
+The script checks all of this itself now: on startup (not dry-run), it runs a preflight check and refuses to start with a clear error naming exactly which piece (hear or understand) is missing a key, rather than failing silently mid-call. Confirm what it sees before going live:
 
 ```bash
-curant-cli set-api-key <key> --provider gemini
+python3 curant-facetime-answerer.py --apple-id "your.customer@icloud.com"
+# expect: "API preflight check passed — hear: ..., understand/reply: ..., speak: local (say/afplay, no API key)."
 ```
 
-If you're on Anthropic and don't want a Gemini account, use Whisper instead:
-
-```bash
-curant-cli set-api-key sk-... --provider openai
-```
-
-Either way, this is a real, ongoing cost per call minute on top of whatever your reply-generation provider costs.
+Either way, ongoing API usage during calls is a real, ongoing cost per call minute (transcription) plus whatever your reply-generation provider charges per message.
 
 ---
 

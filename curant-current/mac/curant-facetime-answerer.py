@@ -808,6 +808,68 @@ def hang_up():
     return (r.stdout or "").strip()
 
 
+def _preflight_check_apis(cfg):
+    """Fails fast at startup, before the poll loop ever begins, rather
+    than mid-call. Checks two INDEPENDENT things that are easy to
+    silently mismatch:
+
+      1. HEAR/transcribe — transcribe() only needs a Gemini or OpenAI
+         key present in api_keys, checked directly, regardless of
+         which provider is configured for replies.
+      2. UNDERSTAND/reply — get_reply() shells out to `curant-cli
+         relay`, which uses config["provider"] (defaults to
+         "anthropic" if unset — see curant-cli's DEFAULT_PROVIDER) to
+         pick the model, and needs THAT provider's key specifically.
+
+    These can drift apart in a confusing way: running only
+    `curant-cli set-api-key <key> --provider gemini` sets up
+    transcription fine, but does nothing to the configured provider —
+    if it's still defaulted to "anthropic" (or whatever it was before)
+    and no Anthropic key is set, calls would answer, transcribe the
+    caller correctly, and then fail on every single reply. Catching
+    that here means the failure is one clear line at startup instead
+    of a mystery mid-call.
+
+    SPEAK is real-local `say`/`afplay` (see speak()) — no API key
+    involved, so nothing to check for it here."""
+    problems = []
+
+    gemini_key = _config_api_key(cfg, "gemini") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    openai_key = _config_api_key(cfg, "openai") or os.environ.get("OPENAI_API_KEY")
+    if gemini_key:
+        transcription_via = "Gemini (native audio)"
+    elif openai_key:
+        transcription_via = "OpenAI Whisper"
+    else:
+        transcription_via = None
+        problems.append(
+            "HEAR is not wired up: no Gemini or OpenAI key found for transcription. Run "
+            "`curant-cli set-api-key <key> --provider gemini` (or --provider openai)."
+        )
+
+    reply_provider = (cfg.get("provider") or "anthropic").strip().lower()
+    reply_key = _config_api_key(cfg, reply_provider)
+    if reply_provider == "anthropic" and not reply_key:
+        reply_key = cfg.get("anthropic_api_key")  # legacy field, matches curant-cli's own fallback
+    if not reply_key:
+        problems.append(
+            f"UNDERSTAND/reply is not wired up: curant-cli is configured to use "
+            f"'{reply_provider}' for replies (config[\"provider\"], default 'anthropic' if "
+            f"never set), but no API key is stored for '{reply_provider}'. Either run "
+            f"`curant-cli set-api-key <key> --provider {reply_provider}`, or switch providers "
+            f"with `curant-cli set-provider gemini` to match your transcription key."
+        )
+
+    if problems:
+        print("API preflight check FAILED — refusing to start:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"API preflight check passed — hear: {transcription_via}, "
+          f"understand/reply: {reply_provider}, speak: local (say/afplay, no API key).")
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────
@@ -890,6 +952,9 @@ def main():
     print(f"  mode: {'DRY RUN (no answering, no speaking)' if args.dry_run else 'LIVE'}")
     print(f"  apple_id for replies: {apple_id}")
     print(f"  access mode: {_read_access_mode(cfg)}")
+
+    if not args.dry_run:
+        _preflight_check_apis(cfg)
 
     while True:
         try:
