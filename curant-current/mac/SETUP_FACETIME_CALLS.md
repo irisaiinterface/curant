@@ -1,100 +1,140 @@
 # Setting up FaceTime auto-answer calls (EXPERIMENTAL)
 
-This feature is fundamentally different from everything else in Curant. Text-in/text-back (`curant-watcher.py`) is built on documented, verifiable APIs — a readable SQLite database and AppleScript's Messages support. FaceTime has neither: no API, no AppleScript dictionary, and no audio-routing hooks. Everything below is either UI automation (can silently break on a macOS update) or manual system configuration only you can do on your actual Mac. Budget time to iterate — this is not a five-minute setup.
+This feature is fundamentally different from everything else in Curant. Text-in/text-back (`curant-watcher.py`) is built on documented, verifiable APIs — a readable SQLite database and AppleScript's Messages support. FaceTime has none of that. Live testing on the real Mac this was built for found:
 
-Do these steps in order. Steps 1–3 are one-time. Step 4 is per-call (until you confirm FaceTime remembers your choice).
+- FaceTime.app never actually runs for an incoming call — it's handled by background daemons plus a system call banner.
+- That banner IS reliably detectable (a "Notification Center" window appears while it's up), but its Accept button is **not reachable via Accessibility scripting at all** — confirmed by walking its entire UI tree and finding nothing but empty nested groups five levels deep.
+- So accepting a call here works **visually**: screenshot the screen, find the green Accept button by color, click that exact pixel. This is real automation, but more fragile than the Accessibility-based clicking used everywhere else in Curant — it can be thrown off by the banner appearing in a different spot, a second notification stacking above it, a display/resolution change, or a macOS visual update.
+- **Caller-ID verification for calls doesn't currently exist.** The caller's number is visible as pixels but not as readable text, so there's no way to check it against your configured handles before answering. `approved` mode (the safe default) refuses every call for exactly this reason; only `open` mode answers, and it answers *everyone*.
+
+Budget real time to iterate — this is not a five-minute setup, and it may never be as reliable as the text watcher.
+
+Do steps 1–3 in order once. Step 4 is per-call.
 
 ---
 
-## 1. Install BlackHole (two separate virtual devices)
-
-Curant uses **two** BlackHole devices so your outgoing (synthesized) voice and the caller's incoming voice never mix into the same audio stream:
-
-- **BlackHole 2ch** → carries Curant's synthesized speech *to* FaceTime (used as FaceTime's Microphone)
-- **BlackHole 16ch** → carries the caller's voice *out of* FaceTime so the script can record and transcribe it (used as FaceTime's Speaker/Output)
+## 1. Install everything
 
 ```bash
-brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg
+brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg cliclick
+pip3 install pillow --break-system-packages
 ```
+
+- **BlackHole 2ch / 16ch** — two separate virtual audio devices, kept separate so your outgoing synthesized voice and the caller's incoming voice never mix: 2ch carries Curant's speech *to* FaceTime (set as FaceTime's Microphone), 16ch carries the caller's voice *out of* FaceTime for transcription (set as FaceTime's Speaker/Output).
+- **switchaudio-osx** — lets the script flip your system's default output device programmatically.
+- **cliclick** — synthesizes the actual mouse click on the detected Accept button.
+- **pillow** (PIL) — reads the screenshot to find that button by color.
 
 After installing, **restart your Mac** (or at least log out/in) — BlackHole devices sometimes don't appear in Sound settings until CoreAudio restarts.
 
-Verify both appear:
+Verify the audio devices appear:
 
 ```bash
 system_profiler SPAudioDataType | grep -A2 BlackHole
 ```
 
-You should see both `BlackHole 2ch` and `BlackHole 16ch` listed.
+You should see both `BlackHole 2ch` and `BlackHole 16ch`.
 
 ---
 
 ## 2. Grant permissions
 
-- **System Settings → Privacy & Security → Accessibility** — add and enable Terminal (or whatever runs the script). Without this, the script cannot click FaceTime's Accept/Decline buttons at all.
-- **System Settings → Privacy & Security → Microphone** — FaceTime needs this regardless.
-- Keep **FaceTime.app open and signed in** whenever the answerer is running.
+Two separate permission systems, both needed:
+
+- **System Settings → Privacy & Security → Accessibility** — add and enable Terminal (or whatever runs the script). Needed for both call detection (`System Events`) and the synthesized click (`cliclick`). Note: adding it while Terminal is already open doesn't always take effect immediately — fully quit (Cmd+Q) and reopen Terminal after granting.
+- **System Settings → Privacy & Security → Screen Recording** — add and enable Terminal too. Needed for the screenshot the script takes to find the Accept button. Without this, screenshots silently come back black instead of erroring — if detection seems to "not see" a clearly-visible button, check this first.
 
 ---
 
-## 3. Verify the script can even detect FaceTime's window structure
+## 3. Verify call detection works
 
-Before trusting it to answer anything, run in dry-run mode and place a real test call to yourself from another device/Apple ID:
+Run dry-run mode and place a real test call to yourself from another device/Apple ID:
 
 ```bash
+cd curant-current/mac
 python3 curant-facetime-answerer.py --dry-run --apple-id "your.apple.id@icloud.com"
 ```
 
-Call the Mac's FaceTime number/Apple ID from your phone. Watch the terminal output. It should print the incoming call's window text. If it prints `no_facetime_process` or nothing at all when you know FaceTime is ringing, the UI-detection heuristic in `poll_for_incoming_call()` doesn't match your macOS version — this is the part most likely to need adjusting. Useful next step: run
+While it's ringing, the terminal should print something like `Incoming call detected: 'FaceTime call banner active...'`. If it prints nothing while a call is visibly ringing, check what's actually happening directly:
 
 ```bash
-osascript -e 'tell application "System Events" to tell process "FaceTime" to get name of every window'
+osascript -e 'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
 ```
 
-while a call is ringing, and compare what it prints against what `DETECT_AND_DESCRIBE_SCRIPT` in the script expects.
+Run that once with no call ringing, then again while one is — you're looking for a window named exactly `"Notification Center"` to appear only in the second case. If it doesn't, the detection logic in `poll_for_incoming_call()` needs adjusting for your macOS version.
 
-**Do not proceed to live answering until dry-run reliably detects an incoming call.**
-
----
-
-## 4. Route FaceTime's audio through BlackHole (per-call, manual)
-
-FaceTime lets you pick input/output devices from its menu bar while a call is active: **Video menu → Microphone** and **Video menu → Speaker** (or, on some macOS versions, in FaceTime's own in-call controls).
-
-During a live call (or immediately after the script auto-accepts one):
-1. **Video → Microphone → BlackHole 2ch** — this makes FaceTime send whatever plays into BlackHole 2ch (i.e., Curant's synthesized speech) to the caller, instead of your real mic.
-2. **Video → Speaker → BlackHole 16ch** — this makes FaceTime send the caller's voice into BlackHole 16ch instead of your speakers, where the script records and transcribes it.
-
-This selection is **per FaceTime window/call** on most macOS versions — it may not persist automatically between calls. If it turns out your version does remember it, great, one less manual step; verify by placing a second test call and checking the Video menu's current selection before assuming it stuck.
-
-The script itself only automates one piece of this: it sets your **system default output** to `BlackHole 2ch` right when it accepts a call (`set_system_output_device`), since `afplay`/`say` always play to whatever the system default output is — it cannot select FaceTime's per-call speaker/microphone settings for you. Steps 1 and 2 above still need to be set by hand.
+**Do not proceed until dry-run reliably detects a ringing call.**
 
 ---
 
-## 5. Confirm the transcription dependency
+## 4. Find the Accept button's fallback coordinates (recommended before your first live test)
 
-Call transcription uses OpenAI's Whisper API regardless of which provider (Anthropic/Gemini/OpenAI) you use for replies. Set it once:
+The script tries to find the Accept button visually on its own — but since this is the most fragile piece, it's worth having a manual fallback ready. While a call is ringing:
+
+1. Hover your mouse exactly over the center of the green Accept button (don't click).
+2. In a second terminal window, run:
+   ```bash
+   cliclick p
+   ```
+   This prints your current mouse position as `x,y` — those are the coordinates.
+3. Set that as an environment variable before running the script for real:
+   ```bash
+   export CURANT_FACETIME_ACCEPT_XY="1930,140"
+   ```
+   (using your actual printed numbers). The script only falls back to this if visual detection fails to find the button on its own, so it's a safety net, not the primary mechanism.
+
+---
+
+## 5. Route FaceTime's audio through BlackHole (per-call, manual)
+
+Once a call is answered, FaceTime.app becomes the active app with its own in-call controls (this part is a normal window, unlike the pre-answer banner). Set, from its **Video menu**:
+
+1. **Video → Microphone → BlackHole 2ch** — sends whatever plays into BlackHole 2ch (Curant's synthesized speech) to the caller.
+2. **Video → Speaker → BlackHole 16ch** — sends the caller's voice into BlackHole 16ch instead of your speakers, where the script records and transcribes it.
+
+This selection may not persist between calls — verify on a second test call rather than assuming it stuck.
+
+The script automates one piece of this automatically: it sets your **system default output** to `BlackHole 2ch` right when it accepts a call, since `afplay`/`say` always play to whatever the system default output is. Steps 1 and 2 above still need to be set by hand each call (for now).
+
+---
+
+## 6. Confirm the transcription dependency
+
+Call transcription uses OpenAI's Whisper API regardless of which provider (Anthropic/Gemini/OpenAI) you use for replies:
 
 ```bash
 curant-cli set-api-key sk-... --provider openai
 ```
 
-This is a real, ongoing cost per call minute (Whisper API pricing) on top of whatever your reply-generation provider costs — factor that in before leaving this running unattended.
+This is a real, ongoing cost per call minute on top of whatever your reply-generation provider costs.
 
 ---
 
-## 6. Run it for real
+## 7. Decide on access mode before running it live
+
+Because caller-ID verification doesn't work yet (see the top of this doc), `approved` mode will simply refuse to answer anything — which is safe, but means nothing will happen at all until you explicitly opt into `open` mode:
+
+```bash
+export CURANT_ACCESS_MODE=open
+```
+
+Understand what this means: **the Mac will attempt to auto-answer literally any incoming FaceTime call**, not just ones from your configured customer. Only set this if you're comfortable with that while testing.
+
+---
+
+## 8. Run it for real
 
 ```bash
 python3 curant-facetime-answerer.py --apple-id "your.customer@icloud.com"
 ```
 
-Leave it running (a `launchd` plist like `com.curant.watcher.plist` could wrap this later, once it's actually working reliably — not set up yet, since there's no point auto-starting something still being debugged live).
+No `launchd` auto-start plist yet — deliberately, since there's no point auto-starting something still being debugged live.
 
 **Expect to iterate.** Realistic failure modes, roughly most-to-least likely:
-- The Accept-button click never fires (UI structure guess is wrong for your macOS version) — fix `ACCEPT_CALL_SCRIPT`/`poll_for_incoming_call` against what step 3's `osascript` probe actually shows.
-- Call gets answered but the caller hears silence (BlackHole 2ch not selected as FaceTime's Microphone, or `SwitchAudioSource` didn't actually flip system output — check `system_profiler SPAudioDataType` and `SwitchAudioSource -c` mid-call).
-- Script "hears" nothing from the caller (BlackHole 16ch not selected as FaceTime's Speaker, or the ffmpeg device index lookup in `_find_avfoundation_audio_device_index` picked the wrong device — run `ffmpeg -f avfoundation -list_devices true -i ""` yourself and compare).
-- Echo/garbled audio if both directions end up on the same BlackHole device by mistake — re-check step 4.
+- Detection sees the call but the click misses or does nothing — check Screen Recording permission first (black screenshots look like "nothing detected"), then check whether `CURANT_FACETIME_ACCEPT_XY` is set as a fallback.
+- Call gets answered but the caller hears silence — BlackHole 2ch not actually selected as FaceTime's Microphone this call, or `SwitchAudioSource` didn't flip system output (check with `SwitchAudioSource -c` mid-call).
+- Script "hears" nothing from the caller — BlackHole 16ch not selected as FaceTime's Speaker, or the ffmpeg device index lookup picked the wrong device (run `ffmpeg -f avfoundation -list_devices true -i ""` yourself and compare against `_find_avfoundation_audio_device_index`).
+- Echo/garbled audio — both directions ended up on the same BlackHole device by mistake; re-check step 5.
+- `hang_up()` doesn't end the call — unverified separately from everything above; if it fails, the call stays connected and needs manual ending.
 
-Report back exactly what you see (terminal output + what happened on the call) and it can be fixed — this really is a "build it experimentally, you test live" feature, same as we agreed.
+Report back exactly what you see (terminal output + what happened on the call) — this really is a "build it experimentally, you test live" feature.

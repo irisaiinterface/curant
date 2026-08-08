@@ -9,29 +9,53 @@ waiting), and speaks the reply back with macOS's built-in `say`.
 READ THIS BEFORE RUNNING IT.
 
 Unlike curant-watcher.py (SQLite + AppleScript, both documented, both
-verified end to end on a real Mac), this script rests on ground that is
-NOT solid:
+verified end to end on a real Mac), this rests on ground that live
+testing proved is NOT solid — here's exactly what was tried and what
+was actually found, on the real Mac this runs on, not guessed:
 
-  - FaceTime has no public API and no AppleScript dictionary. Answering
-    a call here means clicking a button via macOS's Accessibility APIs
-    (System Events), driven by GUESSING at FaceTime's current window/
-    button layout. Apple can change that layout in any macOS update and
-    silently break this. The one community project that tried to solve
-    this (vrunt/facetime-auto-answer) gave up on the "real" approach and
-    relied on a preference key its own README says "haven't worked for
-    at least 3 years and have never been officially supported by Apple."
-    This script instead does the UI click for real, which is more
-    likely to work but has never been run against a live FaceTime call
-    — I have no macOS desktop to test it on.
+  - FaceTime.app never runs for an incoming call — confirmed via `ps
+    aux`: it's handled entirely by background daemons
+    (FTConversationService, facetimemessagestored, identityservicesd,
+    callservicesd) plus a system call-banner UI. `open -a FaceTime`
+    while a call rings opens FaceTime's Recents window, not an
+    answerable in-call screen — a dead end, ruled out by testing.
 
-  - Piping audio into and out of a FaceTime call requires a virtual
-    audio driver (BlackHole) and manual device routing that only you
-    can set up on your actual Mac — see SETUP_FACETIME_CALLS.md next to
-    this file. Skipping that setup means this script will "answer" the
-    call but neither hear nor be heard.
+  - The banner IS reliably detectable — a window named "Notification
+    Center" appears in NotificationCenter's window list only while it's
+    up (confirmed with and without a live call). But its internal
+    controls are NOT reachable via Accessibility scripting at all:
+    `entire contents` of that window bottoms out five levels of nested,
+    unlabeled AXGroups deep with zero buttons or text exposed. This
+    looks like Apple's modern Live-Activity-style rendering, which
+    doesn't populate the standard Accessibility tree the way older
+    AppKit notification banners did — not a wrong-guess-fixable problem,
+    a genuine platform restriction.
+
+  - So acceptance here is VISUAL instead: screenshot the screen, find
+    the green accept button by color+position, synthesize a click at
+    that point (see accept_call()). This is real automation, but
+    meaningfully more fragile than Accessibility-based clicking would
+    have been — it breaks if the banner appears in a different position,
+    a second notification stacks above it, the display resolution
+    changes, or a macOS visual update changes the button's look. A
+    hardcoded coordinate fallback exists for when visual detection
+    itself misses (CURANT_FACETIME_ACCEPT_XY).
+
+  - REGRESSION: caller-ID verification for calls is NOT implemented.
+    The banner's caller-ID text is visible as rendered pixels but not
+    exposed to Accessibility scripting either, so there's currently no
+    way to check an incoming caller against your configured handles
+    before answering. "approved" mode (the safe default) therefore
+    refuses to auto-answer ANY call right now — see caller_is_approved().
+    Only "open" mode (explicit, already used the same way by the text
+    watcher) will actually answer calls, and it answers ALL of them.
+
+  - Piping audio into and out of the call still requires the BlackHole
+    virtual-audio setup in SETUP_FACETIME_CALLS.md. Skipping it means
+    this script "answers" the call but neither hears nor is heard.
 
   - This is a "you test it live, tell me what breaks" feature, not a
-    "verified working" one. Expect to iterate.
+    "verified working" one. Expect to keep iterating.
 
 WHAT'S ACTUALLY SOLID (reused from the rest of Curant, unchanged):
   - The reply itself comes from `curant-cli relay --tier fast`, the same
@@ -43,15 +67,23 @@ WHAT'S ACTUALLY SOLID (reused from the rest of Curant, unchanged):
     dependency this feature adds. Requires an OpenAI key even if your
     main provider is Anthropic or Gemini:
         curant-cli set-api-key <key> --provider openai
+  - Call detection (is a call ringing at all) is a cheap, confirmed-
+    reliable window-list check — see poll_for_incoming_call().
 
 REQUIREMENTS
   - Full setup in SETUP_FACETIME_CALLS.md (BlackHole, per-call FaceTime
     audio device selection) done FIRST.
   - Accessibility permission granted to Terminal/python (System
-    Settings > Privacy & Security > Accessibility).
-  - `brew install ffmpeg switchaudio-osx`
+    Settings > Privacy & Security > Accessibility) — needed for both
+    detection (System Events) and synthesized clicks (cliclick).
+  - Screen Recording permission granted to Terminal/python (System
+    Settings > Privacy & Security > Screen Recording) — needed for
+    accept_call()'s screenshot; without it, screenshots come back black
+    instead of erroring, which looks like a detection bug but isn't.
+  - `brew install ffmpeg switchaudio-osx cliclick`
+  - `pip3 install pillow --break-system-packages` (screenshot analysis)
   - An OpenAI API key set (for Whisper transcription).
-  - FaceTime.app open and signed in.
+  - FaceTime.app signed in (does not need to be open — see above).
 
 USAGE
     python3 curant-facetime-answerer.py [--apple-id name@icloud.com]
@@ -61,17 +93,16 @@ USAGE
                  curant-cli's memory/persona context. Defaults to the
                  configured customer_apple_id (same config key the
                  watcher uses).
-    --dry-run    Detect and log incoming calls, print what it WOULD
-                 click/say, but never actually click Accept or speak.
-                 Use this first to sanity-check detection before
-                 letting it answer anything for real.
+    --dry-run    Detect incoming calls and log what it WOULD do, but
+                 never actually click Accept or speak. Use this first
+                 to sanity-check detection before letting it answer
+                 anything for real.
 
-ACCESS CONTROL: honors the same CURANT_ACCESS_MODE the watcher uses.
-In "approved" mode (default), calls are only answered if the incoming
-caller ID (best-effort, read from the call window's text — FaceTime
-does not expose this cleanly, so this can fail closed and refuse to
-answer rather than risk answering an unrecognized caller) matches a
-configured handle. In "open" mode, any call is answered.
+ACCESS CONTROL: honors the same CURANT_ACCESS_MODE the watcher uses,
+but with a real capability gap for calls specifically — see the
+REGRESSION note above and caller_is_approved()'s docstring. "approved"
+mode currently refuses every call; "open" mode answers every call, with
+no verification of who's calling.
 """
 
 from __future__ import annotations
@@ -135,91 +166,221 @@ def _run_osascript(script, timeout=15):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Step 1: detect + accept an incoming call (UI automation — the fragile part)
+# Step 1: detect + accept an incoming call
+#
+# Live-tested on the real Mac this was built for (not guessed):
+#   - FaceTime.app never actually runs for an incoming call — confirmed via
+#     `ps aux`, it's handled entirely by background daemons
+#     (FTConversationService, facetimemessagestored, identityservicesd,
+#     callservicesd) plus a system call-banner UI.
+#   - `open -a FaceTime` while a call rings opens FaceTime's normal Recents
+#     window, NOT an answerable in-call screen — dead end, don't use it.
+#   - DETECTION works: `System Events` can enumerate NotificationCenter's
+#     windows cheaply, and a window literally named "Notification Center"
+#     appears in that list only while the call banner is on screen (checked
+#     both with and without a live call — confirmed the difference).
+#   - ACCEPTING via Accessibility does NOT work: `entire contents` of that
+#     window bottoms out five levels of nested, unlabeled AXGroups deep with
+#     zero buttons, static text, or any other leaf UI element exposed. This
+#     is Apple's modern Live-Activity-style call banner, and its internal
+#     controls are not exposed to third-party Accessibility scripting at
+#     all — not a wrong-guess-fixable problem.
+#
+# So acceptance here is VISUAL instead: screenshot the screen, look for the
+# banner's green accept-call button by color+position, and synthesize a
+# click at that point. A hardcoded coordinate fallback exists for when
+# visual detection misses — see CURANT_FACETIME_ACCEPT_XY below.
 # ─────────────────────────────────────────────────────────────────────────
 
-DETECT_AND_DESCRIBE_SCRIPT = '''
-tell application "System Events"
-    if not (exists process "FaceTime") then return "no_facetime_process"
-    tell process "FaceTime"
-        set winNames to {}
-        repeat with w in windows
-            try
-                set end of winNames to (name of w as string)
-            end try
-        end repeat
-        set AppleScript's text item delimiters to "||"
-        set result to winNames as string
-        set AppleScript's text item delimiters to ""
-        return result
-    end tell
-end tell
-'''
-
-ACCEPT_CALL_SCRIPT = '''
-tell application "System Events"
-    if not (exists process "FaceTime") then return "no_facetime_process"
-    tell process "FaceTime"
-        set frontmost to true
-        repeat with w in windows
-            try
-                if exists (button "Accept" of w) then
-                    click (button "Accept" of w)
-                    return "accepted:" & (name of w as string)
-                end if
-            end try
-            -- Some macOS versions expose the accept control differently
-            -- (e.g. inside a group, or labeled just as an icon button
-            -- with no visible text name) — this UI shape is a guess and
-            -- may need adjusting on your actual Mac. Run with
-            -- --dry-run and inspect the printed window/button names if
-            -- this never matches.
-        end repeat
-    end tell
-    return "no_incoming_call"
-end tell
-'''
-
-
 def poll_for_incoming_call(dry_run):
-    """Returns a description string of the incoming call window (best
-    effort — often just contains window titles), or None if no call is
-    ringing. Never claims certainty about caller identity."""
-    r = _run_osascript(DETECT_AND_DESCRIBE_SCRIPT)
+    """Cheap, confirmed-reliable detection: does NotificationCenter's
+    window list currently include a window named "Notification Center"?
+    Caveat, genuinely unverified beyond FaceTime: this may also go true
+    for OTHER kinds of notifications (Slack, Calendar, etc.), not just
+    calls — only tested against a real FaceTime call so far. The
+    corroborating ps check below (FTConversationService actively
+    running) narrows this back down to calls specifically."""
+    r = _run_osascript(
+        'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
+    )
     if r.returncode != 0:
         return None
-    windows = r.stdout.strip()
-    if not windows or windows == "no_facetime_process":
+    names = [n.strip() for n in (r.stdout or "").split(",")]
+    if "Notification Center" not in names:
         return None
-    # Heuristic: FaceTime's incoming-call window usually isn't the main
-    # window and its title often includes the caller's name/number.
-    # This is unverified — inspect with --dry-run on your Mac and adjust
-    # if it doesn't look right.
-    return windows
+    if not _facetime_call_daemon_active():
+        return None  # a banner is up, but not a FaceTime call specifically
+    return "FaceTime call banner active (NotificationCenter window detected)"
+
+
+def _facetime_call_daemon_active():
+    """Corroborating signal alongside the window check — confirmed via
+    `ps aux` that com.apple.FaceTime.FTConversationService only showed up
+    while a call was actively ringing. Reduces false-positives from
+    unrelated notifications triggering poll_for_incoming_call()."""
+    try:
+        r = subprocess.run(["pgrep", "-f", "FTConversationService"],
+                            capture_output=True, text=True, timeout=5)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+
+# Set once you've found the real coordinates by hovering your mouse over
+# the actual Accept button during a live call and running `cliclick p`
+# (prints current mouse position in point coordinates) — used only if
+# visual detection below fails to locate the button itself.
+ACCEPT_BUTTON_FALLBACK_XY_ENV = "CURANT_FACETIME_ACCEPT_XY"  # e.g. "1900,140"
+
+# macOS's call-accept green, sampled as a tolerant RGB range (not one exact
+# value) to survive screenshot compression/anti-aliasing. Search is
+# restricted to the top-right region, matching where the banner has
+# consistently appeared in live testing — this narrows false positives
+# from other green UI elsewhere on screen (Messages bubbles, etc.).
+_ACCEPT_GREEN_RGB_RANGE = ((20, 90), (170, 230), (70, 140))  # (R, G, B) each (min, max)
+_SEARCH_REGION_FRACTION = (0.55, 1.0, 0.0, 0.30)  # (x0, x1, y0, y1) as fraction of screen size
+
+_display_scale_cache = None
+
+
+def _capture_screenshot():
+    """Requires Screen Recording permission granted to whatever runs this
+    (System Settings > Privacy & Security > Screen Recording) — without
+    it, screencapture silently produces a black or permission-prompt
+    image instead of erroring, so a black-looking result usually means
+    this permission, not a code bug."""
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    subprocess.run(["screencapture", "-x", path], check=True, timeout=10)
+    return path
+
+
+def _display_scale_factor(screenshot_width):
+    """screencapture saves at actual pixel resolution (2x on Retina
+    displays), but click coordinates (cliclick, CGEvent) are in logical
+    'point' space — this converts between them. Cached after first call
+    since it won't change mid-run."""
+    global _display_scale_cache
+    if _display_scale_cache is not None:
+        return _display_scale_cache
+    try:
+        r = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                            capture_output=True, text=True, timeout=15)
+        import re
+        m = re.search(r"Resolution:\s*(\d+)\s*x\s*(\d+)", r.stdout or "")
+        logical_w = int(m.group(1)) if m else screenshot_width
+    except Exception:
+        logical_w = screenshot_width
+    _display_scale_cache = (screenshot_width / logical_w) if logical_w else 1.0
+    return _display_scale_cache
+
+
+def _find_accept_button_visually(screenshot_path):
+    """Returns (x, y) in POINT coordinates (already scale-corrected) of
+    the detected accept button's center, or None if nothing matched.
+    Real fallback for the fact that Accessibility scripting cannot see
+    inside the call banner at all (see module-level comment above)."""
+    from PIL import Image
+
+    img = Image.open(screenshot_path).convert("RGB")
+    width, height = img.size
+    xf0, xf1, yf0, yf1 = _SEARCH_REGION_FRACTION
+    x0, x1 = int(width * xf0), int(width * xf1)
+    y0, y1 = int(height * yf0), int(height * yf1)
+    (r_lo, r_hi), (g_lo, g_hi), (b_lo, b_hi) = _ACCEPT_GREEN_RGB_RANGE
+
+    pixels = img.load()
+    step = 3  # downsample for speed on high-res screenshots
+    matches = []
+    for y in range(y0, y1, step):
+        for x in range(x0, x1, step):
+            r, g, b = pixels[x, y]
+            if r_lo <= r <= r_hi and g_lo <= g <= g_hi and b_lo <= b <= b_hi:
+                matches.append((x, y))
+
+    if not matches:
+        return None
+
+    center_x = sum(p[0] for p in matches) / len(matches)
+    center_y = sum(p[1] for p in matches) / len(matches)
+    scale = _display_scale_factor(width)
+    return round(center_x / scale), round(center_y / scale)
+
+
+def _click_at(x_point, y_point):
+    """Requires `brew install cliclick`. Synthesizes a real mouse click
+    at the given point coordinates — this is the mechanism for both the
+    visual-detection path and the hardcoded fallback."""
+    subprocess.run(["cliclick", f"c:{x_point},{y_point}"], check=True, timeout=10)
 
 
 def accept_call():
-    r = _run_osascript(ACCEPT_CALL_SCRIPT, timeout=10)
-    out = (r.stdout or "").strip()
-    return out.startswith("accepted"), out
+    """Two-tier: try to visually locate and click the real accept button;
+    if that fails, fall back to a hardcoded coordinate you've found
+    yourself (see ACCEPT_BUTTON_FALLBACK_XY_ENV above). Both are
+    genuinely fragile compared to the rest of Curant — a banner in a
+    different position, a stacked second notification, screen
+    resolution/display changes, or a macOS visual update could all break
+    either one. Test with --dry-run's detection working reliably first."""
+    screenshot_path = _capture_screenshot()
+    try:
+        found = _find_accept_button_visually(screenshot_path)
+    finally:
+        os.remove(screenshot_path)
+
+    if found:
+        try:
+            _click_at(*found)
+            return True, f"clicked visually-detected accept button at point {found}"
+        except Exception as e:
+            return False, f"found button at {found} but click failed: {e}"
+
+    fallback = os.environ.get(ACCEPT_BUTTON_FALLBACK_XY_ENV)
+    if fallback:
+        try:
+            x_str, y_str = fallback.split(",")
+            _click_at(int(x_str), int(y_str))
+            return True, f"clicked hardcoded fallback coordinates ({fallback})"
+        except Exception as e:
+            return False, f"hardcoded fallback ({fallback}) invalid or click failed: {e}"
+
+    return False, (
+        f"could not visually locate the accept button, and no "
+        f"{ACCEPT_BUTTON_FALLBACK_XY_ENV} fallback is set — hover your mouse over "
+        f"the real button during a live call and run `cliclick p` to get coordinates, "
+        f"then export {ACCEPT_BUTTON_FALLBACK_XY_ENV}=\"x,y\""
+    )
 
 
 def caller_is_approved(window_desc, cfg):
+    """
+    IMPORTANT REGRESSION vs. the text-based watcher: caller ID
+    verification for FaceTime calls is NOT currently implemented. The
+    old version of this function tried to read the caller's name/number
+    out of the call window's title text — but live testing proved the
+    banner exposes no text to Accessibility scripting at all (same
+    finding that forced accept_call() over to visual detection). There's
+    no caller-identifying string available to check against configured
+    handles right now.
+
+    The caller's number IS visible as rendered pixels in the banner
+    (confirmed from screenshots) — OCR (e.g. via Vision framework or
+    pytesseract) could read it back out and restore real verification,
+    but that's unbuilt. Until then, this fails CLOSED: 'approved' mode
+    (the safe default) refuses every call, since it cannot tell who's
+    calling. Only 'open' mode (already an explicit, documented
+    no-allowlist choice for the text watcher too) will actually answer.
+    """
     mode = _read_access_mode(cfg)
     if mode == "open":
-        return True, "open access mode"
-    _, handles = _read_customer_handles(cfg)
-    if not handles:
-        return False, "approved mode but no customer handles configured"
-    for h in handles:
-        if h and h.lower() in (window_desc or "").lower():
-            return True, f"matched configured handle: {h}"
+        return True, "open access mode (caller ID verification not implemented for calls)"
     return False, (
-        "could not confirm caller matches a configured handle from window "
-        f"text ({window_desc!r}) — refusing to answer rather than risk "
-        "answering an unrecognized caller. If this is a false negative, "
-        "the window-title heuristic likely needs adjusting for your macOS "
-        "version (see poll_for_incoming_call)."
+        "approved mode requires verifying the caller, but caller-ID text isn't "
+        "readable from the call banner (Accessibility scripting can't see it — "
+        "confirmed by testing) — refusing to auto-answer rather than answer an "
+        "unverified caller. Set CURANT_ACCESS_MODE=open if you want this Mac to "
+        "auto-answer any FaceTime call regardless of who it's from, or build OCR-based "
+        "caller-ID reading before trusting 'approved' mode for calls."
     )
 
 
@@ -347,9 +508,14 @@ def get_reply(text, apple_id):
 
 
 def hang_up():
-    """Best-effort — same UI-click fragility as accepting. If this
-    fails, the call is left open; log it loudly rather than silently
-    leaving a customer connected to a Curant that's stopped responding."""
+    """Best-effort. Unlike accept_call(), this targets FaceTime.app's own
+    window via Accessibility — plausible this actually works, since once
+    a call is answered, control genuinely transfers to a normal in-call
+    FaceTime window (confirmed FaceTime.app becomes the active app then,
+    from a live screenshot showing its menu bar) rather than staying on
+    the unscriptable pre-answer banner. Still unverified — if this fails,
+    the call is left open; log it loudly rather than silently leaving a
+    customer connected to a Curant that's stopped responding."""
     script = '''
     tell application "System Events"
         tell process "FaceTime"
