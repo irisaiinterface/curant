@@ -131,11 +131,49 @@ Understand what this means: **the Mac will attempt to auto-answer literally any 
 
 ## 8. Run it for real
 
+While you're still actively debugging clicks/audio, run it in the foreground so you can see output live and Ctrl+C instantly:
+
 ```bash
 python3 curant-facetime-answerer.py --apple-id "your.customer@icloud.com"
 ```
 
-No `launchd` auto-start plist yet — deliberately, since there's no point auto-starting something still being debugged live.
+### Running texting and calling at the same time
+
+Once the foreground testing above is stable, `com.curant.facetime.plist` runs the answerer as its own background `launchd` job — separate and independent from `com.curant.watcher.plist` (texting). Loading both means Curant answers texts and calls simultaneously; each restarts independently (`KeepAlive`) and one crashing doesn't affect the other.
+
+```bash
+cp curant-facetime-answerer.py /usr/local/bin/curant-facetime-answerer.py
+chmod +x /usr/local/bin/curant-facetime-answerer.py
+cp com.curant.facetime.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.curant.facetime.plist
+
+# texting side, if not already loaded:
+cp curant-watcher.py /usr/local/bin/curant-watcher.py
+cp com.curant.watcher.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.curant.watcher.plist
+```
+
+Confirm both are up:
+
+```bash
+launchctl list | grep curant
+# expect: app.curant.watcher   AND   app.curant.facetime
+```
+
+Two things `launchd` handles differently than a foreground terminal, both already set in `com.curant.facetime.plist`:
+- **PATH** — `launchd` doesn't source your shell profile, so `cliclick`/`ffmpeg`/`SwitchAudioSource` (Homebrew) need an explicit `PATH` in the plist's `EnvironmentVariables`, covering both Apple Silicon (`/opt/homebrew/bin`) and Intel (`/usr/local/bin`) install locations.
+- **`CURANT_ACCESS_MODE=open`** — the plist sets this directly, since a `launchd` job doesn't inherit `export`s from a terminal session. If you leave the default `approved` mode, this job will run but silently refuse every call — check `/tmp/curant-facetime.log` if it seems to do nothing.
+
+If you found a manual fallback coordinate (`CURANT_FACETIME_ACCEPT_XY`, step 4) while testing in the foreground, that only lives in your terminal's environment — add it to the plist's `EnvironmentVariables` dict too if you want the background job to have it.
+
+Logs: `/tmp/curant-facetime.log` and `/tmp/curant-facetime-error.log` (answerer), `/tmp/curant-watcher.log` and `/tmp/curant-watcher-error.log` (texting).
+
+To stop one without touching the other:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.curant.facetime.plist   # stop calling only
+launchctl unload ~/Library/LaunchAgents/com.curant.watcher.plist    # stop texting only
+```
 
 **Expect to iterate.** Realistic failure modes, roughly most-to-least likely:
 - Detection sees the call but the click misses or does nothing — check Screen Recording permission first (black screenshots look like "nothing detected"), then check whether `CURANT_FACETIME_ACCEPT_XY` is set as a fallback.

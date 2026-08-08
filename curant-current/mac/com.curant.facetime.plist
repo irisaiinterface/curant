@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.facetime</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/curant-facetime-answerer.py</string>
+    </array>
+
+    <!-- Loops forever polling for incoming calls, same shape as
+         com.curant.watcher.plist, so it can run alongside the text
+         watcher as a second, independent LaunchAgent. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- launchd does not source .zshrc/.zprofile, so cliclick, ffmpeg,
+         and SwitchAudioSource (installed via Homebrew) won't be found
+         on the default PATH unless it's set explicitly here. Includes
+         both Apple Silicon (/opt/homebrew/bin) and Intel (/usr/local/bin)
+         Homebrew locations since this may run on either. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+        <!-- approved mode has no caller-ID verification for calls and
+             refuses everything by design (see SETUP_FACETIME_CALLS.md) —
+             this must be 'open' for the job to ever answer a call.
+             Change deliberately, not by accident. -->
+        <key>CURANT_ACCESS_MODE</key>
+        <string>open</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-facetime.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-facetime-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp curant-facetime-answerer.py /usr/local/bin/curant-facetime-answerer.py
+  chmod +x /usr/local/bin/curant-facetime-answerer.py
+  cp com.curant.facetime.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.facetime.plist
+
+This is a separate LaunchAgent from com.curant.watcher.plist (texting) —
+loading both makes texting and FaceTime answering run at the same time,
+independently. If one crashes or is unloaded, the other keeps running.
+
+Check both are running:
+  launchctl list | grep curant
+  # expect to see BOTH app.curant.watcher and app.curant.facetime
+
+Fallback coordinates, if you set CURANT_FACETIME_ACCEPT_XY as an env
+var while testing in the foreground, need to be added to this plist's
+EnvironmentVariables dict too — env vars exported in your shell are NOT
+visible to a launchd job.
+
+Logs land at /tmp/curant-facetime.log and /tmp/curant-facetime-error.log
+while testing — move these somewhere more permanent once stable.
+
+To stop just the FaceTime answerer without touching texting:
+  launchctl unload ~/Library/LaunchAgents/com.curant.facetime.plist
+-->
