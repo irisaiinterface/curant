@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
 """
 curant-facetime-answerer — EXPERIMENTAL. Auto-answers incoming FaceTime
-calls and lets the caller talk to your Curant in real time: it clicks
-"Accept" via UI automation, records the caller's voice, transcribes it,
-asks curant-cli for a reply (fast model tier — a live caller is
-waiting), and speaks the reply back with macOS's built-in `say`.
+AUDIO calls and lets the caller talk to your Curant in real time: it
+clicks "Accept" via UI automation, records the caller's voice,
+transcribes it, asks curant-cli for a reply (fast model tier — a live
+caller is waiting), and speaks the reply back with macOS's built-in
+`say`.
+
+DELIBERATELY TARGETS FACETIME AUDIO CALLS, NOT VIDEO. Confirmed against
+Apple's own FaceTime User Guide and a real live test call: audio-only
+calls get a different, more limited menu bar item ("Audio" — just Mic
+Mode/Voice Isolation) than video calls ("Video" — full camera/
+microphone/output device picker). Video calls' Video menu could
+override system defaults per-call; audio calls have no such picker, so
+this script instead points macOS's SYSTEM default input/output devices
+at BlackHole automatically (see set_system_input_device/
+set_system_output_device and handle_call()) — there's no manual
+per-call FaceTime menu step anymore, which is actually simpler than the
+video-call approach this used to assume. If a caller instead places a
+FaceTime VIDEO call, detection/accept should still work (the banner
+looks the same), but the audio routing here has NOT been verified for
+that case and may need the old manual Video-menu approach instead.
 
 READ THIS BEFORE RUNNING IT.
 
@@ -71,8 +87,11 @@ WHAT'S ACTUALLY SOLID (reused from the rest of Curant, unchanged):
     reliable window-list check — see poll_for_incoming_call().
 
 REQUIREMENTS
-  - Full setup in SETUP_FACETIME_CALLS.md (BlackHole, per-call FaceTime
-    audio device selection) done FIRST.
+  - Full setup in SETUP_FACETIME_CALLS.md (BlackHole + switchaudio-osx)
+    done FIRST. No manual per-call FaceTime device selection needed —
+    this script switches the system default input/output automatically
+    (see the audio-routing note above); switchaudio-osx is what makes
+    that possible.
   - Accessibility permission granted to Terminal/python (System
     Settings > Privacy & Security > Accessibility) — needed for both
     detection (System Events) and synthesized clicks (cliclick).
@@ -610,17 +629,54 @@ def caller_is_approved(window_desc, cfg):
 # Step 2: audio in/out, once on the call
 # ─────────────────────────────────────────────────────────────────────────
 
+SWITCH_SETTLE_SECONDS = 0.35  # brief pause after a CoreAudio device switch before using it
+
+
 def set_system_output_device(device_name):
-    """Requires `brew install switchaudio-osx`. Sets the TTS-injection
-    device as the default system output for the duration of the call —
-    see SETUP_FACETIME_CALLS.md for why this is the mechanism (afplay
-    has no per-call device argument on macOS)."""
+    """Requires `brew install switchaudio-osx`. Sets the SYSTEM default
+    output device — the mechanism this whole script relies on for BOTH
+    directions of audio, for a reason specific to FaceTime AUDIO calls
+    (confirmed live, not assumed): unlike FaceTime VIDEO calls, an
+    audio-only call's menu bar shows an "Audio" menu with only Mic Mode
+    (Voice Isolation/Wide Spectrum) — no per-call camera/microphone/
+    output device picker at all (confirmed against Apple's own FaceTime
+    User Guide). So there is no per-call "select BlackHole" step
+    possible for audio calls; FaceTime falls back to whatever the
+    SYSTEM's default input/output devices are, same as its documented
+    fallback when nothing is explicitly chosen. This function (and its
+    counterpart set_system_input_device below) is what handle_call()
+    uses to point that system-wide default at BlackHole devices
+    automatically, entirely replacing what used to be a manual FaceTime
+    Video-menu step for video calls."""
     try:
         subprocess.run(["SwitchAudioSource", "-t", "output", "-s", device_name],
                         check=True, capture_output=True, timeout=10)
+        time.sleep(SWITCH_SETTLE_SECONDS)
         return True
     except Exception as e:
         print(f"Could not switch system output to '{device_name}': {e}. "
+              f"Is switchaudio-osx installed (brew install switchaudio-osx) "
+              f"and is that device name exact?", file=sys.stderr)
+        return False
+
+
+def set_system_input_device(device_name):
+    """Counterpart to set_system_output_device — sets the SYSTEM default
+    INPUT device. Set once per call (not per-turn like output): FaceTime
+    Audio has no per-call microphone picker, so it uses whatever the
+    system default input is for the whole call. Pointing this at
+    TTS_OUTPUT_DEVICE (BlackHole 2ch) is what lets FaceTime treat
+    Curant's synthesized speech as if it were the real microphone input
+    — BlackHole loops whatever is played to its output side back out as
+    its input side, so anything afplay'd while system output is also
+    BlackHole 2ch becomes available here."""
+    try:
+        subprocess.run(["SwitchAudioSource", "-t", "input", "-s", device_name],
+                        check=True, capture_output=True, timeout=10)
+        time.sleep(SWITCH_SETTLE_SECONDS)
+        return True
+    except Exception as e:
+        print(f"Could not switch system input to '{device_name}': {e}. "
               f"Is switchaudio-osx installed (brew install switchaudio-osx) "
               f"and is that device name exact?", file=sys.stderr)
         return False
@@ -934,6 +990,24 @@ def handle_call(window_desc, apple_id, dry_run):
         return
     print(f"  Accepted: {detail}")
 
+    # FaceTime AUDIO calls (confirmed live: this feature targets audio
+    # calls, not video — see set_system_output_device's docstring for
+    # why) have no per-call device picker at all, so BOTH directions are
+    # driven by SYSTEM default input/output, switched around the natural
+    # turn-taking already in this loop:
+    #   - input is set ONCE, for the whole call, to TTS_OUTPUT_DEVICE —
+    #     that's what lets FaceTime treat Curant's speech as "the mic".
+    #   - output flips per-turn: TTS_OUTPUT_DEVICE while Curant is
+    #     talking (so afplay's audio loops into what FaceTime treats as
+    #     the mic), CALLER_AUDIO_DEVICE while listening (so FaceTime's
+    #     own call audio -- the caller's voice -- plays into a device
+    #     this script can actually record from, instead of your
+    #     speakers).
+    if not set_system_input_device(TTS_OUTPUT_DEVICE):
+        print("  Continuing anyway, but the caller likely won't hear Curant "
+              "at all until system input is fixed — see SETUP_FACETIME_CALLS.md.",
+              file=sys.stderr)
+
     if not set_system_output_device(TTS_OUTPUT_DEVICE):
         print("  Continuing anyway, but TTS likely won't reach the caller "
               "until system output is fixed — see SETUP_FACETIME_CALLS.md.",
@@ -942,6 +1016,7 @@ def handle_call(window_desc, apple_id, dry_run):
     speak("Hi, this is Curant. I'm listening.")
 
     for turn in range(MAX_CALL_TURNS):
+        set_system_output_device(CALLER_AUDIO_DEVICE)
         try:
             wav_path = record_caller_audio(TURN_RECORD_SECONDS)
         except Exception as e:
@@ -964,6 +1039,7 @@ def handle_call(window_desc, apple_id, dry_run):
             reply = "Sorry, I ran into a problem there — could you say that again?"
         if reply:
             print(f"  Curant says: {reply}")
+            set_system_output_device(TTS_OUTPUT_DEVICE)
             speak(reply)
         if any(word in text.lower() for word in ("bye", "goodbye", "hang up", "that's all")):
             break

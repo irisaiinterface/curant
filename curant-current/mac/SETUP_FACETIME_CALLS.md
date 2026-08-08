@@ -88,16 +88,15 @@ The script tries to find the Accept button visually on its own — but since thi
 
 ---
 
-## 5. Route FaceTime's audio through BlackHole (per-call, manual)
+## 5. Audio routing — automatic, for FaceTime AUDIO calls specifically
 
-Once a call is answered, FaceTime.app becomes the active app with its own in-call controls (this part is a normal window, unlike the pre-answer banner). Set, from its **Video menu**:
+This feature targets **FaceTime Audio calls**, not Video calls. Confirmed against Apple's own FaceTime User Guide and live testing: an audio-only call's menu bar shows an "Audio" menu with only Mic Mode (Voice Isolation/Wide Spectrum) — there's no per-call camera/microphone/output device picker the way FaceTime Video's **Video menu** has. So there's no manual per-call selection to make here at all; FaceTime Audio just uses whatever your Mac's SYSTEM default input/output devices are, the same fallback behavior Apple documents for when no explicit device is chosen.
 
-1. **Video → Microphone → BlackHole 2ch** — sends whatever plays into BlackHole 2ch (Curant's synthesized speech) to the caller.
-2. **Video → Speaker → BlackHole 16ch** — sends the caller's voice into BlackHole 16ch instead of your speakers, where the script records and transcribes it.
+The script drives that automatically now — no manual step needed each call:
+- Once a call is accepted, it sets your **system default input** to `BlackHole 2ch` for the whole call — this is what makes FaceTime treat Curant's synthesized speech as if it were your real microphone (BlackHole loops whatever's played to its output side back out as its input side).
+- It flips your **system default output** back and forth per conversational turn: `BlackHole 2ch` while Curant is speaking (so `afplay` feeds the "microphone" loop above), `BlackHole 16ch` while listening (so FaceTime's own call audio — the caller's voice — plays into a device the script can record from, instead of your speakers).
 
-This selection may not persist between calls — verify on a second test call rather than assuming it stuck.
-
-The script automates one piece of this automatically: it sets your **system default output** to `BlackHole 2ch` right when it accepts a call, since `afplay`/`say` always play to whatever the system default output is. Steps 1 and 2 above still need to be set by hand each call (for now).
+You won't hear either side of the call through your normal speakers while this is running — that's expected, both directions are being routed through BlackHole. If you place a FaceTime **Video** call instead, detection/accept should still work (the banner looks the same either way), but this automatic routing has NOT been verified for video calls — they may still need the old manual **Video menu → Microphone/Speaker** approach instead, since a video call's Video menu could override the system defaults this script is setting.
 
 ---
 
