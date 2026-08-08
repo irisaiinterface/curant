@@ -224,7 +224,24 @@ def poll_for_incoming_call(dry_run):
     for OTHER kinds of notifications (Slack, Calendar, etc.), not just
     calls — only tested against a real FaceTime call so far. The
     corroborating ps check below (FTConversationService actively
-    running) narrows this back down to calls specifically."""
+    running) narrows this back down to calls specifically.
+
+    GUARD added after a real, confirmed-live bug: if a call is already
+    connected (FaceTime.app's own process exists — see
+    _call_is_still_connected()), never report a "new" incoming call no
+    matter what the banner/daemon signals say. Root cause found via a
+    user-submitted screen recording: after a real successful accept, the
+    NotificationCenter window and FTConversationService daemon can both
+    stay lingering/stale for a few seconds into the already-connected
+    call, which previously caused this function to report a phantom
+    SECOND "incoming call" — leading handle_call() to call accept_call()
+    again and click the (by then relocated) accept coordinate a second
+    time, landing on the in-call toolbar's End Call button instead and
+    hanging up a call that had already connected successfully. Checking
+    connection state FIRST closes that hole even if the click-
+    verification race in _click_and_verify() is ever imperfect again."""
+    if _call_is_still_connected():
+        return None  # already connected — don't treat stale banner/daemon state as a new call
     r = _run_osascript(
         'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
     )
@@ -483,11 +500,31 @@ def _click_and_verify(x_point, y_point, attempt_label):
     doesn't move the actual call state is exactly the failure mode found
     in live testing (logged as accepted, banner never went away).
 
-    Checks _facetime_is_frontmost() first, before deciding whether
-    another click is even safe to attempt — see its docstring for why:
-    a delayed/racy still-ringing reading previously caused a real
-    accidental second click that disconnected a call that had actually
-    just connected."""
+    CHANGED after a real, confirmed-live bug found via a user-submitted
+    screen recording: this used to check _facetime_is_frontmost() first.
+    That was wrong for FaceTime AUDIO calls specifically — the in-call UI
+    is a small floating overlay/toolbar, not a real focused app window,
+    so FaceTime.app never actually becomes "frontmost" for an audio
+    call. That made this always fall through to _call_still_ringing(),
+    whose banner/daemon signals were seen live to stay stale for a
+    couple seconds into an already-connected call — so a click that
+    genuinely worked (confirmed via the recording: FaceTime's own call
+    timer was already at 0:01/0:02) still got reported as "still
+    ringing, click did not work." That false failure made accept_call()
+    return False, which made handle_call() give up and poll_for_incoming_
+    call() detect a phantom second "incoming call" a couple seconds
+    later — leading to a SECOND click at the same cached coordinate,
+    which by then was sitting on the in-call toolbar's End Call button
+    instead of the (long gone) Accept button, hanging up a call that had
+    already connected successfully.
+
+    Now checks _call_is_still_connected() first instead: once a call is
+    genuinely answered, control transfers to a real FaceTime.app process
+    (confirmed live — its menu bar/process only exists once truly
+    in-call, per hang_up()'s docstring), which is a much more direct,
+    UI-focus-independent signal than "is FaceTime frontmost" or "is the
+    old banner state gone yet."
+    """
     try:
         _click_at(x_point, y_point)
     except Exception as e:
@@ -495,8 +532,8 @@ def _click_and_verify(x_point, y_point, attempt_label):
         return False
     time.sleep(CLICK_VERIFY_WAIT_SECONDS)
 
-    if _facetime_is_frontmost():
-        print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — FaceTime is now frontmost, call answered",
+    if _call_is_still_connected():
+        print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — FaceTime process now present, call answered",
               file=sys.stderr)
         return True
 
