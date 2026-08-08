@@ -984,25 +984,32 @@ def handle_call(window_desc, apple_id, dry_run):
         print("  [dry-run] would click Accept now. Stopping here.")
         return
 
-    ok, detail = accept_call()
-    if not ok:
-        print(f"  Failed to accept call: {detail}", file=sys.stderr)
-        return
-    print(f"  Accepted: {detail}")
-
     # FaceTime AUDIO calls (confirmed live: this feature targets audio
     # calls, not video — see set_system_output_device's docstring for
     # why) have no per-call device picker at all, so BOTH directions are
-    # driven by SYSTEM default input/output, switched around the natural
-    # turn-taking already in this loop:
+    # driven by SYSTEM default input/output. CRITICAL ORDERING, found
+    # live: this MUST happen BEFORE accept_call(), not after. Setting it
+    # after caused every single call to drop at almost exactly 4 seconds
+    # in, every time -- a suspiciously fixed, repeatable duration that
+    # points at FaceTime's own audio-session negotiation, not a script
+    # bug: FaceTime very likely locks in its input device at the moment
+    # the call connects, and hot-swapping the system default input out
+    # from under it a moment later (while the call is already live)
+    # looks to FaceTime like the microphone disappeared, so it tears the
+    # call down after a short grace period. Setting the devices BEFORE
+    # accepting means FaceTime negotiates the call with BlackHole
+    # already in place, with nothing to hot-swap once it's live.
     #   - input is set ONCE, for the whole call, to TTS_OUTPUT_DEVICE —
     #     that's what lets FaceTime treat Curant's speech as "the mic".
-    #   - output flips per-turn: TTS_OUTPUT_DEVICE while Curant is
-    #     talking (so afplay's audio loops into what FaceTime treats as
-    #     the mic), CALLER_AUDIO_DEVICE while listening (so FaceTime's
-    #     own call audio -- the caller's voice -- plays into a device
-    #     this script can actually record from, instead of your
-    #     speakers).
+    #   - output flips per-turn, AFTER acceptance: TTS_OUTPUT_DEVICE
+    #     while Curant is talking (so afplay's audio loops into what
+    #     FaceTime treats as the mic), CALLER_AUDIO_DEVICE while
+    #     listening (so FaceTime's own call audio -- the caller's voice
+    #     -- plays into a device this script can actually record from,
+    #     instead of your speakers). Output toggling AFTER connection
+    #     hasn't shown the same drop behavior as the input hot-swap did,
+    #     but keep an eye on it if calls start dropping mid-conversation
+    #     instead of at the 4-second mark specifically.
     if not set_system_input_device(TTS_OUTPUT_DEVICE):
         print("  Continuing anyway, but the caller likely won't hear Curant "
               "at all until system input is fixed — see SETUP_FACETIME_CALLS.md.",
@@ -1012,6 +1019,12 @@ def handle_call(window_desc, apple_id, dry_run):
         print("  Continuing anyway, but TTS likely won't reach the caller "
               "until system output is fixed — see SETUP_FACETIME_CALLS.md.",
               file=sys.stderr)
+
+    ok, detail = accept_call()
+    if not ok:
+        print(f"  Failed to accept call: {detail}", file=sys.stderr)
+        return
+    print(f"  Accepted: {detail}")
 
     speak("Hi, this is Curant. I'm listening.")
 
