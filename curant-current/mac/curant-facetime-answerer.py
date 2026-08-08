@@ -760,6 +760,8 @@ def set_system_input_device(device_name):
         return False
 
 
+TTS_VOICE = "Alex"  # explicit `say` voice -- see speak()'s docstring for why this is required, not optional
+
 _SOX_AVAILABLE = None  # cached shutil.which("sox") result
 
 
@@ -790,11 +792,40 @@ def speak(text, device_name=None):
 
     Falls back to the old afplay+system-output approach ONLY if SoX
     isn't installed, with a loud warning -- that path is known to risk
-    dropping the call and is a stopgap, not a fix, if you land here."""
+    dropping the call and is a stopgap, not a fix, if you land here.
+
+    ALWAYS passes -v TTS_VOICE explicitly -- real bug found live: with
+    no -v flag, `say` silently falls back to whatever this Mac's
+    "default" voice is, and on this Mac that default is broken --
+    confirmed via a standalone `say -o file text` test producing a
+    4332-byte near-empty AIFF (versus ~118KB for a real ~2s sentence)
+    with no error at all, while `defaults read
+    com.apple.speech.voice.prefs SelectedVoiceName` showed no voice was
+    even explicitly set. `say -v Alex` on the same text produced a
+    normal ~118KB file. Since `say` doesn't error on this failure mode
+    (sox and afplay both happily "play" the near-silent result without
+    complaint), this was invisible except by comparing file sizes --
+    every greeting and reply was likely going out silent or near-silent
+    until this was pinned down. Explicitly naming a known-good voice
+    sidesteps whatever is wrong with this Mac's actual default."""
     fd, aiff_path = tempfile.mkstemp(suffix=".aiff")
     os.close(fd)
     try:
-        subprocess.run(["say", "-o", aiff_path, text], check=True, timeout=30)
+        subprocess.run(["say", "-v", TTS_VOICE, "-o", aiff_path, text], check=True, timeout=30)
+        # `say` exits 0 and produces a well-formed but near-empty AIFF on
+        # this failure mode -- no exception to catch. Bytes-per-character
+        # is a crude but effective tripwire: a real sentence runs roughly
+        # 1-2KB/char at this sample rate; the broken default voice
+        # produced ~30 bytes/char total regardless of text length. This
+        # doesn't fix a bad voice, it just makes a silent/near-silent
+        # greeting or reply loud in the logs instead of invisible.
+        actual_bytes = os.path.getsize(aiff_path)
+        expected_min_bytes = max(2000, len(text) * 200)
+        if actual_bytes < expected_min_bytes:
+            print(f"  WARNING: TTS output for voice '{TTS_VOICE}' looks suspiciously small "
+                  f"({actual_bytes} bytes for {len(text)} chars of text, expected at least "
+                  f"~{expected_min_bytes}) -- this may play as silence or near-silence. "
+                  f"Check `say -v {TTS_VOICE} -o /tmp/t.aiff \"test\"` manually.", file=sys.stderr)
         target_device = device_name or TTS_OUTPUT_DEVICE
         if _sox_available():
             subprocess.run(["sox", aiff_path, "-t", "coreaudio", target_device],
