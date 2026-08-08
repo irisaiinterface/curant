@@ -1069,7 +1069,20 @@ def _extract_loudest_channel_mono(multi_channel_path):
     return mono_path
 
 
-SILENCE_RMS_THRESHOLD = 250.0  # int16 RMS units — tune per SETUP_FACETIME_CALLS.md notes
+SILENCE_RMS_THRESHOLD = 15.0  # int16 RMS units — RECALIBRATED from a real call, see below
+# CHANGED after real live data: this was originally 250.0, a guess made
+# before any real audio had ever actually been captured through this
+# pipeline. Once the Multi-Output Device fix got real signal flowing
+# for the first time, a live call with the caller speaking clearly the
+# whole time measured RMS 17-40 (peak 166-753) per turn -- genuine
+# speech, well above true silence (confirmed elsewhere as an exact
+# RMS=0.0 baseline), but every single one of those turns was still
+# being thrown away as "silent" against the old 250 threshold. 15.0 sits
+# just above that true-silence floor while comfortably catching the
+# real speech levels actually observed -- raise it again only if
+# background-noise turns start false-triggering transcription, using
+# the per-turn RMS now printed by _wav_has_speech to see exactly what
+# the noise floor looks like on this specific Mac/setup.
 
 
 def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
