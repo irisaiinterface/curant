@@ -441,8 +441,15 @@ def _click_at(x_point, y_point):
 
 
 CLICK_CACHE_PATH = os.path.expanduser("~/.curant/facetime_accept_click_cache.json")
-CLICK_VERIFY_WAIT_SECONDS = 1.5   # how long to wait after a click before checking if it worked
-MAX_ACCEPT_ATTEMPTS = 6           # hard cap so a persistently-wrong click can't loop forever
+CLICK_VERIFY_WAIT_SECONDS = 1.5      # how long to wait after a click before the FIRST check
+CLICK_VERIFY_RECHECK_SECONDS = 1.0   # how long to wait between re-checks if still reading "ringing"
+CLICK_VERIFY_MAX_WAIT_SECONDS = 5.0  # total time to keep re-checking before concluding the click failed —
+                                      # live testing showed a genuinely successful click can still read
+                                      # "still ringing" for a couple seconds after CLICK_VERIFY_WAIT_SECONDS
+                                      # alone, so this gives the banner/daemon teardown more time to
+                                      # actually finish before giving up and (previously) triggering a
+                                      # phantom second click.
+MAX_ACCEPT_ATTEMPTS = 6              # hard cap so a persistently-wrong click can't loop forever
 
 
 def _load_click_cache():
@@ -519,30 +526,47 @@ def _click_and_verify(x_point, y_point, attempt_label):
     instead of the (long gone) Accept button, hanging up a call that had
     already connected successfully.
 
-    Now checks _call_is_still_connected() first instead: once a call is
-    genuinely answered, control transfers to a real FaceTime.app process
-    (confirmed live — its menu bar/process only exists once truly
-    in-call, per hang_up()'s docstring), which is a much more direct,
-    UI-focus-independent signal than "is FaceTime frontmost" or "is the
-    old banner state gone yet."
-    """
+    REVERTED the _call_is_still_connected() swap tried next: three
+    consecutive live test calls showed that check's underlying signal
+    (whether FaceTime.app has become a real process) is NOT reliable —
+    it read 'NO_PROCESS' the entire time in one run, even while a real
+    accept + greeting was happening, and 'PROCESS_NO_WINDOWS' (process
+    exists) in an earlier run at the equivalent moment. Since
+    _call_is_still_connected() was also just changed to treat ANY
+    non-error read as "still connected" (see its own docstring), reusing
+    it here would make every single click report "success" immediately,
+    even a total miss — worse than what it replaced.
+
+    Back to _call_still_ringing() — the one signal that, across every
+    real test call logged so far, has EVENTUALLY always correctly read
+    "not ringing" once a click truly worked. The actual problem was
+    never that signal being wrong, only READING it too early: one
+    single check at CLICK_VERIFY_WAIT_SECONDS (1.5s) could catch the
+    banner/daemon mid-teardown and misreport "still ringing" for a click
+    that had, in fact, worked — which is what caused the phantom second
+    click in the first place. Fix: keep re-checking for up to
+    CLICK_VERIFY_MAX_WAIT_SECONDS total before giving up, instead of
+    trusting one early read."""
     try:
         _click_at(x_point, y_point)
     except Exception as e:
         print(f"  [{attempt_label}] click at ({x_point},{y_point}) failed to execute: {e}", file=sys.stderr)
         return False
+
+    deadline = time.monotonic() + CLICK_VERIFY_MAX_WAIT_SECONDS
     time.sleep(CLICK_VERIFY_WAIT_SECONDS)
-
-    if _call_is_still_connected():
-        print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — FaceTime process now present, call answered",
-              file=sys.stderr)
-        return True
-
-    still_ringing = _call_still_ringing()
-    print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — "
-          f"{'still ringing, click did not work' if still_ringing else 'banner gone, click worked'}",
-          file=sys.stderr)
-    return not still_ringing
+    while True:
+        still_ringing = _call_still_ringing()
+        if not still_ringing:
+            print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — banner gone, click worked",
+                  file=sys.stderr)
+            return True
+        if time.monotonic() >= deadline:
+            print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — "
+                  f"still ringing after {CLICK_VERIFY_MAX_WAIT_SECONDS}s, click did not work",
+                  file=sys.stderr)
+            return False
+        time.sleep(CLICK_VERIFY_RECHECK_SECONDS)
 
 
 def _local_search_offsets(center, radii=(0, 15, 30, 50)):
@@ -991,7 +1015,28 @@ def _call_is_still_connected():
     ongoing "is the call still active" check was wrong: clicking into
     Terminal to read logs makes FaceTime stop being frontmost with the
     call still perfectly connected, which looked exactly like "Curant
-    cutting the call" even though nothing was ever clicked."""
+    cutting the call" even though nothing was ever clicked.
+
+    CHANGED again after a second real bug, found live: this used to
+    treat raw == "NO_PROCESS" as proof the call had ended. Three
+    consecutive real test calls in the same run all showed
+    raw='NO_PROCESS' immediately after a successful accept and greeting
+    — meaning FaceTime.app's own process never spun up at all for those
+    calls, even while genuinely connected — cutting all three right
+    after the greeting played. This directly contradicts an earlier
+    test where the same check read 'PROCESS_NO_WINDOWS' (process
+    exists, no windows) right after a successful accept. So FaceTime.app
+    becoming a real process on answer is NOT reliable in either
+    direction — sometimes it happens, sometimes it doesn't, for reasons
+    outside this script's control. Given the hard requirement that
+    Curant must never be the one to end a call, NO_PROCESS can no longer
+    be trusted as "ended" — only a literal AppleScript execution failure
+    (System Events itself erroring) is treated as inconclusive now.
+    KNOWN GAP, not hidden: this means the loop currently has no reliable
+    way to detect a real hangup at all, and will keep trying to
+    record/transcribe/reply into a dead call until it's manually killed
+    or a better signal is found — accepted as the lesser problem versus
+    falsely cutting a call that's still live."""
     script = '''
     tell application "System Events"
         if not (exists process "FaceTime") then return "NO_PROCESS"
@@ -1016,10 +1061,11 @@ def _call_is_still_connected():
     print(f"  [_call_is_still_connected diagnostic] rc={r.returncode} raw={raw!r} "
           f"stderr={(r.stderr or '').strip()!r}", file=sys.stderr)
 
-    if r.returncode != 0 or raw == "NO_PROCESS":
+    if r.returncode != 0:
         return False
-    # PROCESS_NO_WINDOWS or any window dump at all -> still connected,
-    # deliberately loose (see docstring) until real button names are known.
+    # NO_PROCESS, PROCESS_NO_WINDOWS, or any window dump at all -> still
+    # connected, deliberately loose (see CHANGED note above) until a
+    # genuinely reliable connected/ended signal is found.
     return True
 
 
