@@ -433,17 +433,48 @@ def _call_still_ringing():
     return "Notification Center" in names and _facetime_call_daemon_active()
 
 
+def _facetime_is_frontmost():
+    """Second, independent positive signal that a call was actually
+    answered: FaceTime.app only becomes the frontmost app once truly
+    in-call (confirmed live — its menu bar appears then, not before).
+    Checked BEFORE any retry click, because trusting only
+    _call_still_ringing()'s single reading caused a real, reported bug:
+    a first click that actually worked but got read as "still ringing"
+    a moment too early led to a SECOND click landing on the new in-call
+    screen instead of the (now-gone) banner — hitting whatever control
+    happened to be at that point on the in-call UI, including hanging
+    up a call that had just connected. Checking this first lets the
+    retry loop stop immediately instead of clicking blind into a
+    changed screen."""
+    r = _run_osascript(
+        'tell application "System Events" to get name of first process whose frontmost is true'
+    )
+    return r.returncode == 0 and (r.stdout or "").strip() == "FaceTime"
+
+
 def _click_and_verify(x_point, y_point, attempt_label):
     """Clicks, waits, then checks whether the call actually got answered
     — not just whether cliclick exited 0. A "successful" click that
     doesn't move the actual call state is exactly the failure mode found
-    in live testing (logged as accepted, banner never went away)."""
+    in live testing (logged as accepted, banner never went away).
+
+    Checks _facetime_is_frontmost() first, before deciding whether
+    another click is even safe to attempt — see its docstring for why:
+    a delayed/racy still-ringing reading previously caused a real
+    accidental second click that disconnected a call that had actually
+    just connected."""
     try:
         _click_at(x_point, y_point)
     except Exception as e:
         print(f"  [{attempt_label}] click at ({x_point},{y_point}) failed to execute: {e}", file=sys.stderr)
         return False
     time.sleep(CLICK_VERIFY_WAIT_SECONDS)
+
+    if _facetime_is_frontmost():
+        print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — FaceTime is now frontmost, call answered",
+              file=sys.stderr)
+        return True
+
     still_ringing = _call_still_ringing()
     print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — "
           f"{'still ringing, click did not work' if still_ringing else 'banner gone, click worked'}",
