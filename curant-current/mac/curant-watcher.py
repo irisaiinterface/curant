@@ -550,7 +550,19 @@ def handle_message(msg):
         return
 
     if reply_data.get("error"):
-        print(f"curant-cli reported an error: {reply_data['error']}", file=sys.stderr)
+        # ADDED after a real live gap: curant-cli's relay() actually
+        # includes a human-readable detail in the "reply" field even on
+        # error (e.g. "Couldn't reach anthropic on your account: <the
+        # real exception>") -- this used to print only the generic
+        # error CODE and silently threw that detail away, making it
+        # impossible to tell from watcher logs alone whether a failure
+        # was a bad/missing API key, a network problem, an invalid
+        # model name, a rate limit, etc. Print both now.
+        detail = reply_data.get("reply")
+        if detail:
+            print(f"curant-cli reported an error: {reply_data['error']} — {detail}", file=sys.stderr)
+        else:
+            print(f"curant-cli reported an error: {reply_data['error']}", file=sys.stderr)
         return
 
     reply_text = reply_data.get("reply", "")
