@@ -5234,12 +5234,25 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
                     result = await session.list_tools()
                     return [t.name for t in result.tools]
 
+    def _describe_exception(e):
+        """anyio/httpx2's TaskGroup wraps real failures in an
+        ExceptionGroup, whose own str() is just a useless summary count
+        ("unhandled errors in a TaskGroup (1 sub-exception)") — walk down
+        to the actual underlying exception(s) so the printed error means
+        something."""
+        if hasattr(e, "exceptions"):  # ExceptionGroup / BaseExceptionGroup (Python 3.11+)
+            return "; ".join(_describe_exception(sub) for sub in e.exceptions)
+        return f"{type(e).__name__}: {e}"
+
     try:
         tool_names = asyncio.run(asyncio.wait_for(run_flow(), timeout=310))
         _mark_mcp_server_oauth(name, url, transport=transport)
         print(f"Logged in and connected — {len(tool_names)} tool(s) available: {', '.join(tool_names)}")
     except Exception as e:
-        print(f"OAuth login failed: {e}")
+        print(f"OAuth login failed: {_describe_exception(e)}")
+        if os.environ.get("CURANT_DEBUG"):
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
