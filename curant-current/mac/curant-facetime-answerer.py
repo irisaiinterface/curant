@@ -904,9 +904,23 @@ def _start_continuous_capture(seconds_per_segment):
         )
     segment_dir = tempfile.mkdtemp(prefix="curant_facetime_turns_")
     pattern = os.path.join(segment_dir, "turn_%05d.wav")
+    # CHANGED after a real, confirmed-live bug: this used to request
+    # "-ac 1" here, letting ffmpeg downmix BlackHole 16ch's 16 channels
+    # to mono at capture time. A real call held connected for 4+ minutes
+    # with the caller speaking clearly the whole time, and EVERY turn
+    # still measured as near-total digital silence (RMS ~1, peak ~10-15
+    # out of a possible 32768) -- with System Settings > Sound confirmed
+    # showing BlackHole 16ch genuinely selected as the output device the
+    # whole time (ruled out via a live screenshot), so the audio has to
+    # be landing on SOME channel of the 16. ffmpeg's default mono-downmix
+    # from a 16-channel avfoundation source doesn't reliably grab it.
+    # Fix: capture ALL 16 channels raw and untouched here (no -ac flag
+    # at all, so avfoundation's native channel count is preserved), then
+    # _extract_loudest_channel_mono() picks whichever channel actually
+    # has signal on it, per turn, after the fact.
     process = subprocess.Popen(
         ["ffmpeg", "-y", "-f", "avfoundation", "-i", f":{device_index}",
-         "-ar", "16000", "-ac", "1",
+         "-ar", "16000",
          "-f", "segment", "-segment_time", str(seconds_per_segment),
          "-reset_timestamps", "1", "-strftime", "0", pattern],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -970,6 +984,69 @@ def _wait_for_next_turn_segment(pattern, index):
             return this_segment if os.path.exists(this_segment) else None
         time.sleep(SEGMENT_WAIT_POLL_SECONDS)
     return None
+
+
+def _extract_loudest_channel_mono(multi_channel_path):
+    """Real bug found live: BlackHole 16ch is a 16-channel virtual
+    device, and capturing it with ffmpeg's default mono downmix
+    (previously -ac 1 in _start_continuous_capture) produced near-total
+    digital silence (RMS ~1, peak ~10-15 out of 32768) on EVERY turn of
+    a real 4+ minute call, even though the caller spoke clearly the
+    whole time and System Settings > Sound confirmed BlackHole 16ch was
+    genuinely the selected output device throughout (checked via a live
+    screenshot, ruling out a wrong-device explanation). The real audio
+    has to be landing on some specific channel of the 16 that a naive
+    downmix doesn't reliably pick up.
+
+    _start_continuous_capture() now captures all 16 channels raw and
+    untouched. This function runs once per turn, after the segment is
+    ready: measures RMS independently on EVERY channel, and keeps only
+    whichever one actually has the caller's voice on it, writing that
+    single channel out as a new mono WAV. No channel is assumed ahead of
+    time -- if the real channel shifts between calls or Macs, this still
+    finds it.
+
+    Returns the path to a new mono WAV file (caller must clean this up
+    separately from the original multi-channel file), or the original
+    path unchanged if it was already mono."""
+    import wave
+    import numpy as np
+    with wave.open(multi_channel_path, "rb") as w:
+        n_channels = w.getnchannels()
+        sample_rate = w.getframerate()
+        sampwidth = w.getsampwidth()
+        n_frames = w.getnframes()
+        frames = w.readframes(n_frames)
+
+    if n_channels <= 1:
+        return multi_channel_path  # already mono, nothing to extract
+
+    if sampwidth != 2:
+        # Only int16 PCM is handled below -- if the device ever produces
+        # something else, fail loud rather than silently mis-decode it.
+        raise RuntimeError(
+            f"Unexpected sample width {sampwidth} bytes (expected 2/int16) "
+            f"reading {multi_channel_path} -- can't safely extract a channel."
+        )
+
+    samples = np.frombuffer(frames, dtype=np.int16)
+    usable_frames = samples.size // n_channels
+    samples = samples[: usable_frames * n_channels].reshape(-1, n_channels)
+    per_channel_rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2, axis=0))
+    best_channel = int(np.argmax(per_channel_rms))
+    print(f"  [{_ts()}] {n_channels}-channel capture, per-channel RMS: "
+          + ", ".join(f"ch{i}={r:.1f}" for i, r in enumerate(per_channel_rms))
+          + f" -- using channel {best_channel} (loudest)", file=sys.stderr)
+
+    mono_samples = np.ascontiguousarray(samples[:, best_channel])
+    mono_path = multi_channel_path[:-4] + "_mono.wav" if multi_channel_path.endswith(".wav") \
+        else multi_channel_path + "_mono.wav"
+    with wave.open(mono_path, "wb") as w_out:
+        w_out.setnchannels(1)
+        w_out.setsampwidth(sampwidth)
+        w_out.setframerate(sample_rate)
+        w_out.writeframes(mono_samples.tobytes())
+    return mono_path
 
 
 SILENCE_RMS_THRESHOLD = 250.0  # int16 RMS units — tune per SETUP_FACETIME_CALLS.md notes
@@ -1452,6 +1529,14 @@ def handle_call(window_desc, apple_id, dry_run):
             turn_index += 1
             print(f"  [{_ts()}] Turn segment ready: {os.path.basename(wav_path)}")
 
+            raw_wav_path = wav_path
+            try:
+                wav_path = _extract_loudest_channel_mono(raw_wav_path)
+            except Exception as e:
+                print(f"  [{_ts()}] Could not extract a channel from {raw_wav_path} ({e}) -- "
+                      f"using it as-is.", file=sys.stderr)
+                wav_path = raw_wav_path
+
             # DEBUG AID: if CURANT_FACETIME_DEBUG_KEEP_AUDIO is set, copy
             # every turn's segment to that directory instead of just
             # deleting it after the silence check -- added live after
@@ -1459,13 +1544,18 @@ def handle_call(window_desc, apple_id, dry_run):
             # was no way to actually listen to what was captured to tell
             # whether that was really true. Off by default (adds disk
             # I/O and leaves files behind) -- only meant to be turned on
-            # for a single diagnostic test call.
+            # for a single diagnostic test call. Copies BOTH the raw
+            # 16-channel capture and the extracted mono channel so a
+            # bad extraction can be told apart from genuinely no signal
+            # anywhere in the raw capture.
             debug_keep_dir = os.environ.get("CURANT_FACETIME_DEBUG_KEEP_AUDIO")
             if debug_keep_dir:
                 try:
                     os.makedirs(debug_keep_dir, exist_ok=True)
                     import shutil as _shutil
-                    _shutil.copy2(wav_path, os.path.join(debug_keep_dir, os.path.basename(wav_path)))
+                    _shutil.copy2(raw_wav_path, os.path.join(debug_keep_dir, os.path.basename(raw_wav_path)))
+                    if wav_path != raw_wav_path:
+                        _shutil.copy2(wav_path, os.path.join(debug_keep_dir, os.path.basename(wav_path)))
                 except Exception as e:
                     print(f"  [{_ts()}] Could not copy debug audio: {e}", file=sys.stderr)
 
@@ -1475,7 +1565,9 @@ def handle_call(window_desc, apple_id, dry_run):
                     continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
                 text = transcribe(wav_path, cfg)
             finally:
-                if os.path.exists(wav_path):
+                if os.path.exists(raw_wav_path):
+                    os.remove(raw_wav_path)
+                if wav_path != raw_wav_path and os.path.exists(wav_path):
                     os.remove(wav_path)
             if not text:
                 continue  # likely silence in this window — just listen again
