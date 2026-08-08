@@ -932,26 +932,45 @@ def _stop_continuous_capture(process):
             pass
 
 
-def _wait_for_next_turn_segment(pattern, index, is_still_connected_fn):
+def _wait_for_next_turn_segment(pattern, index):
     """Blocks until turn N's segment file is fully finalized, detected by
     the NEXT segment (N+1) appearing on disk -- ffmpeg's segment muxer
     only starts writing file N+1 once file N is closed out, so this is a
     reliable "is turn N done" signal without needing to open the file
-    ourselves to check. Polls at SEGMENT_WAIT_POLL_SECONDS intervals,
-    periodically rechecking is_still_connected_fn() so a real hangup
-    (however it's eventually detected) doesn't leave this stuck forever,
-    and gives up after SEGMENT_WAIT_TIMEOUT_SECONDS as a hard backstop.
+    ourselves to check. Polls at SEGMENT_WAIT_POLL_SECONDS intervals, and
+    gives up after SEGMENT_WAIT_TIMEOUT_SECONDS as a hard backstop.
+
+    CHANGED after a real, still-unexplained live bug: a call dropped on
+    its own even with the continuous-capture fix (one persistent ffmpeg
+    process for the whole call, not one per turn) already in place --
+    meaning repeated device open/close wasn't the only remaining cause,
+    or wasn't the cause at all. The one thing that WAS happening very
+    frequently throughout that call (every ~1.6-2s from the outer loop,
+    ADDITIONALLY every SEGMENT_WAIT_POLL_SECONDS from here) is
+    _call_is_still_connected() -- which spawns a fresh `osascript`
+    process every single call. Earlier live evidence (a real macOS log
+    capture) showed FaceTime's own call system can auto-disconnect a
+    call when a tracked client process's connection is invalidated
+    (`wantsCallDisconnectionOnInvalidation=YES`) -- confirmed for an
+    abrupt kill (Ctrl+C), unconfirmed but plausible for ordinary rapid
+    process churn too. Until that's ruled in or out, this no longer
+    calls is_still_connected_fn() at all -- connectivity is checked ONCE
+    per turn by the caller (handle_call()'s outer loop), not repeatedly
+    while waiting for a segment. This cuts total AppleScript
+    invocations from 2-4 per turn down to 1, directly reducing exposure
+    to whatever this mechanism turns out to be, at the cost of relying
+    more on SEGMENT_WAIT_TIMEOUT_SECONDS as the sole backstop if a
+    segment genuinely never arrives.
 
     Returns the path to turn N's now-finalized segment file, or None if
-    the call looks disconnected or this timed out waiting."""
+    this timed out waiting (the caller's own connectivity check, run
+    once per turn, is what actually detects a real hangup now)."""
     this_segment = pattern % index
     next_segment = pattern % (index + 1)
     deadline = time.monotonic() + SEGMENT_WAIT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if os.path.exists(next_segment):
             return this_segment if os.path.exists(this_segment) else None
-        if not is_still_connected_fn():
-            return None
         time.sleep(SEGMENT_WAIT_POLL_SECONDS)
     return None
 
@@ -1404,7 +1423,7 @@ def handle_call(window_desc, apple_id, dry_run):
                       "the user ended it, Curant did not.")
                 return
 
-            wav_path = _wait_for_next_turn_segment(pattern, turn_index, _call_is_still_connected)
+            wav_path = _wait_for_next_turn_segment(pattern, turn_index)
             if wav_path is None:
                 # Either the connectivity check above already caught a
                 # real end and we're about to loop back to it, or this
