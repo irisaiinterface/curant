@@ -4130,7 +4130,16 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     # to actually look at it) and only ever SAVES a Claude call — never
     # skips one on uncertain ground, since classify_message_triviality
     # defaults to False on any doubt at all.
-    if not image_path and classify_message_triviality(message_text):
+    #
+    # SKIPPED entirely in voice_mode -- real live-call latency
+    # diagnosis: a caller reported a "long delay between hearing
+    # something and answering," and this step is a big part of it. It
+    # runs an Ollama call (up to a 4s timeout) BEFORE the real reply
+    # path even starts, purely to maybe save a cloud call -- a trade
+    # that makes sense for a text message someone reads whenever, but
+    # is pure added latency in front of a live caller who's waiting on
+    # the line right now, whether or not it ends up saving anything.
+    if not voice_mode and not image_path and classify_message_triviality(message_text):
         local_reply = generate_local_reply(message_text, persona_name=config.get("persona", "Curant").title())
         save_message("user", message_text, urgency="normal")
         save_message("assistant", local_reply, provider="local")
@@ -4151,10 +4160,23 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     # existing standing rule, or (falling back) a judgment call about
     # relative model strengths. Skipped entirely with only one provider
     # configured, so this never adds cost/latency to the common case.
-    eligible = get_eligible_providers(config)
-    routed_provider, routing_reason, new_rule_saved = decide_provider(
-        message_text, config, provider, eligible
-    )
+    #
+    # ALSO skipped entirely in voice_mode, regardless of how many
+    # providers are configured -- same latency reasoning as above:
+    # decide_provider() is a full extra LLM call (tier="fast", but
+    # still a real network round trip) made JUST to decide who answers,
+    # before the actual reply generation call even starts. For a live
+    # caller that's a second sequential model call stacked in front of
+    # the one that actually produces their answer -- worth it for text
+    # (no one's waiting in real time), not worth it for a call. Voice
+    # always uses the person's default configured provider.
+    if voice_mode:
+        eligible, routed_provider, routing_reason, new_rule_saved = [provider], provider, None, False
+    else:
+        eligible = get_eligible_providers(config)
+        routed_provider, routing_reason, new_rule_saved = decide_provider(
+            message_text, config, provider, eligible
+        )
     if routed_provider != provider:
         # Routing to a different provider than "the" configured one means
         # a different API key too.
@@ -4257,7 +4279,24 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     # Uses the REDACTED text, not user_history_text — this is a real API
     # call too, and would otherwise leak whatever the front-door layer
     # just redacted from the main conversation turn.
-    update_memories_from_exchange(provider, api_key, memories, redacted_message_text, reply_text)
+    #
+    # SKIPPED in voice_mode. Real live-call latency diagnosis (caller
+    # reported "a long delay between hearing something and answering"):
+    # this is a THIRD sequential LLM call this function was making
+    # per turn, and it runs BEFORE the JSON reply below is printed —
+    # subprocess.run(capture_output=True) in the FaceTime answerer's
+    # get_reply() doesn't return until this whole process exits, not
+    # just until the reply is generated, so the caller was sitting
+    # through this extra call's full round trip on every single turn
+    # even though it's about remembering the conversation, not
+    # answering it. "A few hundred ms" per the comment above was true
+    # for a text relay's real-world timing but not for what was
+    # actually observed live on calls. Tradeoff accepted: call
+    # conversations currently don't feed the memory system the way
+    # texts do — revisit with a true fire-and-forget background
+    # process (detached child, not a thread) if that's ever wanted.
+    if not voice_mode:
+        update_memories_from_exchange(provider, api_key, memories, redacted_message_text, reply_text)
 
     # Generated files sit encrypted on disk (see _save_generated_bytes) —
     # decrypt to a short-lived temp file only at the moment of actually
