@@ -134,6 +134,15 @@ import sys
 import tempfile
 import time
 
+def _ts():
+    """Wall-clock timestamp (local time, millisecond precision) prefixed
+    onto the key lifecycle prints below. Added after live debugging where
+    figuring out exactly how many seconds elapsed between 'Accepted' and
+    a call dropping required manually counting terminal scrollback --
+    this makes that a direct read instead of a guess."""
+    return time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time() * 1000) % 1000:03d}"
+
+
 CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
@@ -549,8 +558,9 @@ def _click_and_verify(x_point, y_point, attempt_label):
     trusting one early read."""
     try:
         _click_at(x_point, y_point)
+        print(f"  [{_ts()}] [{attempt_label}] clicked ({x_point},{y_point})", file=sys.stderr)
     except Exception as e:
-        print(f"  [{attempt_label}] click at ({x_point},{y_point}) failed to execute: {e}", file=sys.stderr)
+        print(f"  [{_ts()}] [{attempt_label}] click at ({x_point},{y_point}) failed to execute: {e}", file=sys.stderr)
         return False
 
     deadline = time.monotonic() + CLICK_VERIFY_MAX_WAIT_SECONDS
@@ -558,11 +568,11 @@ def _click_and_verify(x_point, y_point, attempt_label):
     while True:
         still_ringing = _call_still_ringing()
         if not still_ringing:
-            print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — banner gone, click worked",
+            print(f"  [{_ts()}] [{attempt_label}] verified — banner gone, click worked",
                   file=sys.stderr)
             return True
         if time.monotonic() >= deadline:
-            print(f"  [{attempt_label}] clicked ({x_point},{y_point}) — "
+            print(f"  [{_ts()}] [{attempt_label}] verified — "
                   f"still ringing after {CLICK_VERIFY_MAX_WAIT_SECONDS}s, click did not work",
                   file=sys.stderr)
             return False
@@ -1058,7 +1068,7 @@ def _call_is_still_connected():
     '''
     r = _run_osascript(script)
     raw = (r.stdout or "").strip()
-    print(f"  [_call_is_still_connected diagnostic] rc={r.returncode} raw={raw!r} "
+    print(f"  [{_ts()}] [_call_is_still_connected diagnostic] rc={r.returncode} raw={raw!r} "
           f"stderr={(r.stderr or '').strip()!r}", file=sys.stderr)
 
     if r.returncode != 0:
@@ -1178,7 +1188,7 @@ def _preflight_check_apis(cfg):
 # ─────────────────────────────────────────────────────────────────────────
 
 def handle_call(window_desc, apple_id, dry_run):
-    print(f"Incoming call detected: {window_desc!r}")
+    print(f"[{_ts()}] Incoming call detected: {window_desc!r}")
     cfg = _load_config()
     approved, reason = caller_is_approved(window_desc, cfg)
     print(f"  access check: {'PASS' if approved else 'REFUSED'} — {reason}")
@@ -1210,11 +1220,12 @@ def handle_call(window_desc, apple_id, dry_run):
 
     ok, detail = accept_call()
     if not ok:
-        print(f"  Failed to accept call: {detail}", file=sys.stderr)
+        print(f"  [{_ts()}] Failed to accept call: {detail}", file=sys.stderr)
         return
-    print(f"  Accepted: {detail}")
+    print(f"  [{_ts()}] Accepted: {detail}")
 
     speak("Hi, this is Curant. I'm listening.")
+    print(f"  [{_ts()}] Greeting playback finished.")
 
     # CURANT NEVER ENDS THE CALL — only the human can, by hanging up on
     # their own end. Per explicit direction. Two things changed to make
@@ -1245,10 +1256,11 @@ def handle_call(window_desc, apple_id, dry_run):
             # being misread as "call ended"). This checks the actual
             # in-call controls, not who has keyboard focus, so reading
             # logs in Terminal mid-call no longer looks like a hangup.
-            print("  Call ended (FaceTime's in-call controls are gone) — "
+            print(f"  [{_ts()}] Call ended (FaceTime's in-call controls are gone) — "
                   "the user ended it, Curant did not.")
             return
 
+        print(f"  [{_ts()}] Starting {TURN_RECORD_SECONDS}s caller-audio recording...")
         try:
             wav_path = record_caller_audio(TURN_RECORD_SECONDS)
         except Exception as e:
@@ -1257,12 +1269,14 @@ def handle_call(window_desc, apple_id, dry_run):
             # above and now. Either way, Curant still doesn't hang up —
             # re-check frontmost state and loop; if the call is really
             # gone, the check at the top of the next iteration returns.
-            print(f"  Recording failed (will re-check whether the call is "
+            print(f"  [{_ts()}] Recording failed (will re-check whether the call is "
                   f"still up): {e}", file=sys.stderr)
             time.sleep(RECORDING_FAILURE_RETRY_SECONDS)  # avoid a tight busy-loop if this keeps failing
             continue
+        print(f"  [{_ts()}] Recording finished.")
         try:
             if not _wav_has_speech(wav_path):
+                print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
                 continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
             text = transcribe(wav_path, cfg)
         finally:
@@ -1270,15 +1284,16 @@ def handle_call(window_desc, apple_id, dry_run):
                 os.remove(wav_path)
         if not text:
             continue  # likely silence in this window — just listen again
-        print(f"  Caller said: {text}")
+        print(f"  [{_ts()}] Caller said: {text}")
         try:
             reply = get_reply(text, apple_id)
         except Exception as e:
-            print(f"  Reply failed: {e}", file=sys.stderr)
+            print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
             reply = "Sorry, I ran into a problem there — could you say that again?"
         if reply:
-            print(f"  Curant says: {reply}")
+            print(f"  [{_ts()}] Curant says: {reply}")
             speak(reply)
+            print(f"  [{_ts()}] Reply playback finished.")
 
 
 def main():
