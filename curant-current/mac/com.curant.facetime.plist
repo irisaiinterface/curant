@@ -8,6 +8,14 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
+        <!-- -u: unbuffered stdout/stderr. Without it, Python fully
+             block-buffers output when it isn't attached to a real
+             terminal (which a launchd job never is) — the process runs
+             fine, but StandardOutPath/StandardErrorPath can sit empty
+             for a long time before a buffer flush, making it look like
+             nothing happened when it actually has. Confirmed live: the
+             job was state=running the whole time even with empty logs. -->
+        <string>-u</string>
         <string>/usr/local/bin/curant-facetime-answerer.py</string>
     </array>
 
