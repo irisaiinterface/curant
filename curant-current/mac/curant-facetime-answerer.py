@@ -146,7 +146,17 @@ def _ts():
 CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
-TURN_RECORD_SECONDS = 5          # length of each caller-audio recording chunk
+TURN_RECORD_SECONDS = 3          # length of each caller-audio recording chunk -- LOWERED from 5
+# (2026-08-08, latency pass): this is the single biggest structural
+# latency source in the whole call loop -- turns are fixed-length
+# windows, not silence-triggered, so the caller waits up to this many
+# seconds AFTER they finish talking before transcription even starts.
+# 3s still comfortably covers a normal short conversational turn (a
+# few words to a sentence -- the reply-brevity instruction in
+# curant-cli's voice_mode already pushes both sides toward short
+# turns); a genuinely long utterance still gets split across multiple
+# turns same as before, just at a shorter boundary. Real tradeoff, not
+# hidden: going lower than this risks cutting off mid-word more often.
 RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state after a failed recording
 
 # NOTE: there is deliberately no MAX_CALL_TURNS anymore. Per explicit
@@ -838,7 +848,11 @@ def _sox_available():
     return _SOX_AVAILABLE
 
 
-SPEAK_INTERRUPT_POLL_SECONDS = 0.5  # how often speak() checks interrupt_check() while playback runs
+SPEAK_INTERRUPT_POLL_SECONDS = 0.2  # how often speak() checks interrupt_check() while playback runs --
+# LOWERED from 0.5 (latency pass): also a cheap check (proc.poll() +
+# an in-memory RMS comparison, no network), tightening this shaves the
+# average end-of-playback detection delay AND makes barge-in react
+# faster as a side benefit.
 SPEAK_MAX_SECONDS = 60  # hard backstop so a stuck playback process can't hang the call forever
 
 
@@ -968,7 +982,11 @@ def record_caller_audio(seconds):
     return wav_path
 
 
-SEGMENT_WAIT_POLL_SECONDS = 0.5   # how often to check whether the next segment file has appeared
+SEGMENT_WAIT_POLL_SECONDS = 0.2   # how often to check whether the next segment file has appeared --
+# LOWERED from 0.5 (latency pass): this is a cheap os.path.exists()
+# filesystem check, not a network call or subprocess spawn, so a
+# tighter interval costs essentially nothing. Averages out to ~0.1s of
+# pure added wait per turn instead of ~0.25s.
 SEGMENT_WAIT_TIMEOUT_SECONDS = 20  # give up waiting for a turn's segment after this long (should
                                     # normally appear within ~TURN_RECORD_SECONDS of the previous one)
 
@@ -1138,9 +1156,17 @@ def _extract_loudest_channel_mono(multi_channel_path):
     samples = samples[: usable_frames * n_channels].reshape(-1, n_channels)
     per_channel_rms = np.sqrt(np.mean(samples.astype(np.float64) ** 2, axis=0))
     best_channel = int(np.argmax(per_channel_rms))
-    print(f"  [{_ts()}] {n_channels}-channel capture, per-channel RMS: "
-          + ", ".join(f"ch{i}={r:.1f}" for i, r in enumerate(per_channel_rms))
-          + f" -- using channel {best_channel} (loudest)", file=sys.stderr)
+    # TRIMMED (2026-08-08, latency pass): this used to print every one
+    # of the 16 channels' individual RMS values on every single call to
+    # this function -- useful during the channel-mismatch investigation
+    # (see docstring above), pure noise now that the real channel is
+    # confirmed stable. This function also runs on every barge-in watch
+    # tick during reply playback (_InterruptWatcher.check()), not just
+    # once per real turn, so the old line was printing far more often
+    # than once per turn. Down to a single short line with just the
+    # winning channel.
+    print(f"  [{_ts()}] {n_channels}ch capture -> using channel {best_channel} "
+          f"(RMS={per_channel_rms[best_channel]:.1f})", file=sys.stderr)
 
     mono_samples = np.ascontiguousarray(samples[:, best_channel])
     mono_path = multi_channel_path[:-4] + "_mono.wav" if multi_channel_path.endswith(".wav") \
@@ -1208,20 +1234,26 @@ def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
     # makes the next test tell us whether the clip is genuinely near-
     # zero (routing/device problem) or just under-threshold real audio
     # (threshold too high), instead of guessing between those two very
-    # different problems.
-    print(f"  [{_ts()}] WAV check: {n_frames} frames, {n_channels}ch, {sample_rate}Hz "
-          f"({n_frames / sample_rate if sample_rate else 0:.2f}s)", file=sys.stderr)
+    # different problems. TRIMMED (2026-08-08, latency pass): this used
+    # to be two separate print calls (frame/channel/rate info, then a
+    # second line for RMS/peak/verdict) on every single check -- this
+    # function also runs on every barge-in watch tick during reply
+    # playback, not just once per real turn. Down to one line with just
+    # what's actually needed to read a result at a glance; duration is
+    # folded in, frame/channel/rate detail dropped since it was never
+    # actually needed once the pipeline was confirmed working.
     if not frames:
-        print(f"  [{_ts()}] WAV check: zero frames read -- empty/corrupt segment file.",
+        print(f"  [{_ts()}] WAV check: empty/corrupt segment file -- treating as silent.",
               file=sys.stderr)
         return False
     samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
     if samples.size == 0:
-        print(f"  [{_ts()}] WAV check: zero samples after decode.", file=sys.stderr)
+        print(f"  [{_ts()}] WAV check: zero samples after decode -- treating as silent.",
+              file=sys.stderr)
         return False
     rms = float(np.sqrt(np.mean(samples ** 2)))
-    peak = float(np.max(np.abs(samples)))
-    print(f"  [{_ts()}] WAV check: RMS={rms:.1f} peak={peak:.0f} threshold={threshold:.0f} "
+    duration = n_frames / sample_rate if sample_rate else 0
+    print(f"  [{_ts()}] WAV check ({duration:.1f}s): RMS={rms:.1f}/threshold={threshold:.0f} "
           f"-> {'HAS SPEECH' if rms >= threshold else 'silent'}", file=sys.stderr)
     return rms >= threshold
 
