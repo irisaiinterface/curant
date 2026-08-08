@@ -157,7 +157,27 @@ RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state
 
 # BlackHole device names set up per SETUP_FACETIME_CALLS.md.
 TTS_OUTPUT_DEVICE = "BlackHole 2ch"     # fed to FaceTime as its Microphone
-CALLER_AUDIO_DEVICE = "BlackHole 16ch"  # fed FROM FaceTime's Speaker/Output
+CALLER_AUDIO_DEVICE = "BlackHole 16ch"  # what this script CAPTURES caller audio from (always this)
+
+# What gets set as the SYSTEM's default output device -- separate from
+# CALLER_AUDIO_DEVICE above. Real bug found live: setting bare
+# "BlackHole 16ch" as the system output produced genuine, total digital
+# silence (RMS=0.0 across ALL 16 channels, confirmed live) on every
+# single captured turn, even during a call confirmed connected and live
+# (screenshot showed FaceTime's own audio waveform moving) with
+# BlackHole 16ch confirmed as the selected output device the whole time
+# (System Settings > Sound, also screenshotted). FaceTime's call audio
+# apparently doesn't render into a BARE virtual loopback device the way
+# ordinary app audio does. The standard fix is a macOS Multi-Output
+# Device (Audio MIDI Setup -> + -> Create Multi-Output Device, checking
+# both BlackHole 16ch and your real speakers/headphones) -- pointing
+# system output at THAT combined device instead of bare BlackHole 16ch,
+# while still capturing from BlackHole 16ch specifically (which mirrors
+# whatever audio the combined device receives). Set this env var to
+# whatever you named that Multi-Output Device; defaults to
+# CALLER_AUDIO_DEVICE (the old, confirmed-broken-for-FaceTime behavior)
+# if unset, purely for backward compatibility.
+SYSTEM_OUTPUT_DEVICE = os.environ.get("CURANT_FACETIME_SYSTEM_OUTPUT_DEVICE", CALLER_AUDIO_DEVICE)
 
 
 def _load_config():
@@ -1647,14 +1667,21 @@ def main():
         # dedicated always-on answering Mac; worth knowing if this Mac is
         # also used for other calls or everyday audio.
         print("  Setting system audio devices at startup — input: "
-              f"{TTS_OUTPUT_DEVICE}, output: {CALLER_AUDIO_DEVICE}. Both stay "
+              f"{TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}. Both stay "
               "fixed for as long as this process runs (see comment above).")
+        if SYSTEM_OUTPUT_DEVICE == CALLER_AUDIO_DEVICE:
+            print(f"  NOTE: system output is bare '{CALLER_AUDIO_DEVICE}', not a Multi-Output "
+                  f"Device — confirmed live this produces total digital silence for FaceTime call "
+                  f"audio (RMS=0.0 across all 16 channels during a real connected call). Set "
+                  f"CURANT_FACETIME_SYSTEM_OUTPUT_DEVICE to a Multi-Output Device name (Audio MIDI "
+                  f"Setup) that includes {CALLER_AUDIO_DEVICE!r} before expecting hearing to work.",
+                  file=sys.stderr)
         if not set_system_input_device(TTS_OUTPUT_DEVICE):
             print("  System input device switch failed at startup — calls "
                   "will likely answer but the caller won't hear anything "
                   "until this is fixed. See SETUP_FACETIME_CALLS.md.",
                   file=sys.stderr)
-        if not set_system_output_device(CALLER_AUDIO_DEVICE):
+        if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
             print("  System output device switch failed at startup — "
                   "recording the caller's voice likely won't work until "
                   "this is fixed. See SETUP_FACETIME_CALLS.md.",
