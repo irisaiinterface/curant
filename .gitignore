@@ -17,5 +17,10 @@ venv/
 # macOS
 .DS_Store
 
+# Build output (compiled bytecode distributable) — rebuilt via
+# curant-current/build_protected.sh, tied to whatever Python built it,
+# never a source-of-truth artifact worth tracking
+curant-current/dist/
+
 # Local Curant config (if ever accidentally staged from a dev machine)
 .curant/
