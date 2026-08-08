@@ -842,10 +842,15 @@ def speak(text, device_name=None):
 
 
 def record_caller_audio(seconds):
-    """Records from CALLER_AUDIO_DEVICE (FaceTime's Speaker/Output,
-    per the routing setup) using ffmpeg's avfoundation input. The exact
-    device index isn't stable across Macs, so this looks it up by name
-    each time rather than hardcoding an index."""
+    """DEPRECATED for the live-call loop -- see _start_continuous_capture()
+    below for why. Kept only because it's a simple, self-contained way to
+    grab one clip (useful for standalone debugging/manual testing), but
+    handle_call() no longer calls this per-turn.
+
+    Records from CALLER_AUDIO_DEVICE (FaceTime's Speaker/Output, per the
+    routing setup) using ffmpeg's avfoundation input. The exact device
+    index isn't stable across Macs, so this looks it up by name each
+    time rather than hardcoding an index."""
     device_index = _find_avfoundation_audio_device_index(CALLER_AUDIO_DEVICE)
     if device_index is None:
         raise RuntimeError(
@@ -860,6 +865,95 @@ def record_caller_audio(seconds):
         check=True, capture_output=True, timeout=seconds + 15,
     )
     return wav_path
+
+
+SEGMENT_WAIT_POLL_SECONDS = 0.5   # how often to check whether the next segment file has appeared
+SEGMENT_WAIT_TIMEOUT_SECONDS = 20  # give up waiting for a turn's segment after this long (should
+                                    # normally appear within ~TURN_RECORD_SECONDS of the previous one)
+
+
+def _start_continuous_capture(seconds_per_segment):
+    """Opens CALLER_AUDIO_DEVICE via ffmpeg's avfoundation input EXACTLY
+    ONCE for the entire call, and lets ffmpeg's own segment muxer split
+    the continuous stream into rolling per-turn WAV files -- instead of
+    the old approach (record_caller_audio(), called fresh every single
+    turn), which opened and closed a brand-new capture session on that
+    SAME device roughly every 5-7 seconds for the whole call.
+
+    Real suspicion behind this change, not yet 100% proven but the
+    strongest remaining lead after ruling out device-switching (already
+    fixed, see set_system_input_device/set_system_output_device) and the
+    click-verification race (already fixed, see _click_and_verify): live
+    testing showed a call still dropping at an unpredictable point in
+    the first ~10-15s while turns kept recording (and reading as
+    'silent') for over two minutes afterward with no crash -- meaning
+    the SCRIPT never noticed the real call had ended, which also means
+    the terminal logs alone can no longer prove or disprove this timing
+    correlation. Repeatedly opening/closing a capture session on a
+    device FaceTime is actively rendering INTO, mid-call, is the same
+    class of problem that repeatedly switching system default devices
+    mid-call already turned out to be -- this closes that same kind of
+    gap for capture, the one remaining piece of the audio pipeline that
+    still touched the device more than once per call.
+
+    Returns (process, segment_dir, pattern) -- caller is responsible for
+    calling _stop_continuous_capture(process) when the call ends, and
+    for cleaning up segment_dir."""
+    device_index = _find_avfoundation_audio_device_index(CALLER_AUDIO_DEVICE)
+    if device_index is None:
+        raise RuntimeError(
+            f"Could not find an audio input device named '{CALLER_AUDIO_DEVICE}'. "
+            f"Is BlackHole 16ch installed? See SETUP_FACETIME_CALLS.md."
+        )
+    segment_dir = tempfile.mkdtemp(prefix="curant_facetime_turns_")
+    pattern = os.path.join(segment_dir, "turn_%05d.wav")
+    process = subprocess.Popen(
+        ["ffmpeg", "-y", "-f", "avfoundation", "-i", f":{device_index}",
+         "-ar", "16000", "-ac", "1",
+         "-f", "segment", "-segment_time", str(seconds_per_segment),
+         "-reset_timestamps", "1", "-strftime", "0", pattern],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return process, segment_dir, pattern
+
+
+def _stop_continuous_capture(process):
+    """Best-effort clean shutdown of the persistent ffmpeg process
+    started by _start_continuous_capture(). Never raises -- this runs on
+    the way out of handle_call() and must not itself become a new source
+    of problems."""
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _wait_for_next_turn_segment(pattern, index, is_still_connected_fn):
+    """Blocks until turn N's segment file is fully finalized, detected by
+    the NEXT segment (N+1) appearing on disk -- ffmpeg's segment muxer
+    only starts writing file N+1 once file N is closed out, so this is a
+    reliable "is turn N done" signal without needing to open the file
+    ourselves to check. Polls at SEGMENT_WAIT_POLL_SECONDS intervals,
+    periodically rechecking is_still_connected_fn() so a real hangup
+    (however it's eventually detected) doesn't leave this stuck forever,
+    and gives up after SEGMENT_WAIT_TIMEOUT_SECONDS as a hard backstop.
+
+    Returns the path to turn N's now-finalized segment file, or None if
+    the call looks disconnected or this timed out waiting."""
+    this_segment = pattern % index
+    next_segment = pattern % (index + 1)
+    deadline = time.monotonic() + SEGMENT_WAIT_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if os.path.exists(next_segment):
+            return this_segment if os.path.exists(this_segment) else None
+        if not is_still_connected_fn():
+            return None
+        time.sleep(SEGMENT_WAIT_POLL_SECONDS)
+    return None
 
 
 SILENCE_RMS_THRESHOLD = 250.0  # int16 RMS units — tune per SETUP_FACETIME_CALLS.md notes
@@ -1279,52 +1373,76 @@ def handle_call(window_desc, apple_id, dry_run):
     #      is intentionally never called from anywhere in this file
     #      anymore — kept only in case a future, explicit, human-
     #      initiated hangup control is added.
-    while True:
-        if not _call_is_still_connected():
-            # Deliberately _call_is_still_connected() here, NOT
-            # _facetime_is_frontmost() — see the former's docstring for
-            # the real bug that distinction fixes (window focus was
-            # being misread as "call ended"). This checks the actual
-            # in-call controls, not who has keyboard focus, so reading
-            # logs in Terminal mid-call no longer looks like a hangup.
-            print(f"  [{_ts()}] Call ended (FaceTime's in-call controls are gone) — "
-                  "the user ended it, Curant did not.")
-            return
+    # Caller audio is now captured by ONE persistent ffmpeg process for
+    # the entire call, split into rolling per-turn segments by ffmpeg's
+    # own segment muxer -- NOT one fresh ffmpeg invocation per turn (the
+    # old record_caller_audio() approach). Real suspicion behind this
+    # change: live testing showed a call still dropping at an
+    # unpredictable point despite every previously-fixed device-timing
+    # bug being genuinely fixed, and repeatedly opening/closing a capture
+    # session on the SAME device FaceTime is actively rendering into,
+    # mid-call, is the same class of problem per-turn device SWITCHING
+    # already turned out to be. See _start_continuous_capture()'s
+    # docstring for the full reasoning.
+    capture_process = None
+    segment_dir = None
+    try:
+        capture_process, segment_dir, pattern = _start_continuous_capture(TURN_RECORD_SECONDS)
+        print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
 
-        print(f"  [{_ts()}] Starting {TURN_RECORD_SECONDS}s caller-audio recording...")
-        try:
-            wav_path = record_caller_audio(TURN_RECORD_SECONDS)
-        except Exception as e:
-            # Could be a genuinely broken recording setup, but could also
-            # just be the call having ended between the frontmost check
-            # above and now. Either way, Curant still doesn't hang up —
-            # re-check frontmost state and loop; if the call is really
-            # gone, the check at the top of the next iteration returns.
-            print(f"  [{_ts()}] Recording failed (will re-check whether the call is "
-                  f"still up): {e}", file=sys.stderr)
-            time.sleep(RECORDING_FAILURE_RETRY_SECONDS)  # avoid a tight busy-loop if this keeps failing
-            continue
-        print(f"  [{_ts()}] Recording finished.")
-        try:
-            if not _wav_has_speech(wav_path):
-                print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
-                continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
-            text = transcribe(wav_path, cfg)
-        finally:
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-        if not text:
-            continue  # likely silence in this window — just listen again
-        print(f"  [{_ts()}] Caller said: {text}")
-        try:
-            reply = get_reply(text, apple_id)
-        except Exception as e:
-            print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
-            reply = "Sorry, I ran into a problem there — could you say that again?"
-        if reply:
-            print(f"  [{_ts()}] Curant says: {reply}")
-            speak(reply)
-            print(f"  [{_ts()}] Reply playback finished.")
+        turn_index = 0
+        while True:
+            if not _call_is_still_connected():
+                # Deliberately _call_is_still_connected() here, NOT
+                # _facetime_is_frontmost() — see the former's docstring
+                # for the real bug that distinction fixes (window focus
+                # was being misread as "call ended"). This checks the
+                # actual in-call controls, not who has keyboard focus, so
+                # reading logs in Terminal mid-call no longer looks like
+                # a hangup.
+                print(f"  [{_ts()}] Call ended (FaceTime's in-call controls are gone) — "
+                      "the user ended it, Curant did not.")
+                return
+
+            wav_path = _wait_for_next_turn_segment(pattern, turn_index, _call_is_still_connected)
+            if wav_path is None:
+                # Either the connectivity check above already caught a
+                # real end and we're about to loop back to it, or this
+                # specific segment timed out/never got written (e.g. the
+                # capture process died) -- re-check at the top rather
+                # than assuming either one without asking again.
+                time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
+                turn_index += 1  # don't get stuck waiting on the same missing segment forever
+                continue
+            turn_index += 1
+            print(f"  [{_ts()}] Turn segment ready: {os.path.basename(wav_path)}")
+
+            try:
+                if not _wav_has_speech(wav_path):
+                    print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
+                    continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
+                text = transcribe(wav_path, cfg)
+            finally:
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            if not text:
+                continue  # likely silence in this window — just listen again
+            print(f"  [{_ts()}] Caller said: {text}")
+            try:
+                reply = get_reply(text, apple_id)
+            except Exception as e:
+                print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
+                reply = "Sorry, I ran into a problem there — could you say that again?"
+            if reply:
+                print(f"  [{_ts()}] Curant says: {reply}")
+                speak(reply)
+                print(f"  [{_ts()}] Reply playback finished.")
+    finally:
+        if capture_process is not None:
+            _stop_continuous_capture(capture_process)
+        if segment_dir is not None:
+            import shutil
+            shutil.rmtree(segment_dir, ignore_errors=True)
 
 
 def main():
