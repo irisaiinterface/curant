@@ -5260,6 +5260,16 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
                 client_id=pre_client_id,
                 client_secret=pre_client_secret,
                 redirect_uris=[f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"],
+                # Left unset (None), mcp's OAuthClientProvider silently sends NO
+                # client_secret at all in the token exchange — the comment in its
+                # own source says "For 'none' (or absent), don't add any
+                # client_secret" — which is exactly what produced GitHub's
+                # "incorrect_client_credentials" here, nothing to do with a
+                # copy-paste error. client_secret_post is what GitHub's classic
+                # OAuth token endpoint documents (client_id/client_secret both in
+                # the POST body); client_secret_basic (HTTP Basic auth header)
+                # would likely also work but isn't what GitHub's own docs show.
+                token_endpoint_auth_method="client_secret_post" if pre_client_secret else "none",
             )
             await CurantTokenStorage(name).set_client_info(info)
 
