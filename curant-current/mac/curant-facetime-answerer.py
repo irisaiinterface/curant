@@ -790,7 +790,11 @@ def _sox_available():
     return _SOX_AVAILABLE
 
 
-def speak(text, device_name=None):
+SPEAK_INTERRUPT_POLL_SECONDS = 0.5  # how often speak() checks interrupt_check() while playback runs
+SPEAK_MAX_SECONDS = 60  # hard backstop so a stuck playback process can't hang the call forever
+
+
+def speak(text, device_name=None, interrupt_check=None):
     """Same free, local 'standard' tier as curant-watcher.py's
     _tts_macos_say — generates speech and plays it into BlackHole 2ch so
     FaceTime picks it up as the caller-facing "microphone" (see
@@ -824,9 +828,24 @@ def speak(text, device_name=None):
     complaint), this was invisible except by comparing file sizes --
     every greeting and reply was likely going out silent or near-silent
     until this was pinned down. Explicitly naming a known-good voice
-    sidesteps whatever is wrong with this Mac's actual default."""
+    sidesteps whatever is wrong with this Mac's actual default.
+
+    interrupt_check, if given, is a zero-arg callable polled every
+    SPEAK_INTERRUPT_POLL_SECONDS while playback is running (barge-in
+    support, added per explicit request -- previously nothing the caller
+    said could stop a reply already in progress, no matter how long it
+    ran). If it returns truthy, playback is terminated immediately and
+    speak() returns True (interrupted) instead of blocking to the end.
+    Playback now always runs via Popen (not subprocess.run) so it CAN be
+    terminated mid-way -- with interrupt_check=None (e.g. the initial
+    greeting) this just polls in a tight loop until it finishes on its
+    own, same effective behavior as the old blocking call.
+
+    Returns True if playback was interrupted, False if it played to
+    completion (or interrupt_check was never given)."""
     fd, aiff_path = tempfile.mkstemp(suffix=".aiff")
     os.close(fd)
+    interrupted = False
     try:
         subprocess.run(["say", "-v", TTS_VOICE, "-o", aiff_path, text], check=True, timeout=30)
         # `say` exits 0 and produces a well-formed but near-empty AIFF on
@@ -845,17 +864,34 @@ def speak(text, device_name=None):
                   f"Check `say -v {TTS_VOICE} -o /tmp/t.aiff \"test\"` manually.", file=sys.stderr)
         target_device = device_name or TTS_OUTPUT_DEVICE
         if _sox_available():
-            subprocess.run(["sox", aiff_path, "-t", "coreaudio", target_device],
-                            check=True, timeout=60)
+            cmd = ["sox", aiff_path, "-t", "coreaudio", target_device]
         else:
             print("  sox not found (brew install sox) — falling back to afplay via "
                   "system default output, which can drop a live call if the system "
                   "default isn't already this device. Install sox to fix properly.",
                   file=sys.stderr)
-            subprocess.run(["afplay", aiff_path], check=True, timeout=60)
+            cmd = ["afplay", aiff_path]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + SPEAK_MAX_SECONDS
+        while proc.poll() is None:
+            if time.monotonic() > deadline:
+                print(f"  [{_ts()}] speak(): playback exceeded {SPEAK_MAX_SECONDS}s -- killing it "
+                      f"rather than hanging the call.", file=sys.stderr)
+                proc.kill()
+                break
+            if interrupt_check is not None and interrupt_check():
+                interrupted = True
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+                break
+            time.sleep(SPEAK_INTERRUPT_POLL_SECONDS)
     finally:
         if os.path.exists(aiff_path):
             os.remove(aiff_path)
+    return interrupted
 
 
 def record_caller_audio(seconds):
@@ -1251,10 +1287,14 @@ def transcribe(wav_path, cfg):
 
 def get_reply(text, apple_id):
     """Routes through curant-cli's normal relay, same persona/memory/tools
-    as text — just tier='fast' since a live caller is waiting on this,
-    not reading a text at their own pace."""
+    as text — tier='fast' since a live caller is waiting on this, not
+    reading a text at their own pace, and --voice so the reply comes
+    back short and spoken-style instead of formatted like a written
+    paragraph (real bug found live: a caller asked what time it was and
+    got a ~14-second reply written like an email). See curant-cli
+    relay()'s voice_mode docstring for exactly what --voice changes."""
     r = subprocess.run(
-        ["curant-cli", "relay", text, "--apple-id", apple_id, "--tier", "fast"],
+        ["curant-cli", "relay", text, "--apple-id", apple_id, "--tier", "fast", "--voice"],
         capture_output=True, text=True, timeout=45,
     )
     raw = r.stdout.strip()
@@ -1467,6 +1507,72 @@ def _preflight_check_apis(cfg):
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────
 
+class _InterruptWatcher:
+    """Barge-in support for speak(): while a reply is playing, watches
+    the SAME already-running continuous-capture stream (no second
+    device tap -- see _start_continuous_capture's docstring on why
+    touching the capture device more than once per call is exactly the
+    class of bug this whole file has spent most of its history fixing)
+    for a newly-finalized segment with real speech in it. If the caller
+    starts talking while Curant is still mid-reply, check() returns
+    True and speak() kills playback immediately instead of running the
+    reply out to the end.
+
+    Granularity is bounded by TURN_RECORD_SECONDS -- segments only
+    finalize every ~N seconds, so this is "notices within about one
+    segment length that the caller started talking and cuts the reply
+    off there," not sub-second barge-in. Still a real, meaningful
+    change from before: previously nothing the caller said could
+    interrupt a reply already in progress, no matter how long it ran.
+
+    Silent segments that finalize during playback (caller didn't say
+    anything, just normal quiet) are discarded and watching moves on to
+    the next one -- they're not interruptions and aren't worth keeping.
+    """
+
+    def __init__(self, pattern, start_index):
+        self.pattern = pattern
+        self.next_check_index = start_index
+        self.found = None  # (raw_wav_path, mono_wav_path) once triggered
+
+    def check(self):
+        if self.found is not None:
+            return True
+        seg = self.pattern % self.next_check_index
+        nxt = self.pattern % (self.next_check_index + 1)
+        if not (os.path.exists(seg) and os.path.exists(nxt)):
+            return False  # this segment isn't finalized yet -- nothing new to check
+        try:
+            mono = _extract_loudest_channel_mono(seg)
+        except Exception as e:
+            print(f"  [{_ts()}] Interrupt-watch: could not extract a channel from {seg} "
+                  f"({e}) -- using it as-is.", file=sys.stderr)
+            mono = seg
+        if _wav_has_speech(mono, threshold=SILENCE_RMS_THRESHOLD):
+            print(f"  [{_ts()}] Caller spoke during reply playback -- interrupting.")
+            self.found = (seg, mono)
+            return True
+        # Finalized but silent -- not an interruption. Discard and move
+        # the watch window forward to the next segment.
+        try:
+            if os.path.exists(seg):
+                os.remove(seg)
+            if mono != seg and os.path.exists(mono):
+                os.remove(mono)
+        except Exception:
+            pass
+        self.next_check_index += 1
+        return False
+
+    def resume_index(self):
+        """Where the main loop's turn_index should resume after playback
+        ends -- past whatever silent segments were already discarded,
+        and (if triggered) one further past the segment that triggered
+        the interrupt, since that segment is handed directly to the
+        main loop for transcription instead of being waited for again."""
+        return self.next_check_index + (1 if self.found else 0)
+
+
 def handle_call(window_desc, apple_id, dry_run):
     print(f"[{_ts()}] Incoming call detected: {window_desc!r}")
     cfg = _load_config()
@@ -1546,6 +1652,14 @@ def handle_call(window_desc, apple_id, dry_run):
         print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
 
         turn_index = 0
+        # pending_wav, when set, is caller audio that's ALREADY been
+        # captured and confirmed to have speech on it -- specifically,
+        # the segment that triggered an _InterruptWatcher barge-in
+        # during the previous reply's playback. When set, the top of
+        # the loop processes it immediately instead of calling
+        # _wait_for_next_turn_segment() again (which would otherwise
+        # just re-wait for a segment we already have in hand).
+        pending_wav = None
         while True:
             # REMOVED per explicit direction: no more _call_is_still_
             # connected() check here at all -- not once per turn, not
@@ -1562,24 +1676,29 @@ def handle_call(window_desc, apple_id, dry_run):
             # AppleScript check itself contributing to a drop. Curant
             # still never hangs up itself either way.
 
-            wav_path = _wait_for_next_turn_segment(pattern, turn_index)
-            if wav_path is None:
-                # This specific segment timed out or never got written
-                # (e.g. the capture process died) -- loop back and try
-                # the next one rather than assuming the call is over.
-                time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
-                turn_index += 1  # don't get stuck waiting on the same missing segment forever
-                continue
-            turn_index += 1
-            print(f"  [{_ts()}] Turn segment ready: {os.path.basename(wav_path)}")
+            if pending_wav is not None:
+                raw_wav_path, wav_path = pending_wav
+                pending_wav = None
+                print(f"  [{_ts()}] Processing caller audio that interrupted the last reply: "
+                      f"{os.path.basename(raw_wav_path)}")
+            else:
+                raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index)
+                if raw_wav_path is None:
+                    # This specific segment timed out or never got written
+                    # (e.g. the capture process died) -- loop back and try
+                    # the next one rather than assuming the call is over.
+                    time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
+                    turn_index += 1  # don't get stuck waiting on the same missing segment forever
+                    continue
+                turn_index += 1
+                print(f"  [{_ts()}] Turn segment ready: {os.path.basename(raw_wav_path)}")
 
-            raw_wav_path = wav_path
-            try:
-                wav_path = _extract_loudest_channel_mono(raw_wav_path)
-            except Exception as e:
-                print(f"  [{_ts()}] Could not extract a channel from {raw_wav_path} ({e}) -- "
-                      f"using it as-is.", file=sys.stderr)
-                wav_path = raw_wav_path
+                try:
+                    wav_path = _extract_loudest_channel_mono(raw_wav_path)
+                except Exception as e:
+                    print(f"  [{_ts()}] Could not extract a channel from {raw_wav_path} ({e}) -- "
+                          f"using it as-is.", file=sys.stderr)
+                    wav_path = raw_wav_path
 
             # DEBUG AID: if CURANT_FACETIME_DEBUG_KEEP_AUDIO is set, copy
             # every turn's segment to that directory instead of just
@@ -1623,8 +1742,19 @@ def handle_call(window_desc, apple_id, dry_run):
                 reply = "Sorry, I ran into a problem there — could you say that again?"
             if reply:
                 print(f"  [{_ts()}] Curant says: {reply}")
-                speak(reply)
-                print(f"  [{_ts()}] Reply playback finished.")
+                # Barge-in: watch for the caller starting to talk WHILE
+                # this reply is still playing (see _InterruptWatcher's
+                # docstring) and cut playback short if they do, instead
+                # of making them wait out a reply they've already
+                # started talking over.
+                watcher = _InterruptWatcher(pattern, turn_index)
+                interrupted = speak(reply, interrupt_check=watcher.check)
+                turn_index = watcher.resume_index()
+                if interrupted and watcher.found:
+                    print(f"  [{_ts()}] Reply playback interrupted by caller.")
+                    pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
+                else:
+                    print(f"  [{_ts()}] Reply playback finished.")
     finally:
         if capture_process is not None:
             _stop_continuous_capture(capture_process)

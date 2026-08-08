@@ -4063,7 +4063,7 @@ def generate_offline_reply(text, persona_name="Curant"):
     )
 
 
-def relay(message_text, context="", image_path=None, apple_id=None, tier="main"):
+def relay(message_text, context="", image_path=None, apple_id=None, tier="main", voice_mode=False):
     """
     Handle an incoming message entirely locally: verify entitlement (using
     a cached status check, not a live call for every message), build the
@@ -4081,6 +4081,16 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main")
     that need lower latency more than top reasoning quality — currently
     just the experimental FaceTime answerer, where a caller is waiting in
     real time — can pass tier="fast" to use each provider's quicker model.
+
+    voice_mode=True (only ever passed by the FaceTime answerer, via the
+    CLI's --voice flag) appends a spoken-style instruction to the system
+    prompt and caps reply length lower than text's default -- a live
+    caller heard a real reply read out loud that took 14 seconds just to
+    say "I don't have access to your local clock..." formatted like a
+    written paragraph. Text and voice share the exact same persona/
+    memory/instructions; only the delivery-format instruction and the
+    token cap differ here, on purpose -- see build_system_prompt's
+    extra_instruction param.
     """
     config = load_config()
     key = config.get("license_key")
@@ -4157,9 +4167,18 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main")
     is_first_message = len(history) == 0
     urgency = classify_urgency(message_text)
 
+    voice_instruction = (
+        "This message came in through a live FaceTime voice call, not a text -- your reply will be "
+        "read aloud by text-to-speech to someone waiting on the line right now, not read silently as "
+        "text. Talk the way a person actually talks on the phone: short sentences, contractions, no "
+        "markdown, no bullet points or numbered lists, no headers, nothing that only makes sense "
+        "written down. Keep it brief -- a couple of sentences, not a paragraph -- and get to the point "
+        "fast; you can always say more if they ask a follow-up. If you'd normally write a list, say the "
+        "items as a spoken sentence instead (\"a few options: X, Y, or Z\")."
+    ) if voice_mode else None
     system_prompt = build_system_prompt(
-        config, memories, people, context, active_provider=provider,
-        is_first_message=is_first_message, urgency=urgency,
+        config, memories, people, context, extra_instruction=voice_instruction,
+        active_provider=provider, is_first_message=is_first_message, urgency=urgency,
     )
 
     # Local front-door layer, step 2: PII redaction. Applied ONLY to what
@@ -4186,14 +4205,21 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main")
     # tool-calling loop handle this the same way from here on.
     available_tools = get_all_available_tools(config)
 
+    # Voice replies are spoken aloud in real time to someone waiting on
+    # the line, so they're capped shorter than text's 1000-token default
+    # -- 300 tokens is roughly a short paragraph spoken out loud, plenty
+    # for a conversational turn without running long (the instruction
+    # above already asks for brevity; this is a hard backstop in case
+    # the model doesn't fully comply).
+    reply_max_tokens = 300 if voice_mode else 1000
     try:
         if available_tools:
             reply_text = call_llm_with_tools(
                 provider, api_key, system_prompt, history, available_tools, available_tools,
-                max_tokens=1000, tier=tier,
+                max_tokens=reply_max_tokens, tier=tier,
             )
         else:
-            reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=1000, tier=tier)
+            reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=reply_max_tokens, tier=tier)
     except Exception as e:
         # Local front-door layer, step 3: offline fallback. Only
         # attempted after the real call has already failed — this never
@@ -5617,6 +5643,9 @@ def main():
     p_relay.add_argument("--image", default=None, help="Path to an image attachment, internal use")
     p_relay.add_argument("--apple-id", default=None, dest="apple_id",
                           help="Who to deliver an async tool's result to later, internal use")
+    p_relay.add_argument("--voice", action="store_true",
+                          help="This message is from a live voice call (FaceTime) -- reply in short, "
+                               "spoken/conversational style (no markdown/lists), capped shorter than text")
     p_relay.add_argument("--tier", default="main", choices=["main", "fast"],
                           help="Model tier to use — 'fast' for latency-sensitive callers like the FaceTime "
                                "answerer, internal use")
@@ -5704,7 +5733,7 @@ def main():
     elif args.command == "request-release":
         request_release()
     elif args.command == "relay":
-        relay(args.message_text, context=args.context, image_path=args.image, apple_id=args.apple_id, tier=args.tier)
+        relay(args.message_text, context=args.context, image_path=args.image, apple_id=args.apple_id, tier=args.tier, voice_mode=args.voice)
     elif args.command == "run-background-job":
         run_background_job_cmd(args.job_id)
     elif args.command == "pending-background-jobs":
