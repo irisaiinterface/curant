@@ -600,37 +600,39 @@ def _local_search_offsets(center, radii=(0, 15, 30, 50)):
 
 def accept_call():
     """
-    Verify-retry-and-remember: a click 'succeeding' (cliclick exiting 0,
-    or even landing on a template-matched coordinate) doesn't mean the
-    call actually got answered — confirmed live, where a logged
-    "Accepted" click left the banner on screen the whole time. So every
-    click here is followed by a real check (_call_still_ringing) before
-    it's trusted.
+    SIMPLIFIED per explicit direction, after the verify-retry approach
+    was suspected of contributing to call instability: click ONCE and
+    trust it, no _click_and_verify() retry loop, no repeated
+    _call_still_ringing() checks. Every one of those checks is its own
+    osascript invocation -- same reasoning as the connectivity-polling
+    cut in _wait_for_next_turn_segment (see its docstring): more
+    Accessibility-scripting traffic during a call is more chances to
+    trip whatever's causing FaceTime to auto-disconnect. This also
+    fully removes the original phantom-second-click bug class (a
+    misread verification triggering a second click at a now-relocated
+    button) simply by never attempting a second click at all.
 
-    Order of attempts:
-      1. A previously-successful coordinate, if one is cached on disk
-         (fast path — skips screenshotting/matching entirely once this
-         Mac's actual working spot is known).
-      2. Fresh visual template matching, with a small expanding local
-         search around the detected point if the exact match doesn't
-         verify (covers slightly-off scale/detection math, not just
-         totally-wrong guesses).
-      3. The hardcoded ACCEPT_BUTTON_FALLBACK_XY_ENV coordinate, same
-         local-search treatment.
+    Real tradeoff, not hidden: a click that genuinely misses is no
+    longer self-corrected at runtime (no retry, no local-search jitter,
+    no falling through to visual detection after a cache miss's one
+    try). If the cached coordinate goes stale, fix it with
+    CURANT_FACETIME_ACCEPT_XY or by clearing the cache file and
+    re-testing live, not by expecting this function to recover on its
+    own.
 
-    Whichever coordinate is first VERIFIED to work gets saved to
-    CLICK_CACHE_PATH — the next call tries that first before anything
-    else. If the cached spot ever stops working (banner style changes,
-    resolution changes), this naturally falls through to fresh
-    detection again and re-caches whatever works this time.
+    Order of attempts (tries multiple SOURCES, but only ever clicks
+    once, on the first one that has a coordinate available):
+      1. A previously-successful coordinate, if cached on disk.
+      2. Fresh visual template matching, if no cache.
+      3. The hardcoded ACCEPT_BUTTON_FALLBACK_XY_ENV coordinate, if set
+         and steps 1-2 found nothing.
     """
-    attempts = 0
-
     cached = _load_click_cache()
     if cached:
-        attempts += 1
-        if _click_and_verify(*cached, f"attempt {attempts}/cache"):
-            return True, f"clicked cached working coordinate {cached}"
+        _click_at(*cached)
+        print(f"  [{_ts()}] Clicked cached coordinate {cached} (single click, unverified).",
+              file=sys.stderr)
+        return True, f"clicked cached coordinate {cached} (unverified)"
 
     screenshot_path = _capture_screenshot()
     try:
@@ -639,13 +641,11 @@ def accept_call():
         os.remove(screenshot_path)
 
     if found:
-        for point in _local_search_offsets(found):
-            if attempts >= MAX_ACCEPT_ATTEMPTS:
-                break
-            attempts += 1
-            if _click_and_verify(*point, f"attempt {attempts}/visual"):
-                _save_click_cache(point)
-                return True, f"clicked visually-detected accept button (verified) at point {point}"
+        _click_at(*found)
+        _save_click_cache(found)
+        print(f"  [{_ts()}] Clicked visually-detected coordinate {found} (single click, unverified).",
+              file=sys.stderr)
+        return True, f"clicked visually-detected coordinate {found} (unverified)"
 
     fallback = os.environ.get(ACCEPT_BUTTON_FALLBACK_XY_ENV)
     if fallback:
@@ -654,20 +654,17 @@ def accept_call():
             fallback_xy = (int(x_str), int(y_str))
         except Exception:
             return False, f"{ACCEPT_BUTTON_FALLBACK_XY_ENV} ({fallback}) is not valid 'x,y'"
-        for point in _local_search_offsets(fallback_xy):
-            if attempts >= MAX_ACCEPT_ATTEMPTS:
-                break
-            attempts += 1
-            if _click_and_verify(*point, f"attempt {attempts}/fallback"):
-                _save_click_cache(point)
-                return True, f"clicked hardcoded-fallback-derived coordinate (verified) at point {point}"
+        _click_at(*fallback_xy)
+        _save_click_cache(fallback_xy)
+        print(f"  [{_ts()}] Clicked fallback coordinate {fallback_xy} (single click, unverified).",
+              file=sys.stderr)
+        return True, f"clicked fallback coordinate {fallback_xy} (unverified)"
 
     return False, (
-        f"exhausted {attempts} click attempt(s) (cache, visual detection + local search, "
-        f"and{' ' if fallback else ' no '}{ACCEPT_BUTTON_FALLBACK_XY_ENV} fallback) — none "
-        f"verified as actually answering the call. If {ACCEPT_BUTTON_FALLBACK_XY_ENV} isn't "
-        f"set yet, hover your mouse over the real button during a live call and run "
-        f"`cliclick p` to get coordinates, then export {ACCEPT_BUTTON_FALLBACK_XY_ENV}=\"x,y\""
+        f"no coordinate available to click — no cache, visual detection found nothing, and "
+        f"{ACCEPT_BUTTON_FALLBACK_XY_ENV} isn't set. Hover your mouse over the real Accept "
+        f"button during a live call and run `cliclick p` to get coordinates, then export "
+        f"{ACCEPT_BUTTON_FALLBACK_XY_ENV}=\"x,y\""
     )
 
 
@@ -1411,25 +1408,26 @@ def handle_call(window_desc, apple_id, dry_run):
 
         turn_index = 0
         while True:
-            if not _call_is_still_connected():
-                # Deliberately _call_is_still_connected() here, NOT
-                # _facetime_is_frontmost() — see the former's docstring
-                # for the real bug that distinction fixes (window focus
-                # was being misread as "call ended"). This checks the
-                # actual in-call controls, not who has keyboard focus, so
-                # reading logs in Terminal mid-call no longer looks like
-                # a hangup.
-                print(f"  [{_ts()}] Call ended (FaceTime's in-call controls are gone) — "
-                      "the user ended it, Curant did not.")
-                return
+            # REMOVED per explicit direction: no more _call_is_still_
+            # connected() check here at all -- not once per turn, not
+            # ever, during the live-call loop. A call still dropped on
+            # its own even after cutting this down to once per turn (see
+            # _wait_for_next_turn_segment's docstring for that earlier
+            # step), and every remaining osascript invocation is a
+            # remaining suspect for whatever's triggering FaceTime's own
+            # auto-disconnect behavior. Real, accepted tradeoff: this
+            # loop can no longer detect a real hangup at all and will
+            # keep running (recording, transcribing on real speech,
+            # replying) into a dead call until the process is killed
+            # manually -- deliberately preferred over any chance of an
+            # AppleScript check itself contributing to a drop. Curant
+            # still never hangs up itself either way.
 
             wav_path = _wait_for_next_turn_segment(pattern, turn_index)
             if wav_path is None:
-                # Either the connectivity check above already caught a
-                # real end and we're about to loop back to it, or this
-                # specific segment timed out/never got written (e.g. the
-                # capture process died) -- re-check at the top rather
-                # than assuming either one without asking again.
+                # This specific segment timed out or never got written
+                # (e.g. the capture process died) -- loop back and try
+                # the next one rather than assuming the call is over.
                 time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
                 turn_index += 1  # don't get stuck waiting on the same missing segment forever
                 continue
