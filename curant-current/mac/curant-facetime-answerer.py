@@ -252,8 +252,8 @@ def poll_for_incoming_call(dry_run):
     Caveat, genuinely unverified beyond FaceTime: this may also go true
     for OTHER kinds of notifications (Slack, Calendar, etc.), not just
     calls — only tested against a real FaceTime call so far. The
-    corroborating ps check below (FTConversationService actively
-    running) narrows this back down to calls specifically.
+    corroborating checks below narrow this back down to a real FaceTime
+    call specifically.
 
     REVERTED: this briefly had a guard here that skipped detection
     entirely whenever _call_is_still_connected() (FaceTime.app process
@@ -271,7 +271,30 @@ def poll_for_incoming_call(dry_run):
     diagnostic print. The actual phantom-second-click bug this was
     meant to guard against is fixed at its real source instead — see
     _click_and_verify()'s docstring — so this extra guard was removed
-    rather than papered over with a better process check."""
+    rather than papered over with a better process check.
+
+    ADDED (real bug, confirmed live): the two checks below this
+    docstring used to be the ONLY gate, and they weren't enough --
+    after extended call testing left FTConversationService resident in
+    the background (per the note above, it "can stay resident well
+    beyond any single call"), sending a plain text message to this Mac
+    produced a Messages notification banner, which ALSO satisfies the
+    "Notification Center window" check, and with the stale daemon still
+    running, _facetime_call_daemon_active() ALSO returned True -- the
+    combination false-positived as "incoming call," blindly clicked the
+    cached Accept coordinate (nothing real there), played a greeting
+    into a call that didn't exist, and every subsequent turn read
+    RMS=0.0 forever because there was never any real caller audio to
+    capture. This is almost certainly what several "silent call" test
+    runs actually were, not a real audio-routing regression.
+
+    Fix: require a THIRD, genuinely call-specific signal before
+    treating this as a real incoming call -- the same visual
+    template-match already used to actually click Accept
+    (_find_accept_button_visually) must ALSO find the real green Accept
+    button on screen right now. A Messages banner (or any other
+    notification) will never match that template, regardless of
+    whatever FaceTime-adjacent processes happen to still be resident."""
     r = _run_osascript(
         'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
     )
@@ -282,7 +305,32 @@ def poll_for_incoming_call(dry_run):
         return None
     if not _facetime_call_daemon_active():
         return None  # a banner is up, but not a FaceTime call specifically
-    return "FaceTime call banner active (NotificationCenter window detected)"
+    if not _accept_button_visible_now():
+        return None  # a banner is up and the daemon's resident, but no real Accept button on screen
+    return "FaceTime call banner active (NotificationCenter window + FaceTime daemon + visible Accept button)"
+
+
+def _accept_button_visible_now():
+    """Third corroborating signal for poll_for_incoming_call() -- takes a
+    fresh screenshot and runs the SAME template match accept_call() uses
+    to actually click Accept, just to confirm the real button is
+    genuinely on screen right now before this is trusted as a call at
+    all. See poll_for_incoming_call()'s docstring for the false-positive
+    (text notification mistaken for a call) this exists to prevent.
+    Fails safe: any error here (screenshot/template load failure) is
+    treated as "not visible" -- i.e. NOT a call -- rather than risking a
+    false accept on an error."""
+    try:
+        screenshot_path = _capture_screenshot()
+        try:
+            return _find_accept_button_visually(screenshot_path) is not None
+        finally:
+            if os.path.exists(screenshot_path):
+                os.remove(screenshot_path)
+    except Exception as e:
+        print(f"  [{_ts()}] Could not check for a visible Accept button ({e}) -- "
+              f"treating as no call detected, not risking a false accept.", file=sys.stderr)
+        return False
 
 
 def _facetime_call_daemon_active():
