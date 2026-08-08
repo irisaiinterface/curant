@@ -157,6 +157,8 @@ Once the foreground testing above is stable, `com.curant.facetime.plist` runs th
 ```bash
 cp curant-facetime-answerer.py /usr/local/bin/curant-facetime-answerer.py
 chmod +x /usr/local/bin/curant-facetime-answerer.py
+mkdir -p /usr/local/bin/assets
+cp assets/facetime_accept_button.png /usr/local/bin/assets/
 cp com.curant.facetime.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.curant.facetime.plist
 
