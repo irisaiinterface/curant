@@ -159,6 +159,32 @@ TURN_RECORD_SECONDS = 3          # length of each caller-audio recording chunk -
 # hidden: going lower than this risks cutting off mid-word more often.
 RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state after a failed recording
 
+# Real bug fixed live: "sometimes the call cuts, and it still thinks
+# it's the old call." Root cause -- handle_call()'s inner loop has NO
+# hangup detection at all (deliberate, see the loop's own comments:
+# every AppleScript-based connectivity check was removed earlier
+# because polling FaceTime's process/window state too often was
+# suspected of contributing to calls dropping in the first place). So
+# when a call genuinely ends, this function never returns -- it just
+# keeps recording/checking silent segments forever, which ALSO means
+# main()'s outer poll loop never gets control back to notice a real
+# NEW incoming call, because the process is stuck inside handle_call()
+# for the dead one.
+#
+# Fix uses a signal that's already being computed every turn anyway --
+# no new AppleScript calls, no new risk of the disconnect bug this was
+# built around. Real live data from today's debugging: every turn of a
+# genuinely CONNECTED call (even a quiet one, nobody talking) measured
+# RMS in the ~7-18 range -- real, nonzero room-tone noise floor. Every
+# turn of a call that was NOT actually real (the notification-banner
+# false-positive bug, fixed separately today) measured EXACT RMS=0.0 on
+# every channel, every single time. That's a strong, already-observed
+# distinguishing signal: true near-zero RMS sustained over several
+# consecutive turns means there's no real audio source at all anymore
+# -- either the call ended, or was never a real call to begin with.
+TRUE_SILENCE_RMS_THRESHOLD = 1.0  # at/below this = no real audio source, not just a quiet room
+HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS = 6  # ~6 turns at TURN_RECORD_SECONDS=3s each = ~18s of true silence
+
 # NOTE: there is deliberately no MAX_CALL_TURNS anymore. Per explicit
 # direction, Curant must never be the one to end a call — only the human
 # can, by hanging up on their own end. handle_call()'s loop is unbounded
@@ -1214,7 +1240,18 @@ def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
     well under 100; actual speech easily clears several hundred to a
     few thousand. 250 is a conservative starting point — raise it if
     hallucinated turns still get through with a genuinely quiet caller
-    or noisy room, lower it if real quiet speech gets skipped."""
+    or noisy room, lower it if real quiet speech gets skipped.
+
+    CHANGED (2026-08-08): now returns (has_speech, rms) instead of just
+    a bool -- handle_call() needs the raw RMS too, to tell a genuinely
+    CONNECTED-but-quiet call (real room-tone noise floor, RMS ~7-18 in
+    every real call logged so far) apart from a call that's actually
+    ENDED (exact/near-zero RMS across every channel, RMS=0.0 measured
+    repeatedly whenever there was no real FaceTime audio source at
+    all -- see _detect_hangup_from_silence()'s docstring for how this
+    gets used). rms is None only when the file genuinely couldn't be
+    read at all (caller should treat that as inconclusive, not as
+    either signal)."""
     import wave
     import numpy as np
     try:
@@ -1227,7 +1264,7 @@ def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
         print(f"  [{_ts()}] Could not read {wav_path} for silence check ({e}) — "
               f"transcribing anyway rather than silently dropping the turn.",
               file=sys.stderr)
-        return True
+        return True, None
     # Always print what was actually measured, not just the pass/fail
     # verdict -- added live after every single turn of a real 4+ minute
     # call came back "silent" despite the caller speaking clearly. This
@@ -1245,17 +1282,17 @@ def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
     if not frames:
         print(f"  [{_ts()}] WAV check: empty/corrupt segment file -- treating as silent.",
               file=sys.stderr)
-        return False
+        return False, 0.0
     samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
     if samples.size == 0:
         print(f"  [{_ts()}] WAV check: zero samples after decode -- treating as silent.",
               file=sys.stderr)
-        return False
+        return False, 0.0
     rms = float(np.sqrt(np.mean(samples ** 2)))
     duration = n_frames / sample_rate if sample_rate else 0
     print(f"  [{_ts()}] WAV check ({duration:.1f}s): RMS={rms:.1f}/threshold={threshold:.0f} "
           f"-> {'HAS SPEECH' if rms >= threshold else 'silent'}", file=sys.stderr)
-    return rms >= threshold
+    return rms >= threshold, rms
 
 
 _AVFOUNDATION_DEVICE_CACHE = None
@@ -1628,7 +1665,8 @@ class _InterruptWatcher:
             print(f"  [{_ts()}] Interrupt-watch: could not extract a channel from {seg} "
                   f"({e}) -- using it as-is.", file=sys.stderr)
             mono = seg
-        if _wav_has_speech(mono, threshold=SILENCE_RMS_THRESHOLD):
+        has_speech, _rms = _wav_has_speech(mono, threshold=SILENCE_RMS_THRESHOLD)
+        if has_speech:
             print(f"  [{_ts()}] Caller spoke during reply playback -- interrupting.")
             self.found = (seg, mono)
             return True
@@ -1740,6 +1778,14 @@ def handle_call(window_desc, apple_id, dry_run):
         # _wait_for_next_turn_segment() again (which would otherwise
         # just re-wait for a segment we already have in hand).
         pending_wav = None
+        # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring above --
+        # counts consecutive turns with true (not just below-speech-
+        # threshold) silence. Reset to 0 by ANY real signal (speech, or
+        # even just nonzero ambient room noise); once it reaches the
+        # limit, this function returns so main()'s outer loop can go
+        # back to polling for a genuinely new incoming call instead of
+        # staying stuck babysitting a call that's already over.
+        consecutive_true_silent_turns = 0
         while True:
             # REMOVED per explicit direction: no more _call_is_still_
             # connected() check here at all -- not once per turn, not
@@ -1765,8 +1811,17 @@ def handle_call(window_desc, apple_id, dry_run):
                 raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index)
                 if raw_wav_path is None:
                     # This specific segment timed out or never got written
-                    # (e.g. the capture process died) -- loop back and try
-                    # the next one rather than assuming the call is over.
+                    # (e.g. the capture process died, which itself often
+                    # means the call ended and the audio device vanished)
+                    # -- counts toward the same hangup counter as true
+                    # silence, since it's the same underlying signal: no
+                    # real audio coming through anymore.
+                    consecutive_true_silent_turns += 1
+                    if consecutive_true_silent_turns >= HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS:
+                        print(f"  [{_ts()}] Assuming the call has ended -- "
+                              f"{consecutive_true_silent_turns} consecutive turns with no real audio "
+                              f"(segments timing out / true silence). Returning to listen for a new call.")
+                        return
                     time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
                     turn_index += 1  # don't get stuck waiting on the same missing segment forever
                     continue
@@ -1803,7 +1858,25 @@ def handle_call(window_desc, apple_id, dry_run):
                     print(f"  [{_ts()}] Could not copy debug audio: {e}", file=sys.stderr)
 
             try:
-                if not _wav_has_speech(wav_path):
+                has_speech, rms = _wav_has_speech(wav_path)
+                # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring --
+                # rms is None only when the file couldn't be read at all
+                # (inconclusive, don't touch the counter either way).
+                # Real nonzero ambient noise (a connected-but-quiet call)
+                # resets it; sustained true-zero RMS builds toward
+                # assuming the call has actually ended.
+                if rms is not None:
+                    if rms <= TRUE_SILENCE_RMS_THRESHOLD:
+                        consecutive_true_silent_turns += 1
+                        if consecutive_true_silent_turns >= HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS:
+                            print(f"  [{_ts()}] Assuming the call has ended -- "
+                                  f"{consecutive_true_silent_turns} consecutive turns of true digital "
+                                  f"silence (RMS <= {TRUE_SILENCE_RMS_THRESHOLD}), no real audio source "
+                                  f"detected. Returning to listen for a new incoming call.")
+                            return
+                    else:
+                        consecutive_true_silent_turns = 0
+                if not has_speech:
                     print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
                     continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
                 text = transcribe(wav_path, cfg)
