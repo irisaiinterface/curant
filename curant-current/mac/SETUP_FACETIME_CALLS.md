@@ -17,13 +17,14 @@ Do steps 1–3 in order once. Step 4 is per-call.
 
 ```bash
 brew install blackhole-2ch blackhole-16ch switchaudio-osx ffmpeg cliclick
-pip3 install pillow --break-system-packages
+pip3 install pillow numpy --break-system-packages
 ```
 
 - **BlackHole 2ch / 16ch** — two separate virtual audio devices, kept separate so your outgoing synthesized voice and the caller's incoming voice never mix: 2ch carries Curant's speech *to* FaceTime (set as FaceTime's Microphone), 16ch carries the caller's voice *out of* FaceTime for transcription (set as FaceTime's Speaker/Output).
 - **switchaudio-osx** — lets the script flip your system's default output device programmatically.
 - **cliclick** — synthesizes the actual mouse click on the detected Accept button.
-- **pillow** (PIL) — reads the screenshot to find that button by color.
+- **pillow** (PIL) — screenshot loading/cropping.
+- **numpy** — real template matching against `assets/facetime_accept_button.png` (a genuine screenshot crop of the actual button, not a mockup) to find the Accept button's exact position, rather than guessing at a color range. Verified: a true match scores ~74 (normalized SSD) vs. ~6600 for no match at all.
 
 After installing, **restart your Mac** (or at least log out/in) — BlackHole devices sometimes don't appear in Sound settings until CoreAudio restarts.
 

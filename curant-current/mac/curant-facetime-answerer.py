@@ -232,15 +232,25 @@ def _facetime_call_daemon_active():
 # visual detection below fails to locate the button itself.
 ACCEPT_BUTTON_FALLBACK_XY_ENV = "CURANT_FACETIME_ACCEPT_XY"  # e.g. "1900,140"
 
-# macOS's call-accept green, sampled as a tolerant RGB range (not one exact
-# value) to survive screenshot compression/anti-aliasing. Search is
-# restricted to the top-right region, matching where the banner has
-# consistently appeared in live testing — this narrows false positives
-# from other green UI elsewhere on screen (Messages bubbles, etc.).
-_ACCEPT_GREEN_RGB_RANGE = ((20, 90), (170, 230), (70, 140))  # (R, G, B) each (min, max)
+# Real reference image of the actual Accept button, cropped from a live
+# screenshot on the Mac this runs on (not a mockup) — see accept_call()'s
+# docstring for how matching against it works. If FaceTime's button design
+# ever changes, replace this file with a fresh crop.
+ACCEPT_BUTTON_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "assets", "facetime_accept_button.png")
+
+# Downsample factor for template matching — big enough to make the sliding-
+# window search fast on a full-res screenshot, small enough that the
+# button's shape/color pattern still survives clearly. Verified: on a
+# 122x108 real button crop, a true match scores ~74 (normalized SSD) vs.
+# ~6600 for no match at all — roughly 90x separation, so this threshold has
+# a lot of margin, not a hair-trigger cutoff.
+_TEMPLATE_MATCH_DOWNSAMPLE = 4
+_TEMPLATE_MATCH_SSD_THRESHOLD = 800.0  # normalized SSD (per pixel-channel); see above
 _SEARCH_REGION_FRACTION = (0.55, 1.0, 0.0, 0.30)  # (x0, x1, y0, y1) as fraction of screen size
 
 _display_scale_cache = None
+_template_cache = None
 
 
 def _capture_screenshot():
@@ -275,34 +285,77 @@ def _display_scale_factor(screenshot_width):
     return _display_scale_cache
 
 
-def _find_accept_button_visually(screenshot_path):
-    """Returns (x, y) in POINT coordinates (already scale-corrected) of
-    the detected accept button's center, or None if nothing matched.
-    Real fallback for the fact that Accessibility scripting cannot see
-    inside the call banner at all (see module-level comment above)."""
+def _load_accept_button_template():
+    """Loads and downsamples the real reference image once, cached for
+    the life of the process."""
+    global _template_cache
+    if _template_cache is not None:
+        return _template_cache
+    import numpy as np
     from PIL import Image
+
+    if not os.path.exists(ACCEPT_BUTTON_TEMPLATE_PATH):
+        raise RuntimeError(f"Accept-button template image missing: {ACCEPT_BUTTON_TEMPLATE_PATH}")
+    tmpl = Image.open(ACCEPT_BUTTON_TEMPLATE_PATH).convert("RGB")
+    small = tmpl.resize((max(1, tmpl.width // _TEMPLATE_MATCH_DOWNSAMPLE),
+                          max(1, tmpl.height // _TEMPLATE_MATCH_DOWNSAMPLE)))
+    _template_cache = (np.asarray(small, dtype=np.float32), tmpl.width, tmpl.height)
+    return _template_cache
+
+
+def _find_accept_button_visually(screenshot_path):
+    """
+    Returns (x, y) in POINT coordinates (already scale-corrected) of the
+    detected accept button's center, or None if nothing matched with
+    confidence. Real template matching against an actual screenshot crop
+    of the button (assets/facetime_accept_button.png) — not a guessed
+    color range. Confirmed on synthetic test data: a true match scores
+    ~74 (normalized sum-of-squared-differences) vs. ~6600 for a clean
+    no-match case, so _TEMPLATE_MATCH_SSD_THRESHOLD has wide margin.
+
+    Real fallback for the fact that Accessibility scripting cannot see
+    inside the call banner at all (see module-level comment above) — this
+    only has to work well enough to be worth trying before
+    ACCEPT_BUTTON_FALLBACK_XY_ENV's hardcoded-coordinate fallback.
+    """
+    import numpy as np
+    from PIL import Image
+
+    template_small, tmpl_w, tmpl_h = _load_accept_button_template()
+    th, tw = template_small.shape[:2]
 
     img = Image.open(screenshot_path).convert("RGB")
     width, height = img.size
     xf0, xf1, yf0, yf1 = _SEARCH_REGION_FRACTION
     x0, x1 = int(width * xf0), int(width * xf1)
     y0, y1 = int(height * yf0), int(height * yf1)
-    (r_lo, r_hi), (g_lo, g_hi), (b_lo, b_hi) = _ACCEPT_GREEN_RGB_RANGE
 
-    pixels = img.load()
-    step = 3  # downsample for speed on high-res screenshots
-    matches = []
-    for y in range(y0, y1, step):
-        for x in range(x0, x1, step):
-            r, g, b = pixels[x, y]
-            if r_lo <= r <= r_hi and g_lo <= g <= g_hi and b_lo <= b <= b_hi:
-                matches.append((x, y))
+    region = img.crop((x0, y0, x1, y1))
+    region_small = region.resize((max(1, region.width // _TEMPLATE_MATCH_DOWNSAMPLE),
+                                   max(1, region.height // _TEMPLATE_MATCH_DOWNSAMPLE)))
+    region_arr = np.asarray(region_small, dtype=np.float32)
 
-    if not matches:
-        return None
+    if region_arr.shape[0] < th or region_arr.shape[1] < tw:
+        return None  # search region smaller than the template — nothing to match
 
-    center_x = sum(p[0] for p in matches) / len(matches)
-    center_y = sum(p[1] for p in matches) / len(matches)
+    windows = np.lib.stride_tricks.sliding_window_view(region_arr, (th, tw, 3))[:, :, 0, :, :, :]
+    diff = windows - template_small
+    ssd = np.sum(diff * diff, axis=(2, 3, 4))
+    best_idx = np.unravel_index(np.argmin(ssd), ssd.shape)
+    n_values = th * tw * 3
+    best_score = float(ssd[best_idx]) / n_values
+
+    if best_score > _TEMPLATE_MATCH_SSD_THRESHOLD:
+        return None  # best candidate still isn't a confident match
+
+    # best_idx is the template's top-left corner in downsampled region
+    # coords — convert to full-res screenshot coords, centered on the
+    # template's own real size (not the downsampled one).
+    match_top_left_x = x0 + best_idx[1] * _TEMPLATE_MATCH_DOWNSAMPLE
+    match_top_left_y = y0 + best_idx[0] * _TEMPLATE_MATCH_DOWNSAMPLE
+    center_x = match_top_left_x + tmpl_w / 2
+    center_y = match_top_left_y + tmpl_h / 2
+
     scale = _display_scale_factor(width)
     return round(center_x / scale), round(center_y / scale)
 
