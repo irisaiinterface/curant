@@ -916,45 +916,73 @@ def get_reply(text, apple_id):
 
 
 def _call_is_still_connected():
-    """Read-only counterpart to hang_up() — checks whether FaceTime's
-    in-call Decline/End controls still exist, WITHOUT clicking anything.
-    This is what handle_call()'s loop uses to detect the human has ended
-    the call, deliberately NOT _facetime_is_frontmost().
+    """Read-only counterpart to hang_up() — checks whether the call is
+    still connected, WITHOUT clicking anything. This is what
+    handle_call()'s loop uses to detect the human has ended the call,
+    deliberately NOT _facetime_is_frontmost() (see below for why).
 
-    Real bug found live: _facetime_is_frontmost() checks which app
-    currently has WINDOW FOCUS, not whether a call is connected — it was
-    built and validated for a different, narrower purpose (confirming a
-    click just answered a call, checked immediately after clicking, when
-    FaceTime SHOULD momentarily grab focus if it worked). Reusing it as
-    an ongoing "is the call still active" check throughout the whole
-    call was wrong: simply clicking into Terminal to read logs makes
-    FaceTime stop being frontmost with the call still perfectly
-    connected, which handle_call() was then misreading as "the call
-    ended" and silently going quiet — a real, reported bug ("it cuts
-    itself, right before talking"), not an actual FaceTime disconnect.
+    TEMPORARY DIAGNOSTIC MODE, and deliberately LOOSE right now: this
+    was originally written checking specifically for Decline/End named
+    buttons (same names hang_up() guesses at), but that version
+    immediately reported "not connected" on every single real call,
+    right after the greeting, every time — a suspiciously consistent,
+    deterministic failure that (unlike the earlier _facetime_is_frontmost
+    bug, which was timing/focus-dependent and thus variable) points at
+    the button-name check itself being wrong, not an actual disconnect.
+    This makes sense: hang_up()'s Decline/End names were never actually
+    verified against a live FaceTime AUDIO in-call window's real
+    Accessibility tree (only guessed, by analogy) — and we already know
+    from way earlier in this project that FaceTime's PRE-answer banner
+    exposes zero named controls to Accessibility at all; the in-call
+    window may have its own different, unverified structure too.
 
-    Checking for the presence of the actual in-call buttons instead
-    doesn't care about window focus at all — only whether the call
-    itself is still live."""
+    So: this version dumps the real window/button names to stderr every
+    time it runs (so the next live call actually tells us what's there,
+    instead of guessing a third time), and treats the call as still
+    connected as long as the FaceTime process exists and has at least
+    one window — much looser than requiring specific button names,
+    deliberately erring toward NOT ending the call while we don't yet
+    know the real structure. Tighten this back up once the diagnostic
+    output shows the real button/window names.
+
+    Real bug found live that led to needing ANY version of this check:
+    _facetime_is_frontmost() checks which app currently has WINDOW
+    FOCUS, not whether a call is connected — it was built and validated
+    for a different, narrower purpose (confirming a click just answered
+    a call, checked immediately after clicking). Reusing it as an
+    ongoing "is the call still active" check was wrong: clicking into
+    Terminal to read logs makes FaceTime stop being frontmost with the
+    call still perfectly connected, which looked exactly like "Curant
+    cutting the call" even though nothing was ever clicked."""
     script = '''
     tell application "System Events"
+        if not (exists process "FaceTime") then return "NO_PROCESS"
         tell process "FaceTime"
+            set out to ""
             repeat with w in windows
+                set out to out & "WINDOW=" & (name of w)
                 try
-                    if exists (button "Decline" of w) then
-                        return "connected"
-                    end if
-                    if exists (button "End" of w) then
-                        return "connected"
-                    end if
+                    set out to out & " BUTTONS=" & ((name of every button of w) as string)
+                on error errMsg
+                    set out to out & " BUTTONS_ERROR=" & errMsg
                 end try
+                set out to out & " || "
             end repeat
+            if out is "" then return "PROCESS_NO_WINDOWS"
+            return out
         end tell
     end tell
-    return "not_connected"
     '''
     r = _run_osascript(script)
-    return r.returncode == 0 and (r.stdout or "").strip() == "connected"
+    raw = (r.stdout or "").strip()
+    print(f"  [_call_is_still_connected diagnostic] rc={r.returncode} raw={raw!r} "
+          f"stderr={(r.stderr or '').strip()!r}", file=sys.stderr)
+
+    if r.returncode != 0 or raw == "NO_PROCESS":
+        return False
+    # PROCESS_NO_WINDOWS or any window dump at all -> still connected,
+    # deliberately loose (see docstring) until real button names are known.
+    return True
 
 
 def hang_up():
