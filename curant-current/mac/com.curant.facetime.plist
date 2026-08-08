@@ -46,14 +46,17 @@
     <true/>
 
     <!-- launchd does not source .zshrc/.zprofile, so cliclick, ffmpeg,
-         and SwitchAudioSource (installed via Homebrew) won't be found
-         on the default PATH unless it's set explicitly here. Includes
-         both Apple Silicon (/opt/homebrew/bin) and Intel (/usr/local/bin)
-         Homebrew locations since this may run on either. -->
+         SwitchAudioSource (Homebrew), and curant-cli (installed to this
+         Mac's personal ~/bin, confirmed via `which curant-cli`) won't be
+         found on the default PATH unless it's set explicitly here.
+         Without /Users/AbhyudayDhundhel/bin specifically, get_reply()'s
+         subprocess.run(["curant-cli", ...]) fails outright with "No such
+         file or directory" — confirmed live, every single reply on a
+         real test call failed this way until this was added. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
         <!-- approved mode has no caller-ID verification for calls and
              refuses everything by design (see SETUP_FACETIME_CALLS.md) —

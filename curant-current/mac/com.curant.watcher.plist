@@ -7,7 +7,21 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <!-- Deliberately NOT /usr/bin/python3 (Apple's system Python).
+             Same reasoning as com.curant.facetime.plist: this script
+             uses osascript to drive Messages.app (see send_text_reply),
+             which needs Automation/AppleEvents permission — macOS ties
+             that grant to the exact requesting binary, not to whatever
+             terminal/shell launched it. Using the same Homebrew
+             python3.12 already granted permissions for the FaceTime
+             answerer keeps both jobs consistent and avoids needing a
+             second, separate grant for a different binary. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <!-- -u: unbuffered stdout/stderr — without it Python fully
+             block-buffers output when not attached to a real terminal,
+             so StandardOutPath/StandardErrorPath can sit empty for a
+             long time even while the job is genuinely running. -->
+        <string>-u</string>
         <string>/usr/local/bin/curant-watcher.py</string>
     </array>
 
@@ -16,6 +30,20 @@
 
     <key>KeepAlive</key>
     <true/>
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin, confirmed via `which
+         curant-cli`) won't be found on the default PATH unless it's set
+         explicitly here. Without /Users/AbhyudayDhundhel/bin
+         specifically, every subprocess.run(["curant-cli", ...]) call —
+         relay(), report-error, mark-job-delivered — fails outright with
+         "No such file or directory", the same bug confirmed live on the
+         FaceTime answerer's identical launchd setup. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/tmp/curant-watcher.log</string>
@@ -28,11 +56,16 @@
 Install with:
   cp curant-watcher.py /usr/local/bin/curant-watcher.py
   cp com.curant.watcher.plist ~/Library/LaunchAgents/
-  launchctl load ~/Library/LaunchAgents/com.curant.watcher.plist
+  launchctl bootout gui/$(id -u)/app.curant.watcher 2>/dev/null
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.watcher.plist
 
 Check it's running:
-  launchctl list | grep curant
+  launchctl print gui/$(id -u)/app.curant.watcher | grep -E "state|program|last exit"
 
 Logs land at /tmp/curant-watcher.log and /tmp/curant-watcher-error.log
 while testing — move these somewhere more permanent once stable.
+
+Note: `launchctl load`/`unload` (the legacy API) can throw a generic
+"Input/output error" on newer macOS even when nothing is actually
+wrong — use `bootout`/`bootstrap` instead, which give real errors.
 -->
