@@ -1023,11 +1023,25 @@ PROVIDER_MODELS = {
     # confirmed live via a RESOURCE_EXHAUSTED error during FaceTime
     # call testing after a single turn. flash-lite's free tier allows
     # far more requests/day, which matters for calls (one relay call
-    # per turn, tier="fast") but not texts (tier="main", stays on the
-    # higher-quality 3.6-flash — no longer matches Cloud's single-tier
-    # PROVIDER_MODELS["gemini"] entry, which is fine: Cloud has no
-    # main/fast split to harmonize against anyway).
-    "gemini": {"main": "gemini-3.6-flash", "fast": "gemini-3.5-flash-lite"},
+    # per turn, tier="fast").
+    #
+    # "main" moved OFF gemini-3.6-flash too (2026-08-08, same day) —
+    # texts hit the exact same 20/day RPD cap live (confirmed via the
+    # curant-watcher error-detail fix: "Quota exceeded ... limit: 20,
+    # model: gemini-3.6-flash"), because the cap is per-model-per-day
+    # regardless of which feature is calling it, and a single day of
+    # active testing (calls + texts combined) used it up. Moved to
+    # gemini-3.5-flash rather than reusing "fast"'s flash-lite — keeps
+    # the deliberate quality gap between texts (not latency/quota
+    # constrained the same way a live caller is) and calls, while
+    # stepping down from the newest/tightest-quota model to the prior
+    # generation, which free tiers have historically been more generous
+    # with once a newer flagship model exists. Not independently
+    # verified live yet at the time of this change (no RPD figure
+    # confirmed for gemini-3.5-flash specifically) — if this ALSO 429s,
+    # the improved watcher error surfacing will show the real limit
+    # number directly, same as it did for 3.6-flash.
+    "gemini": {"main": "gemini-3.5-flash", "fast": "gemini-3.5-flash-lite"},
 }
 
 DEFAULT_PROVIDER = "anthropic"
