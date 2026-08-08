@@ -1089,6 +1089,38 @@ def main():
     if not args.dry_run:
         _preflight_check_apis(cfg)
 
+        # Set BlackHole as the SYSTEM default input/output BEFORE the poll
+        # loop even starts, not per-call. Reasoning, from a live test: even
+        # with handle_call() switching devices before accept_call() (fixed
+        # the 4-second-drop bug), the caller still heard nothing at all --
+        # despite `SwitchAudioSource -c` confirming the devices WERE
+        # correctly set to BlackHole by the time the call was answered.
+        # That points at FaceTime negotiating a call's audio session
+        # earlier than "Accept" is clicked -- most likely the moment it
+        # starts ringing, before this script's poll loop even detects and
+        # reacts to it. Setting the defaults here, once, at startup, closes
+        # that whole timing window: by the time ANY call comes in -- from
+        # its very first ring -- BlackHole is already the system default,
+        # nothing to race against.
+        #
+        # REAL TRADEOFF, not hidden: while this script is running, this
+        # Mac's system microphone input is BlackHole 2ch, i.e. effectively
+        # silent/dead for anything else that wants the real mic (Zoom,
+        # Voice Memos, etc.) until you stop the script. Acceptable for a
+        # dedicated always-on answering Mac; worth knowing if this Mac is
+        # also used for other calls.
+        print("  Setting system audio devices to BlackHole at startup "
+              "(input+output stay on BlackHole the whole time this runs — "
+              "see comment above main()'s poll loop).")
+        if not set_system_input_device(TTS_OUTPUT_DEVICE):
+            print("  System input device switch failed at startup — calls "
+                  "will likely answer but the caller won't hear anything "
+                  "until this is fixed. See SETUP_FACETIME_CALLS.md.",
+                  file=sys.stderr)
+        if not set_system_output_device(TTS_OUTPUT_DEVICE):
+            print("  System output device switch failed at startup.",
+                  file=sys.stderr)
+
     while True:
         try:
             window_desc = poll_for_incoming_call(args.dry_run)
