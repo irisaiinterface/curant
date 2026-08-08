@@ -567,6 +567,17 @@ def handle_message(msg):
 
     reply_text = reply_data.get("reply", "")
     if not reply_text:
+        # ADDED after a real live gap alongside the error-detail fix
+        # above: this used to return here completely silently -- no
+        # error was reported (reply_data.get("error") was falsy), but
+        # there was also nothing to send, and NOTHING printed either
+        # way. From the terminal alone this looked identical to "still
+        # working" or "succeeded with nothing further to log," when it
+        # was actually a third distinct outcome (curant-cli returned a
+        # legitimately empty reply -- e.g. a genuinely blank string
+        # from the model) that deserves its own visible line.
+        print(f"curant-cli returned no error but an empty reply for message {msg['rowid']} -- "
+              f"nothing sent. Raw response: {reply_json[:300]}", file=sys.stderr)
         return
     reply_format = reply_data.get("reply_format", "text")
 
@@ -574,10 +585,12 @@ def handle_message(msg):
         try:
             audio_path = text_to_speech(reply_text, reply_data.get("voice_tier", "standard"))
             send_voice_reply(msg["sender"], audio_path)
+            print(f"Sent voice reply for message {msg['rowid']}.")
         except Exception:
             report_watcher_error("tts_failed")
     else:
         send_text_reply(msg["sender"], reply_text)
+        print(f"Sent text reply for message {msg['rowid']}.")
 
     # August's specialist tools (image/voice/video generation) attach a
     # locally-generated file to relay()'s output when one was produced
