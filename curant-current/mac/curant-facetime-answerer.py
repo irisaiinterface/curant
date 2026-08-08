@@ -518,18 +518,43 @@ def _find_avfoundation_audio_device_index(device_name):
     return None
 
 
-def transcribe(wav_path, cfg):
-    """Whisper API — the one new external dependency this feature adds.
-    Needs an OpenAI key regardless of which provider you use for actual
-    replies (documented in the module docstring and setup guide)."""
+def _config_api_key(cfg, provider):
+    return (cfg.get("api_keys", {}) or {}).get(provider)
+
+
+def _transcribe_gemini(wav_path, api_key):
+    """Gemini's native audio understanding — no separate transcription
+    service needed if you're already on Gemini for replies. Uses the
+    same native google-genai SDK as curant-cli's Gemini tool-calling
+    path (not the OpenAI-compat shim, which doesn't reliably support
+    audio input) and the same model curant-cli's PROVIDER_MODELS
+    already pins for Gemini, so behavior stays consistent with the
+    rest of Curant rather than picking a different model here."""
+    from google import genai
+    from google.genai import types as genai_types
+
+    client = genai.Client(api_key=api_key)
+    with open(wav_path, "rb") as f:
+        audio_bytes = f.read()
+
+    response = client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=[
+            "Transcribe this audio verbatim. Reply with ONLY the transcript "
+            "text, nothing else — no commentary, no quotation marks. If "
+            "there is no discernible speech (silence or just noise), reply "
+            "with an empty string.",
+            genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def _transcribe_openai_whisper(wav_path, api_key):
+    """OpenAI's Whisper API — the original transcription path, still
+    available as a fallback for anyone not using Gemini as their
+    provider."""
     import requests
-    api_key = (cfg.get("api_keys", {}) or {}).get("openai") or os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "No OpenAI API key configured — needed for call transcription "
-            "even if you use a different provider for replies. Run: "
-            "curant-cli set-api-key <key> --provider openai"
-        )
     with open(wav_path, "rb") as f:
         resp = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
@@ -540,6 +565,28 @@ def transcribe(wav_path, cfg):
         )
     resp.raise_for_status()
     return resp.json().get("text", "").strip()
+
+
+def transcribe(wav_path, cfg):
+    """Tries Gemini first (native audio understanding, no separate
+    account needed if that's already your provider), falls back to
+    OpenAI's Whisper if a Gemini key isn't configured but an OpenAI one
+    is. Raises with clear instructions for both options if neither key
+    is set."""
+    gemini_key = _config_api_key(cfg, "gemini") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gemini_key:
+        return _transcribe_gemini(wav_path, gemini_key)
+
+    openai_key = _config_api_key(cfg, "openai") or os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        return _transcribe_openai_whisper(wav_path, openai_key)
+
+    raise RuntimeError(
+        "No API key configured for call transcription. Either: "
+        "curant-cli set-api-key <key> --provider gemini (uses Gemini's native "
+        "audio understanding, no separate service), or "
+        "curant-cli set-api-key <key> --provider openai (uses Whisper)."
+    )
 
 
 def get_reply(text, apple_id):

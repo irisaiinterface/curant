@@ -101,13 +101,19 @@ The script automates one piece of this automatically: it sets your **system defa
 
 ## 6. Confirm the transcription dependency
 
-Call transcription uses OpenAI's Whisper API regardless of which provider (Anthropic/Gemini/OpenAI) you use for replies:
+Call transcription tries Gemini first (native audio understanding — no separate service needed if that's already your provider), and falls back to OpenAI's Whisper only if no Gemini key is configured:
+
+```bash
+curant-cli set-api-key <key> --provider gemini
+```
+
+If you're on Anthropic and don't want a Gemini account, use Whisper instead:
 
 ```bash
 curant-cli set-api-key sk-... --provider openai
 ```
 
-This is a real, ongoing cost per call minute on top of whatever your reply-generation provider costs.
+Either way, this is a real, ongoing cost per call minute on top of whatever your reply-generation provider costs.
 
 ---
 
