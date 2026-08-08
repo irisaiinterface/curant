@@ -999,18 +999,36 @@ def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
     import numpy as np
     try:
         with wave.open(wav_path, "rb") as w:
-            frames = w.readframes(w.getnframes())
+            n_frames = w.getnframes()
+            n_channels = w.getnchannels()
+            sample_rate = w.getframerate()
+            frames = w.readframes(n_frames)
     except Exception as e:
-        print(f"  Could not read {wav_path} for silence check ({e}) — "
+        print(f"  [{_ts()}] Could not read {wav_path} for silence check ({e}) — "
               f"transcribing anyway rather than silently dropping the turn.",
               file=sys.stderr)
         return True
+    # Always print what was actually measured, not just the pass/fail
+    # verdict -- added live after every single turn of a real 4+ minute
+    # call came back "silent" despite the caller speaking clearly. This
+    # makes the next test tell us whether the clip is genuinely near-
+    # zero (routing/device problem) or just under-threshold real audio
+    # (threshold too high), instead of guessing between those two very
+    # different problems.
+    print(f"  [{_ts()}] WAV check: {n_frames} frames, {n_channels}ch, {sample_rate}Hz "
+          f"({n_frames / sample_rate if sample_rate else 0:.2f}s)", file=sys.stderr)
     if not frames:
+        print(f"  [{_ts()}] WAV check: zero frames read -- empty/corrupt segment file.",
+              file=sys.stderr)
         return False
     samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
     if samples.size == 0:
+        print(f"  [{_ts()}] WAV check: zero samples after decode.", file=sys.stderr)
         return False
     rms = float(np.sqrt(np.mean(samples ** 2)))
+    peak = float(np.max(np.abs(samples)))
+    print(f"  [{_ts()}] WAV check: RMS={rms:.1f} peak={peak:.0f} threshold={threshold:.0f} "
+          f"-> {'HAS SPEECH' if rms >= threshold else 'silent'}", file=sys.stderr)
     return rms >= threshold
 
 
@@ -1433,6 +1451,23 @@ def handle_call(window_desc, apple_id, dry_run):
                 continue
             turn_index += 1
             print(f"  [{_ts()}] Turn segment ready: {os.path.basename(wav_path)}")
+
+            # DEBUG AID: if CURANT_FACETIME_DEBUG_KEEP_AUDIO is set, copy
+            # every turn's segment to that directory instead of just
+            # deleting it after the silence check -- added live after
+            # every turn of a real call kept reading "silent" and there
+            # was no way to actually listen to what was captured to tell
+            # whether that was really true. Off by default (adds disk
+            # I/O and leaves files behind) -- only meant to be turned on
+            # for a single diagnostic test call.
+            debug_keep_dir = os.environ.get("CURANT_FACETIME_DEBUG_KEEP_AUDIO")
+            if debug_keep_dir:
+                try:
+                    os.makedirs(debug_keep_dir, exist_ok=True)
+                    import shutil as _shutil
+                    _shutil.copy2(wav_path, os.path.join(debug_keep_dir, os.path.basename(wav_path)))
+                except Exception as e:
+                    print(f"  [{_ts()}] Could not copy debug audio: {e}", file=sys.stderr)
 
             try:
                 if not _wav_has_speech(wav_path):
