@@ -662,6 +662,48 @@ def record_caller_audio(seconds):
     return wav_path
 
 
+SILENCE_RMS_THRESHOLD = 250.0  # int16 RMS units — tune per SETUP_FACETIME_CALLS.md notes
+
+
+def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
+    """Cheap voice-activity gate run BEFORE spending an API call on
+    transcription. transcribe()'s Gemini prompt already asks for an
+    empty string on silence, but live testing found that instruction
+    isn't reliable: given a near-silent clip (e.g. because BlackHole
+    16ch was never actually selected as FaceTime's Speaker for that
+    call — a manual per-call step, see SETUP_FACETIME_CALLS.md step 5),
+    Gemini can confabulate a fluent, entirely invented sentence instead
+    of reporting silence. That's worse than just skipping a turn — it's
+    a fabricated statement put in a real caller's mouth. So this
+    doesn't trust the model's self-report; it measures the actual
+    recorded audio's RMS against a noise-floor threshold first, and
+    skips calling transcribe() at all if the clip looks silent.
+
+    Threshold is in int16 PCM RMS units. Empirically: normal room noise
+    floor recorded through BlackHole with nothing playing tends to sit
+    well under 100; actual speech easily clears several hundred to a
+    few thousand. 250 is a conservative starting point — raise it if
+    hallucinated turns still get through with a genuinely quiet caller
+    or noisy room, lower it if real quiet speech gets skipped."""
+    import wave
+    import numpy as np
+    try:
+        with wave.open(wav_path, "rb") as w:
+            frames = w.readframes(w.getnframes())
+    except Exception as e:
+        print(f"  Could not read {wav_path} for silence check ({e}) — "
+              f"transcribing anyway rather than silently dropping the turn.",
+              file=sys.stderr)
+        return True
+    if not frames:
+        return False
+    samples = np.frombuffer(frames, dtype=np.int16).astype(np.float64)
+    if samples.size == 0:
+        return False
+    rms = float(np.sqrt(np.mean(samples ** 2)))
+    return rms >= threshold
+
+
 _AVFOUNDATION_DEVICE_CACHE = None
 
 
@@ -906,6 +948,8 @@ def handle_call(window_desc, apple_id, dry_run):
             print(f"  Recording failed: {e}", file=sys.stderr)
             break
         try:
+            if not _wav_has_speech(wav_path):
+                continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
             text = transcribe(wav_path, cfg)
         finally:
             if os.path.exists(wav_path):
