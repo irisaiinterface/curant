@@ -4048,7 +4048,7 @@ def generate_offline_reply(text, persona_name="Curant"):
     )
 
 
-def relay(message_text, context="", image_path=None, apple_id=None):
+def relay(message_text, context="", image_path=None, apple_id=None, tier="main"):
     """
     Handle an incoming message entirely locally: verify entitlement (using
     a cached status check, not a live call for every message), build the
@@ -4061,6 +4061,11 @@ def relay(message_text, context="", image_path=None, apple_id=None):
 
     Always prints structured JSON so curant-watcher.py's json.loads() never
     breaks, matching the previous client/server contract.
+
+    tier defaults to "main" (the full model) for normal text relay. Callers
+    that need lower latency more than top reasoning quality — currently
+    just the experimental FaceTime answerer, where a caller is waiting in
+    real time — can pass tier="fast" to use each provider's quicker model.
     """
     config = load_config()
     key = config.get("license_key")
@@ -4170,10 +4175,10 @@ def relay(message_text, context="", image_path=None, apple_id=None):
         if available_tools:
             reply_text = call_llm_with_tools(
                 provider, api_key, system_prompt, history, available_tools, available_tools,
-                max_tokens=1000, tier="main",
+                max_tokens=1000, tier=tier,
             )
         else:
-            reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=1000, tier="main")
+            reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=1000, tier=tier)
     except Exception as e:
         # Local front-door layer, step 3: offline fallback. Only
         # attempted after the real call has already failed — this never
@@ -5478,6 +5483,9 @@ def main():
     p_relay.add_argument("--image", default=None, help="Path to an image attachment, internal use")
     p_relay.add_argument("--apple-id", default=None, dest="apple_id",
                           help="Who to deliver an async tool's result to later, internal use")
+    p_relay.add_argument("--tier", default="main", choices=["main", "fast"],
+                          help="Model tier to use — 'fast' for latency-sensitive callers like the FaceTime "
+                               "answerer, internal use")
 
     p_bg_job = sub.add_parser("run-background-job", help="Internal — runs a slow tool call in a detached process")
     p_bg_job.add_argument("job_id", type=int)
@@ -5562,7 +5570,7 @@ def main():
     elif args.command == "request-release":
         request_release()
     elif args.command == "relay":
-        relay(args.message_text, context=args.context, image_path=args.image, apple_id=args.apple_id)
+        relay(args.message_text, context=args.context, image_path=args.image, apple_id=args.apple_id, tier=args.tier)
     elif args.command == "run-background-job":
         run_background_job_cmd(args.job_id)
     elif args.command == "pending-background-jobs":
