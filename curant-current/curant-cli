@@ -551,8 +551,27 @@ def save_config(config):
 # ever holds one person's data, on their own machine.
 
 def get_local_db():
-    conn = sqlite3.connect(LOCAL_DB_PATH)
+    # timeout + WAL: this db is now genuinely hit by TWO independent
+    # long-running processes at once -- curant-watcher.py (texts) and
+    # curant-facetime-answerer.py (calls) each spawn their own
+    # `curant-cli relay` subprocess per message/turn, and a text and a
+    # call can land at the same moment. Default sqlite3.connect() (no
+    # WAL, 5s default busy timeout, rollback-journal mode) blocks ALL
+    # readers/writers for the duration of any other connection's write
+    # transaction -- fine for one process hitting this db, a real
+    # "database is locked" risk with two. WAL mode lets readers proceed
+    # concurrently with a writer (only writer-vs-writer still
+    # serializes), and an explicit longer busy_timeout means a brief
+    # writer-vs-writer collision retries instead of immediately raising
+    # OperationalError. WAL is set on every connection open (not just
+    # once) because it's a per-connection PRAGMA in older SQLite
+    # versions bundled with some Python builds -- cheap enough (a single
+    # PRAGMA read/write) to not matter given how short-lived these
+    # connections already are.
+    conn = sqlite3.connect(LOCAL_DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
     return conn
 
 
