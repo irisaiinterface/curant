@@ -5234,6 +5234,35 @@ def mcp_add_oauth_cmd(name, url, transport="http"):
                     result = await session.list_tools()
                     return [t.name for t in result.tools]
 
+    # Some servers (GitHub's official remote MCP, confirmed as of this
+    # writing) don't support RFC 7591 dynamic client registration at
+    # all — registration just 404s. This is a known, widely-reported
+    # limitation of the ecosystem, not something curant-cli's flow can
+    # work around automatically: those servers need a real,
+    # pre-registered OAuth App Client ID (GitHub's official IDE
+    # integrations ship with one baked in; third-party tools don't get
+    # one for free). If the customer has set one up themselves
+    # (github.com/settings/developers -> New OAuth App, callback URL
+    # http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback), seed it here so
+    # OAuthClientProvider finds existing client_info and skips
+    # registration entirely rather than attempting (and failing) DCR.
+    pre_client_id = os.environ.get("CURANT_OAUTH_CLIENT_ID")
+    pre_client_secret = os.environ.get("CURANT_OAUTH_CLIENT_SECRET")
+    if pre_client_id:
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        async def _seed_client_info():
+            info = OAuthClientInformationFull(
+                client_id=pre_client_id,
+                client_secret=pre_client_secret,
+                redirect_uris=[f"http://127.0.0.1:{OAUTH_CALLBACK_PORT}/callback"],
+            )
+            await CurantTokenStorage(name).set_client_info(info)
+
+        asyncio.run(_seed_client_info())
+        print(f"Using a pre-registered OAuth Client ID for '{name}' (skipping dynamic "
+              f"client registration).")
+
     def _describe_exception(e):
         """anyio/httpx2's TaskGroup wraps real failures in an
         ExceptionGroup, whose own str() is just a useless summary count
