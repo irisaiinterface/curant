@@ -380,6 +380,30 @@ def relay_to_curant(text, context="", image_path=None):
     return result.stdout.strip()
 
 
+def screen_with_curant(sender, text, contact_name=None):
+    """
+    Calls curant-cli's screen-message subcommand for a text from someone
+    who is NOT the customer -- see handle_message()'s branch below for
+    when this is actually reached (only ever when CURANT_TEXT_ACCESS_MODE
+    is "open"; in "approved" mode fetch_new_messages() never even returns
+    a non-customer sender's messages in the first place). This never
+    replies to the third party directly -- it returns an action telling
+    handle_message() to either silently ignore the message (spam) or
+    text the CUSTOMER a heads-up asking what they want done, per the
+    real incident this whole path exists to prevent (see the text/call
+    access-mode split comment above)."""
+    args = ["curant-cli", "screen-message", sender, text]
+    if contact_name:
+        args += ["--contact-name", contact_name]
+    result = subprocess.run(args, capture_output=True, text=True)
+    try:
+        return json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, ValueError):
+        print(f"screen-message returned non-JSON output: {result.stdout[:300]!r} "
+              f"(stderr: {result.stderr[:300]!r})", file=sys.stderr)
+        return None
+
+
 def _load_curant_config():
     """Reads curant-cli's config.json directly rather than importing
     curant-cli as a module — the two are separate scripts, and this is
@@ -652,6 +676,41 @@ def resolve_contact_name(handle):
 
 
 def handle_message(msg):
+    # Non-customer sender screening: only reachable at all when
+    # CURANT_TEXT_ACCESS_MODE is "open" -- fetch_new_messages() already
+    # filters to CUSTOMER_HANDLES-only in "approved" mode, so a
+    # non-customer msg["sender"] literally can't appear there. This is
+    # the funnel that replaces the old (real incident, see the
+    # access-mode split above) behavior of directly relaying and
+    # auto-replying to ANY sender: a third party is NEVER handed to
+    # relay()/full reply generation here -- screen_with_curant() only
+    # ever comes back with "silently ignore" (spam) or "tell the
+    # customer and let them decide," never an auto-reply to the sender.
+    if msg["sender"] not in CUSTOMER_HANDLES:
+        contact_name = resolve_contact_name(msg["sender"])
+        text = msg["text"] or ("[sent an attachment]" if msg["has_attachment"] else "")
+        who = f"{contact_name} ({msg['sender']})" if contact_name else f"unresolved handle {msg['sender']}"
+        print(f"Incoming message, rowid {msg['rowid']}, from NON-CUSTOMER sender {who} — screening, not relaying.")
+        result = screen_with_curant(msg["sender"], text, contact_name=contact_name)
+        if result is None:
+            report_watcher_error("screen_message_failed")
+            return
+        action = result.get("action")
+        if action == "ignore":
+            print(f"  Screened as: ignore ({result.get('reason', 'no reason given')})")
+            return
+        elif action == "notify_owner":
+            notice = result.get("notice") or f"You got a text from {who} — want me to reply?"
+            if CUSTOMER_APPLE_ID:
+                send_text_reply(CUSTOMER_APPLE_ID, notice)
+                print("  Screened as: notified you about it.")
+            else:
+                print("  Screened as: notify_owner, but no CUSTOMER_APPLE_ID configured to notify.",
+                      file=sys.stderr)
+        else:
+            print(f"  screen-message returned an unrecognized action: {result!r}", file=sys.stderr)
+        return
+
     # REWRITTEN (2026-08-08) to cover multiple attachments per message
     # and, critically, to never leave a sender with total silence when
     # something couldn't be processed. Previously: an unsupported

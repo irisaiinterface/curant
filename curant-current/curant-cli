@@ -740,6 +740,26 @@ def init_local_db():
         if "auth_mode" not in mcp_cols:
             conn.execute("ALTER TABLE mcp_servers ADD COLUMN auth_mode TEXT DEFAULT 'none'")
             conn.commit()
+        # People-memory expansion (2026-08-09): important_people used to be
+        # a free-text name/relationship/note blob with no way to tie an
+        # entry back to a real iMessage handle, and no dedicated fields for
+        # gender/role — added directly in response to a real incident (see
+        # curant-watcher.py's text/call access-mode split) where texts from
+        # people Curant had no record of at all got engaged with directly,
+        # with no way to even ask "who is this" first. handle is what lets
+        # an incoming message's sender be matched against a real person
+        # (see get_person_by_handle); is_spam is what lets a number be
+        # permanently filtered after being flagged once (see
+        # set_person_spam) instead of re-bothering the customer on every
+        # future message from the same spammer.
+        people_cols = {row["name"] for row in conn.execute("PRAGMA table_info(important_people)")}
+        if "handle" not in people_cols:
+            conn.execute("ALTER TABLE important_people ADD COLUMN handle TEXT")
+            conn.execute("ALTER TABLE important_people ADD COLUMN gender TEXT")
+            conn.execute("ALTER TABLE important_people ADD COLUMN role TEXT")
+            conn.execute("ALTER TABLE important_people ADD COLUMN is_spam INTEGER DEFAULT 0")
+            conn.execute("ALTER TABLE important_people ADD COLUMN updated_at TEXT")
+            conn.commit()
     os.chmod(LOCAL_DB_PATH, 0o600)  # this db holds memories/history — owner-only
 
 
@@ -762,9 +782,96 @@ def delete_memory_by_content(content):
 
 
 def get_important_people():
+    # Excludes anyone flagged is_spam -- a spam-marked handle shouldn't
+    # keep showing up in "people who matter to this customer" context
+    # just because a row still exists for it (see set_person_spam).
     with closing(get_local_db()) as conn:
-        rows = conn.execute("SELECT name, relationship, note FROM important_people").fetchall()
+        rows = conn.execute(
+            "SELECT name, relationship, note, handle, gender, role, is_spam "
+            "FROM important_people WHERE is_spam IS NOT 1"
+        ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_person_by_handle(handle):
+    """Local people-memory lookup keyed on a real iMessage handle (phone
+    number or email) -- this is what lets an incoming text's sender be
+    matched to someone Curant actually has a record of, as opposed to
+    get_important_people()'s free-text name matching. Returns None if no
+    row has this exact handle."""
+    if not handle:
+        return None
+    with closing(get_local_db()) as conn:
+        row = conn.execute(
+            "SELECT name, relationship, note, handle, gender, role, is_spam "
+            "FROM important_people WHERE handle = ?", (handle,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_person(handle, name=None, relationship=None, note=None, gender=None, role=None):
+    """Creates or updates a person record keyed on handle. Only fields
+    actually passed (non-None) overwrite what's already stored -- calling
+    this with just a name after a handle already has a role/note saved
+    doesn't blow those away. Used by the remember_person tool (see
+    get_all_available_tools) so Curant can save what it's told about a
+    person mid-conversation ("that's Aarav, my friend from college") and
+    recall it on their next message."""
+    if not handle:
+        raise ValueError("upsert_person requires a handle")
+    existing = get_person_by_handle(handle)
+    with closing(get_local_db()) as conn:
+        if existing:
+            conn.execute(
+                """UPDATE important_people SET
+                       name = COALESCE(?, name),
+                       relationship = COALESCE(?, relationship),
+                       note = COALESCE(?, note),
+                       gender = COALESCE(?, gender),
+                       role = COALESCE(?, role),
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE handle = ?""",
+                (name, relationship, note, gender, role, handle),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO important_people (name, relationship, note, handle, gender, role, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (name or handle, relationship, note, handle, gender, role),
+            )
+        conn.commit()
+    return get_person_by_handle(handle)
+
+
+def set_person_spam(handle, is_spam=True):
+    """Flags (or un-flags) a handle as spam. A spam-marked handle is
+    filtered by curant-watcher.py's screening path (see the `screen`
+    subcommand) BEFORE it ever reaches the customer as a notification --
+    the point is to stop bothering the customer with the same spammer
+    over and over, not just to hide it from get_important_people()'s
+    context. Creates a minimal record if this handle has no person row
+    yet (most spam never will)."""
+    if not handle:
+        raise ValueError("set_person_spam requires a handle")
+    existing = get_person_by_handle(handle)
+    with closing(get_local_db()) as conn:
+        if existing:
+            conn.execute(
+                "UPDATE important_people SET is_spam = ?, updated_at = CURRENT_TIMESTAMP WHERE handle = ?",
+                (1 if is_spam else 0, handle),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO important_people (name, handle, is_spam, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (handle, handle, 1 if is_spam else 0),
+            )
+        conn.commit()
+
+
+def is_spam_handle(handle):
+    with closing(get_local_db()) as conn:
+        row = conn.execute("SELECT is_spam FROM important_people WHERE handle = ?", (handle,)).fetchone()
+        return bool(row and row["is_spam"])
 
 
 def get_history(limit=20):
@@ -1363,6 +1470,40 @@ def _get_server_tools_cached(server):
     return tools
 
 
+def lookup_macos_contact(handle):
+    """Real macOS Contacts.app lookup by phone/email, via AppleScript --
+    same mechanism curant-watcher.py's resolve_contact_name() uses, kept
+    as an independent copy here (not imported) because curant-cli and
+    curant-watcher.py are separate standalone scripts, not a shared
+    package. Used as a fallback by the lookup_person tool when a handle
+    has no local people-memory row yet, so Curant can still recognize a
+    real contact even before anyone's told it anything about them.
+    Fails soft: returns None on any error (Contacts access not granted,
+    AppleScript failure, no match) rather than raising."""
+    if not handle:
+        return None
+    safe_handle = handle.replace(chr(34), chr(92) + chr(34))
+    script = (
+        'tell application "Contacts"\n'
+        '    set matchedPeople to {}\n'
+        '    try\n'
+        f'        set matchedPeople to (people whose (value of emails contains "{safe_handle}") or (value of phones contains "{safe_handle}"))\n'
+        '    end try\n'
+        '    if (count of matchedPeople) > 0 then\n'
+        '        return name of item 1 of matchedPeople\n'
+        '    else\n'
+        '        return ""\n'
+        '    end if\n'
+        'end tell\n'
+    )
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        found = (r.stdout or "").strip()
+        return found if (r.returncode == 0 and found) else None
+    except Exception:
+        return None
+
+
 def get_all_available_tools(config):
     """
     Aggregates tools from every enabled MCP server into one flat list,
@@ -1409,6 +1550,82 @@ def get_all_available_tools(config):
         },
         "server_command": None,
         "raw_name": "log_capability_gap",
+        "builtin": True,
+    })
+
+    # People-memory tools -- always available, same reasoning as
+    # log_capability_gap above (no MCP server involved, no confirmation
+    # needed: these only ever read/write LOCAL people-memory, they never
+    # send anything to anyone). Added directly in response to a real
+    # incident where Curant had no way to know who it was even talking
+    # to beyond a raw handle, and no way to record what the customer
+    # told it about a person for next time -- see PORTABLE_MEMORY_SPEC.md
+    # for how this data is exported, and curant-watcher.py's `screen`
+    # subcommand for how is_spam actually gets enforced on incoming texts.
+    tools.append({
+        "qualified_name": "lookup_person",
+        "description": (
+            "Look up what's known about a person by their iMessage handle (phone number or "
+            "email) -- checks local people-memory first, then falls back to the real macOS "
+            "Contacts app if nothing's saved locally yet. Use this whenever a message mentions "
+            "someone, or when you need to recall who a specific handle belongs to, rather than "
+            "guessing or treating a raw number as anonymous."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"handle": {"type": "string", "description": "Phone number or email (iMessage handle) to look up"}},
+            "required": ["handle"],
+        },
+        "server_command": None,
+        "raw_name": "lookup_person",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "remember_person",
+        "description": (
+            "Save or update what you know about a person, keyed on their iMessage handle (phone "
+            "number or email) -- name, relationship/how the customer knows them, role, gender, "
+            "and a free-text note. Only pass the fields you actually have new information for; "
+            "anything omitted keeps its previously saved value. Use this whenever the customer "
+            "tells you who someone is (e.g. 'that's Aarav, my friend from college') so you "
+            "recognize them next time instead of asking again."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Phone number or email (iMessage handle)"},
+                "name": {"type": "string", "description": "Their name"},
+                "relationship": {"type": "string", "description": "How the customer knows them, e.g. 'friend from college', 'sister', 'coworker'"},
+                "role": {"type": "string", "description": "Their role, e.g. 'landlord', 'manager', 'doctor'"},
+                "gender": {"type": "string", "description": "Their gender, if known/relevant"},
+                "note": {"type": "string", "description": "Any other free-text detail worth remembering about them"},
+            },
+            "required": ["handle"],
+        },
+        "server_command": None,
+        "raw_name": "remember_person",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "mark_sender_as_spam",
+        "description": (
+            "Flag (or unflag) an iMessage handle as spam. Once marked, curant-watcher.py's "
+            "message screening silently drops future incoming texts from that handle instead of "
+            "notifying the customer about them again. Only call this when the customer explicitly "
+            "says to block/mark a number as spam, or it's unmistakably spam/marketing content -- "
+            "never guess on an ordinary unknown person, that should go through the normal "
+            "'ask the customer who this is' screening flow instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Phone number or email (iMessage handle) to mark"},
+                "is_spam": {"type": "boolean", "description": "true to mark as spam, false to un-mark (default true)"},
+            },
+            "required": ["handle"],
+        },
+        "server_command": None,
+        "raw_name": "mark_sender_as_spam",
         "builtin": True,
     })
 
@@ -2866,6 +3083,53 @@ def execute_tool_call(tool_name, arguments, available_tools):
             return "[No description provided — nothing was logged.]"
         return log_capability_gap(description)
 
+    if match["builtin"] and tool_name == "lookup_person":
+        handle = (arguments.get("handle") or "").strip()
+        if not handle:
+            return "[No handle provided — nothing to look up.]"
+        person = get_person_by_handle(handle)
+        if person:
+            bits = [f"name: {person['name']}"]
+            if person.get("relationship"):
+                bits.append(f"relationship: {person['relationship']}")
+            if person.get("role"):
+                bits.append(f"role: {person['role']}")
+            if person.get("gender"):
+                bits.append(f"gender: {person['gender']}")
+            if person.get("note"):
+                bits.append(f"note: {person['note']}")
+            if person.get("is_spam"):
+                bits.append("(marked as spam)")
+            return "Found in local people-memory — " + "; ".join(bits)
+        contact_name = lookup_macos_contact(handle)
+        if contact_name:
+            return (f"No local people-memory for this handle, but it matches '{contact_name}' in the "
+                    f"Mac's Contacts app — nothing else is known about them yet. Consider calling "
+                    f"remember_person once you learn more (relationship, role, etc.).")
+        return "No record of this handle anywhere — not in local people-memory, not in Contacts. Unknown person."
+
+    if match["builtin"] and tool_name == "remember_person":
+        handle = (arguments.get("handle") or "").strip()
+        if not handle:
+            return "[No handle provided — nothing was saved.]"
+        person = upsert_person(
+            handle,
+            name=arguments.get("name"),
+            relationship=arguments.get("relationship"),
+            note=arguments.get("note"),
+            gender=arguments.get("gender"),
+            role=arguments.get("role"),
+        )
+        return f"Saved — {person['name']} ({handle}) is now remembered."
+
+    if match["builtin"] and tool_name == "mark_sender_as_spam":
+        handle = (arguments.get("handle") or "").strip()
+        if not handle:
+            return "[No handle provided — nothing was marked.]"
+        is_spam = arguments.get("is_spam", True)
+        set_person_spam(handle, is_spam=bool(is_spam))
+        return f"{handle} is now {'marked as spam — future texts from them will be silently dropped' if is_spam else 'un-marked as spam'}."
+
     if match["builtin"] and tool_name == "shell_exec":
         config = load_config()
         output, error = shell_exec(
@@ -3911,7 +4175,16 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
             "use this naturally, don't just recite it back):\n" + live_context
         )
     if people:
-        people_str = "\n".join(f"- {p['name']} ({p['relationship']}): {p['note']}" for p in people)
+        def _person_line(p):
+            bits = [p.get("relationship") or ""]
+            if p.get("role"):
+                bits.append(f"role: {p['role']}")
+            if p.get("gender"):
+                bits.append(f"gender: {p['gender']}")
+            descriptor = ", ".join(b for b in bits if b)
+            note = f": {p['note']}" if p.get("note") else ""
+            return f"- {p['name']} ({descriptor}){note}" if descriptor else f"- {p['name']}{note}"
+        people_str = "\n".join(_person_line(p) for p in people)
         system_parts.append(f"People who matter to this customer:\n{people_str}")
     if addons:
         system_parts.append(f"Unlocked add-ons: {', '.join(addons)}. You may use these capabilities.")
@@ -4472,6 +4745,84 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
         "voice_tier": config.get("voice_tier", "standard"),
         "attachment_path": attachment_path,
     }))
+
+
+def _looks_like_spam(handle, text):
+    """Lightweight, explainable heuristic for obvious marketing/automated
+    spam -- deliberately conservative (false negatives are fine, a
+    missed spam text just falls through to the normal "ask the customer"
+    screening path; false POSITIVES are the expensive mistake here,
+    since a match here auto-marks the handle as spam and future real
+    messages from them go silently dropped). Two real, well-known
+    signals, not guesses:
+      1. Common carrier/marketing spam phrasing (opt-out language, prize/
+         urgency bait) -- the same kind of boilerplate every SMS spam
+         filter looks for.
+      2. US short-code senders (5-6 digit numeric handles) -- these are
+         registered exclusively for bulk/automated SMS (marketing,
+         verification codes, alerts), never a real person's personal
+         number, so a message FROM one is essentially never someone the
+         customer needs to personally screen.
+    """
+    text_lower = (text or "").lower()
+    spam_phrases = (
+        "reply stop", "text stop to", "unsubscribe", "you've won", "you have won",
+        "claim your prize", "verification code", "limited time offer", "act now",
+        "call now", "free gift", "no cost to you", "% off today only", "msg & data rates",
+    )
+    if any(p in text_lower for p in spam_phrases):
+        return True
+    digits = (handle or "").lstrip("+")
+    if digits.isdigit() and len(digits) in (5, 6):
+        return True
+    return False
+
+
+def screen_message(sender, text, contact_name=None):
+    """
+    Decides what curant-watcher.py should do with an incoming text from
+    someone who is NOT the customer (a third party) -- the customer's own
+    messages always go straight through relay() unchanged; this is only
+    reached when CURANT_TEXT_ACCESS_MODE=open lets other people's texts
+    through the door at all. See curant-watcher.py's text/call
+    access-mode split for the incident this whole screening layer exists
+    to prevent: a third party never gets auto-replied to here, ever --
+    the only two outcomes are "silently ignore" (spam) or "tell the
+    customer, let THEM decide" (everyone else, known or not). Actually
+    replying to a third party on the customer's behalf isn't built yet;
+    see the comment at this function's call site in curant-watcher.py.
+
+    Always prints exactly one JSON object to stdout:
+      {"action": "ignore", "reason": "..."}
+      {"action": "notify_owner", "notice": "...", "sender": "...", "resolved_name": "..." or null}
+    """
+    init_local_db()
+
+    if is_spam_handle(sender):
+        print(json.dumps({"action": "ignore", "reason": "marked as spam"}))
+        return
+
+    person = get_person_by_handle(sender)
+    if person is None and _looks_like_spam(sender, text):
+        set_person_spam(sender, is_spam=True)
+        print(json.dumps({"action": "ignore", "reason": "heuristic spam match — marked spam so it won't ask again"}))
+        return
+
+    resolved_name = contact_name or (person.get("name") if person else None) or lookup_macos_contact(sender)
+    preview = (text or "").strip()
+    if len(preview) > 200:
+        preview = preview[:200] + "…"
+    who = f"{resolved_name} ({sender})" if resolved_name else f"an unknown number ({sender})"
+    known_note = ""
+    if person and (person.get("relationship") or person.get("role")):
+        known_note = f" You've got them saved as: {person.get('relationship') or ''} {person.get('role') or ''}.".strip()
+    notice = (
+        f"You got a text from {who} that I haven't replied to — I only ever text people back if "
+        f"it's you, or you've told me to.{known_note}\n\nTheir message: \"{preview}\"\n\n"
+        f"Want me to reply, and if so what should I say? (Or tell me to mark them as spam if this "
+        f"isn't someone you know.)"
+    )
+    print(json.dumps({"action": "notify_owner", "notice": notice, "sender": sender, "resolved_name": resolved_name}))
 
 
 def proactive_check(context):
@@ -5840,6 +6191,12 @@ def main():
                           help="Model tier to use — 'fast' for latency-sensitive callers like the FaceTime "
                                "answerer, internal use")
 
+    p_screen = sub.add_parser("screen-message", help="Decide what to do with a text from a non-customer sender (internal use, watcher only)")
+    p_screen.add_argument("sender", help="The sender's iMessage handle (phone number or email)")
+    p_screen.add_argument("message_text")
+    p_screen.add_argument("--contact-name", default=None, dest="contact_name",
+                          help="Name already resolved from Contacts.app by the watcher, if any")
+
     p_bg_job = sub.add_parser("run-background-job", help="Internal — runs a slow tool call in a detached process")
     p_bg_job.add_argument("job_id", type=int)
 
@@ -5924,6 +6281,8 @@ def main():
         request_release()
     elif args.command == "relay":
         relay(args.message_text, context=args.context, image_path=args.image, apple_id=args.apple_id, tier=args.tier, voice_mode=args.voice)
+    elif args.command == "screen-message":
+        screen_message(args.sender, args.message_text, contact_name=args.contact_name)
     elif args.command == "run-background-job":
         run_background_job_cmd(args.job_id)
     elif args.command == "pending-background-jobs":
