@@ -1504,6 +1504,32 @@ def lookup_macos_contact(handle):
         return None
 
 
+def send_imessage(to_handle, text):
+    """Sends a REAL iMessage from this Mac to a third-party handle, via
+    AppleScript -- the actual mechanism behind the send_message_to_person
+    tool. Deliberately independent of the normal reply path: watcher.py's
+    send_text_reply() always targets whoever's thread relay() is already
+    handling (the customer); this is curant-cli itself initiating a NEW
+    outbound message to someone ELSE, as a real side effect of a tool
+    call mid-conversation. Returns (success, error_or_None) -- never
+    raises, same contract as the other tool-backing functions in this
+    file."""
+    safe_text = text.replace(chr(34), chr(92) + chr(34))
+    safe_handle = to_handle.replace(chr(34), chr(92) + chr(34))
+    script = (
+        'tell application "Messages"\n'
+        '    set targetService to 1st service whose service type = iMessage\n'
+        f'    set targetBuddy to buddy "{safe_handle}" of targetService\n'
+        f'    send "{safe_text}" to targetBuddy\n'
+        'end tell\n'
+    )
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        return r.returncode == 0, ((r.stderr or "").strip() or None)
+    except Exception as e:
+        return False, str(e)
+
+
 def get_all_available_tools(config):
     """
     Aggregates tools from every enabled MCP server into one flat list,
@@ -1626,6 +1652,33 @@ def get_all_available_tools(config):
         },
         "server_command": None,
         "raw_name": "mark_sender_as_spam",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "send_message_to_person",
+        "description": (
+            "Send a REAL iMessage to someone who is NOT the customer -- a genuine external effect, same "
+            "confirmation bar as fill_and_submit_form: requires confirmed=true, and only ever set that "
+            "AFTER the customer has explicitly confirmed, in a PRIOR message, that they want this exact "
+            "message sent -- never in the same turn you first bring it up, and never on a standing "
+            "assumption that a past 'yes' covers a new, different message later. Appropriate uses: the "
+            "customer directly asks you to text someone something ('tell Aarav I'll be 10 min late'), or "
+            "is replying to your own heads-up about an unrecognized text ('yes reply to them and say...'). "
+            "The recipient handle must already be a known, recognized contact (call lookup_person first) "
+            "-- if it can't be identified from local people-memory or the Mac's Contacts app, ask the "
+            "customer to confirm the exact number/email rather than sending blind to an unverified handle."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "The recipient's phone number or email (iMessage handle)"},
+                "text": {"type": "string", "description": "The exact message to send"},
+                "confirmed": {"type": "boolean", "description": "Must be true — set only after the customer has explicitly confirmed, in a prior message, that this exact message should be sent."},
+            },
+            "required": ["handle", "text", "confirmed"],
+        },
+        "server_command": None,
+        "raw_name": "send_message_to_person",
         "builtin": True,
     })
 
@@ -3129,6 +3182,29 @@ def execute_tool_call(tool_name, arguments, available_tools):
         is_spam = arguments.get("is_spam", True)
         set_person_spam(handle, is_spam=bool(is_spam))
         return f"{handle} is now {'marked as spam — future texts from them will be silently dropped' if is_spam else 'un-marked as spam'}."
+
+    if match["builtin"] and tool_name == "send_message_to_person":
+        handle = (arguments.get("handle") or "").strip()
+        text_to_send = (arguments.get("text") or "").strip()
+        confirmed = arguments.get("confirmed", False)
+        if not handle or not text_to_send:
+            return "[Missing handle or text — nothing was sent.]"
+        if not confirmed:
+            return ("[Refused: send_message_to_person requires confirmed=true, set only after the "
+                     "customer has explicitly confirmed IN A PRIOR MESSAGE that this exact message "
+                     "should be sent. Ask them to confirm first, then call this again.]")
+        person = get_person_by_handle(handle)
+        if person and person.get("is_spam"):
+            return f"[Refused: {handle} is marked as spam — not sending to them.]"
+        known_name = (person.get("name") if person else None) or lookup_macos_contact(handle)
+        if not known_name:
+            return (f"[Refused: {handle} isn't a recognized contact — no local people-memory and no "
+                     f"match in the Mac's Contacts app. Confirm the exact number/email with the customer, "
+                     f"or save it first with remember_person, before sending.]")
+        ok, error = send_imessage(handle, text_to_send)
+        if ok:
+            return f"Sent to {known_name} ({handle})."
+        return f"Failed to send to {known_name} ({handle}): {error or 'unknown error'}"
 
     if match["builtin"] and tool_name == "shell_exec":
         config = load_config()
