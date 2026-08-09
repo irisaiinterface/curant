@@ -4262,11 +4262,19 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
 
     # Voice replies are spoken aloud in real time to someone waiting on
     # the line, so they're capped shorter than text's 1000-token default
-    # -- 300 tokens is roughly a short paragraph spoken out loud, plenty
-    # for a conversational turn without running long (the instruction
-    # above already asks for brevity; this is a hard backstop in case
-    # the model doesn't fully comply).
-    reply_max_tokens = 300 if voice_mode else 1000
+    # -- LOWERED further, 300 -> 150 (2026-08-08, explicit "make
+    # transcription and response faster" request): fewer tokens the
+    # model has to generate is a direct, proportional latency win on
+    # top of the earlier brevity instruction (which asks nicely but
+    # doesn't bound worst case) -- 150 tokens is still a genuine couple
+    # of spoken sentences, not a single word, but caps a rambling reply
+    # far more aggressively than 300 did. Real tradeoff, not hidden: a
+    # reply that genuinely needs more room (a longer explanation the
+    # caller actually asked for) gets cut off mid-thought instead of
+    # finishing -- raise this back up if that starts happening in real
+    # calls, using the per-turn timing now printed by the FaceTime
+    # answerer to see the actual token-count-vs-latency tradeoff.
+    reply_max_tokens = 150 if voice_mode else 1000
     try:
         if available_tools:
             reply_text = call_llm_with_tools(

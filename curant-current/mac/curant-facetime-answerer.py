@@ -1879,7 +1879,16 @@ def handle_call(window_desc, apple_id, dry_run):
                 if not has_speech:
                     print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
                     continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
+                # TIMED (2026-08-08, added per explicit request to make
+                # transcription/response faster): rather than guess at
+                # what's slow, measure the two real API round trips
+                # directly so the NEXT live test shows exactly where
+                # the time is going instead of another round of
+                # speculation. See get_reply() below for the matching
+                # timer on the reply side.
+                _transcribe_start = time.monotonic()
                 text = transcribe(wav_path, cfg)
+                _transcribe_elapsed = time.monotonic() - _transcribe_start
             finally:
                 if os.path.exists(raw_wav_path):
                     os.remove(raw_wav_path)
@@ -1887,14 +1896,16 @@ def handle_call(window_desc, apple_id, dry_run):
                     os.remove(wav_path)
             if not text:
                 continue  # likely silence in this window — just listen again
-            print(f"  [{_ts()}] Caller said: {text}")
+            print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
+            _reply_start = time.monotonic()
             try:
                 reply = get_reply(text, apple_id)
             except Exception as e:
                 print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
                 reply = "Sorry, I ran into a problem there — could you say that again?"
+            _reply_elapsed = time.monotonic() - _reply_start
             if reply:
-                print(f"  [{_ts()}] Curant says: {reply}")
+                print(f"  [{_ts()}] Curant says: {reply} (reply generation took {_reply_elapsed:.2f}s)")
                 # Barge-in: watch for the caller starting to talk WHILE
                 # this reply is still playing (see _InterruptWatcher's
                 # docstring) and cut playback short if they do, instead
