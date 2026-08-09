@@ -174,10 +174,25 @@ def fetch_new_messages(since_rowid):
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".heic", ".gif", ".webp", ".bmp", ".tiff"}
 AUDIO_EXTENSIONS = {".caf", ".m4a", ".mp3", ".wav", ".aac"}
+PDF_EXTENSIONS = {".pdf"}  # ADDED (2026-08-08) -- see extract_pdf_text() below
+
+# ADDED (2026-08-08): cap on how much extracted PDF text gets sent
+# along in a single turn -- an uncapped multi-hundred-page PDF would
+# blow up the token budget (and cost) of a single text-reply turn.
+# 15000 characters is roughly 5-10 pages of normal-density text, plenty
+# for the vast majority of real documents (receipts, letters, forms,
+# short reports) while still bounding the worst case.
+PDF_TEXT_CHAR_LIMIT = 15000
 
 
-def get_attachment_path(rowid):
-    """Look up the file path of an attachment (voice memo or image) on a given message."""
+def get_attachment_paths(rowid):
+    """Look up file paths of ALL attachments on a given message, not just
+    the first one. CHANGED (2026-08-08) from the old get_attachment_path
+    (singular, fetchone()) -- a message with multiple attachments (e.g.
+    two photos sent together) previously only ever saw the first one,
+    the rest silently ignored with no indication to the sender. Returns
+    a list of existing, expanded file paths (attachments that no longer
+    exist on disk are skipped here, not left for callers to re-check)."""
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
@@ -186,20 +201,26 @@ def get_attachment_path(rowid):
         FROM message_attachment_join
         JOIN attachment ON message_attachment_join.attachment_id = attachment.ROWID
         WHERE message_attachment_join.message_id = ?
+        ORDER BY attachment.ROWID ASC
         """,
         (rowid,),
     )
-    row = cur.fetchone()
+    rows = cur.fetchall()
     conn.close()
-    if row and row["filename"]:
-        return os.path.expanduser(row["filename"])
-    return None
+    paths = []
+    for row in rows:
+        if row["filename"]:
+            p = os.path.expanduser(row["filename"])
+            if os.path.exists(p):
+                paths.append(p)
+    return paths
 
 
 def classify_attachment(file_path):
-    """Returns 'image', 'audio', or 'other' based on file extension —
-    determines whether the watcher transcribes it (audio) or passes it
-    straight through for the model to actually look at (image)."""
+    """Returns 'image', 'audio', 'pdf', or 'other' based on file
+    extension -- determines whether the watcher transcribes it (audio),
+    extracts text from it (pdf), or passes it straight through for the
+    model to actually look at (image)."""
     if not file_path:
         return "other"
     ext = os.path.splitext(file_path)[1].lower()
@@ -207,6 +228,8 @@ def classify_attachment(file_path):
         return "image"
     if ext in AUDIO_EXTENSIONS:
         return "audio"
+    if ext in PDF_EXTENSIONS:
+        return "pdf"
     return "other"
 
 
@@ -215,15 +238,73 @@ def transcribe_voice_memo(file_path):
     Local transcription via Whisper — keeps audio on-device, matching
     the honesty/privacy brand commitment. Requires: pip install
     openai-whisper, and ffmpeg installed via brew.
+
+    CHANGED (2026-08-08): now returns (text_or_None, error_or_None)
+    instead of just text_or_None -- callers used to only be able to
+    tell "it failed," never WHY, which meant a sender whose voice memo
+    genuinely couldn't be transcribed (missing dependency, corrupt
+    file, whatever) got total silence back with no idea their message
+    was ever received at all. error is a short, sender-safe reason
+    string (never a raw exception/traceback) suitable for actually
+    telling them what happened.
     """
     try:
         import whisper
-        model = whisper.load_model("base")  # "small"/"medium" for better accuracy, more RAM/CPU
-        result = model.transcribe(file_path)
-        return result["text"].strip()
     except ImportError:
         print("Whisper not installed — run: pip install openai-whisper --break-system-packages")
-        return None
+        return None, "the voice-to-text engine (Whisper) isn't installed on this Mac yet"
+    try:
+        model = whisper.load_model("base")  # "small"/"medium" for better accuracy, more RAM/CPU
+        result = model.transcribe(file_path)
+        text = (result.get("text") or "").strip()
+        if not text:
+            return None, "I couldn't make out any speech in that voice memo"
+        return text, None
+    except Exception as e:
+        print(f"Whisper transcription failed for {file_path}: {e}", file=sys.stderr)
+        return None, "something went wrong transcribing that voice memo"
+
+
+def extract_pdf_text(file_path):
+    """
+    ADDED (2026-08-08): text extraction for PDF attachments, previously
+    an unsupported attachment type entirely (silently skipped with no
+    reply at all). Uses pypdf (lightweight, local -- no attachment
+    content leaves the device just to extract text, same on-device
+    principle as transcribe_voice_memo's Whisper use). Requires: pip
+    install pypdf --break-system-packages.
+
+    Returns (text_or_None, error_or_None), same contract as
+    transcribe_voice_memo -- error is always a short, sender-safe
+    reason, never a raw exception.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        print("pypdf not installed — run: pip install pypdf --break-system-packages")
+        return None, "I can't read PDFs yet (the PDF library isn't installed on this Mac)"
+    try:
+        reader = PdfReader(file_path)
+        if getattr(reader, "is_encrypted", False):
+            try:
+                reader.decrypt("")  # only handles PDFs with an empty/no real password
+            except Exception:
+                return None, "that PDF is password-protected, so I can't read it"
+        pages_text = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            if page_text:
+                pages_text.append(page_text)
+        full_text = "\n\n".join(pages_text).strip()
+        if not full_text:
+            return None, "I couldn't find any readable text in that PDF (it may be a scanned image with no text layer)"
+        truncated = len(full_text) > PDF_TEXT_CHAR_LIMIT
+        if truncated:
+            full_text = full_text[:PDF_TEXT_CHAR_LIMIT] + "\n\n[...PDF truncated, it was longer than I can read in one go...]"
+        return full_text, None
+    except Exception as e:
+        print(f"PDF extraction failed for {file_path}: {e}", file=sys.stderr)
+        return None, "something went wrong reading that PDF"
 
 
 def get_calendar_and_reminders_context():
@@ -505,36 +586,92 @@ def run_proactive_check():
 
 
 def handle_message(msg):
+    # REWRITTEN (2026-08-08) to cover multiple attachments per message
+    # and, critically, to never leave a sender with total silence when
+    # something couldn't be processed. Previously: an unsupported
+    # attachment type, a failed transcription, or a missing attachment
+    # file all just logged locally and returned -- the sender had no
+    # way to know their message was even received. See
+    # get_attachment_paths/transcribe_voice_memo/extract_pdf_text's
+    # docstrings for the individual pieces this assembles.
     image_path = None
+    content_parts = []       # successfully-extracted text (caption, transcripts, PDF text)
+    failure_notes = []       # sender-safe one-line reasons for anything that DIDN'T work
+    extra_image_count = 0
+
     if msg["has_attachment"]:
-        attachment_path = get_attachment_path(msg["rowid"])
-        if not attachment_path or not os.path.exists(attachment_path):
-            print(f"Attachment not found for message {msg['rowid']}, skipping.")
+        attachment_paths = get_attachment_paths(msg["rowid"])
+        if not attachment_paths:
+            # Either genuinely no attachment found, or it was deleted/
+            # moved before we could read it -- still worth telling the
+            # sender rather than silently dropping their message.
+            print(f"Attachment(s) not found on disk for message {msg['rowid']}.")
             report_watcher_error("attachment_not_found")
+            send_text_reply(msg["sender"],
+                             "I saw you sent something, but couldn't find the file on this end "
+                             "— could you try sending it again?")
             return
-        kind = classify_attachment(attachment_path)
-        if kind == "image":
-            # Passed straight through — curant-cli sends it to the model
-            # directly rather than this script trying to describe it.
-            # The message's own caption text (if any) still comes along
-            # as the accompanying text; an image with no caption still
-            # gets sent so the model can react to it on its own.
-            image_path = attachment_path
-            text = msg["text"] or ""
-        elif kind == "audio":
-            text = transcribe_voice_memo(attachment_path)
-            if not text:
-                report_watcher_error("transcription_failed")
-                return
-        else:
-            print(f"Unrecognized attachment type for message {msg['rowid']}, skipping.")
-            report_watcher_error("attachment_not_found")
-            return
-    else:
-        text = msg["text"]
+
+        for attachment_path in attachment_paths:
+            kind = classify_attachment(attachment_path)
+            if kind == "image":
+                if image_path is None:
+                    # Passed straight through — curant-cli sends it to
+                    # the model directly rather than this script trying
+                    # to describe it. Only the FIRST image is actually
+                    # attached to the model call (curant-cli's relay()
+                    # only accepts a single image_path today); real
+                    # limitation, not hidden -- see extra_image_count
+                    # below for how additional images are handled.
+                    image_path = attachment_path
+                else:
+                    extra_image_count += 1
+            elif kind == "audio":
+                transcript, error = transcribe_voice_memo(attachment_path)
+                if transcript:
+                    content_parts.append(f"[Voice memo transcript]: {transcript}")
+                else:
+                    failure_notes.append(f"a voice memo — {error}")
+            elif kind == "pdf":
+                pdf_text, error = extract_pdf_text(attachment_path)
+                if pdf_text:
+                    content_parts.append(f"[PDF content ({os.path.basename(attachment_path)})]:\n{pdf_text}")
+                else:
+                    failure_notes.append(f"a PDF ({os.path.basename(attachment_path)}) — {error}")
+            else:
+                failure_notes.append(f"a {os.path.splitext(attachment_path)[1] or 'file'} attachment "
+                                      f"— I can't read that file type yet (only images, voice memos, "
+                                      f"and PDFs right now)")
+
+        if extra_image_count:
+            failure_notes.append(f"{extra_image_count} additional image(s) — I can only actually "
+                                  f"look at one image per message right now, so I only saw the first one")
+
+    caption = msg["text"] or ""
+    if caption:
+        content_parts.insert(0, caption)
+    text = "\n\n".join(content_parts)
 
     if not text and not image_path:
+        # Nothing usable came out of this message at all -- if there
+        # were attachment failures, that's WHY, and the sender deserves
+        # to know rather than being met with silence. If there's
+        # nothing here and no failures either (e.g. a genuinely empty
+        # message), stay silent same as before -- nothing to say.
+        if failure_notes:
+            report_watcher_error("attachment_not_found")
+            note_text = "; ".join(failure_notes)
+            send_text_reply(msg["sender"], f"I got your message, but ran into a problem with it: {note_text}.")
         return
+
+    if failure_notes:
+        # Partial success -- got SOMETHING usable (a caption, another
+        # attachment that worked fine), but at least one thing in this
+        # message didn't come through. Still worth flagging rather than
+        # quietly ignoring the part that failed, but not worth blocking
+        # the reply to whatever DID work.
+        print(f"  Partial attachment failure(s) for message {msg['rowid']}: {failure_notes}",
+              file=sys.stderr)
 
     print(f"Incoming message, rowid {msg['rowid']}" + (" (with image)" if image_path else ""))
     live_context = get_calendar_and_reminders_context()
