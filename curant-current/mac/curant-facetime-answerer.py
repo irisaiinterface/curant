@@ -117,11 +117,16 @@ USAGE
                  to sanity-check detection before letting it answer
                  anything for real.
 
-ACCESS CONTROL: honors the same CURANT_ACCESS_MODE the watcher uses,
-but with a real capability gap for calls specifically — see the
-REGRESSION note above and caller_is_approved()'s docstring. "approved"
-mode currently refuses every call; "open" mode answers every call, with
-no verification of who's calling.
+ACCESS CONTROL: uses its OWN access-mode setting, CURANT_CALL_ACCESS_MODE
+(config key "call_access_mode") -- deliberately separate from
+curant-watcher.py's CURANT_TEXT_ACCESS_MODE, after a real incident where
+sharing one switch between calls and texts meant opening call access for
+testing silently opened text access to everyone too (see
+_read_call_access_mode()'s docstring). There's also a real capability gap
+for calls specifically — see the REGRESSION note above and
+caller_is_approved()'s docstring. "approved" mode currently refuses every
+call; "open" mode answers every call, with no verification of who's
+calling.
 """
 
 from __future__ import annotations
@@ -243,10 +248,21 @@ def _read_customer_handles(cfg):
     return primary, ordered
 
 
-def _read_access_mode(cfg):
-    mode = (os.environ.get("CURANT_ACCESS_MODE") or cfg.get("access_mode") or "approved").strip().lower()
+def _read_call_access_mode(cfg):
+    """DELIBERATELY a separate key (CURANT_CALL_ACCESS_MODE / config
+    "call_access_mode") from curant-watcher.py's text access mode
+    (CURANT_TEXT_ACCESS_MODE / "text_access_mode") -- these used to share
+    one CURANT_ACCESS_MODE / "access_mode" key, and a real incident
+    confirmed why that was unsafe: setting it to "open" here (needed
+    because 'approved' mode can't verify caller ID at all yet -- see
+    caller_is_approved()) also silently opened the TEXT watcher to
+    answering literally anyone who texted the customer's real number,
+    with no separate signal that had happened. Two independent keys
+    means testing/enabling one feature's open access can never again
+    silently do the same to the other."""
+    mode = (os.environ.get("CURANT_CALL_ACCESS_MODE") or cfg.get("call_access_mode") or "approved").strip().lower()
     if mode not in ("approved", "open"):
-        print(f"Unrecognized CURANT_ACCESS_MODE '{mode}' — falling back to 'approved'.", file=sys.stderr)
+        print(f"Unrecognized CURANT_CALL_ACCESS_MODE '{mode}' — falling back to 'approved'.", file=sys.stderr)
         mode = "approved"
     return mode
 
@@ -791,16 +807,18 @@ def caller_is_approved(window_desc, cfg):
     calling. Only 'open' mode (already an explicit, documented
     no-allowlist choice for the text watcher too) will actually answer.
     """
-    mode = _read_access_mode(cfg)
+    mode = _read_call_access_mode(cfg)
     if mode == "open":
-        return True, "open access mode (caller ID verification not implemented for calls)"
+        return True, "open call access mode (caller ID verification not implemented for calls)"
     return False, (
         "approved mode requires verifying the caller, but caller-ID text isn't "
         "readable from the call banner (Accessibility scripting can't see it — "
         "confirmed by testing) — refusing to auto-answer rather than answer an "
-        "unverified caller. Set CURANT_ACCESS_MODE=open if you want this Mac to "
-        "auto-answer any FaceTime call regardless of who it's from, or build OCR-based "
-        "caller-ID reading before trusting 'approved' mode for calls."
+        "unverified caller. Set CURANT_CALL_ACCESS_MODE=open if you want this Mac to "
+        "auto-answer any FaceTime call regardless of who it's from (this no longer "
+        "affects text access at all -- see CURANT_TEXT_ACCESS_MODE in curant-watcher.py "
+        "separately), or build OCR-based caller-ID reading before trusting 'approved' "
+        "mode for calls."
     )
 
 
@@ -1950,7 +1968,7 @@ def main():
     print("curant-facetime-answerer starting (EXPERIMENTAL — see module docstring).")
     print(f"  mode: {'DRY RUN (no answering, no speaking)' if args.dry_run else 'LIVE'}")
     print(f"  apple_id for replies: {apple_id}")
-    print(f"  access mode: {_read_access_mode(cfg)}")
+    print(f"  call access mode: {_read_call_access_mode(cfg)}")
 
     if not args.dry_run:
         _preflight_check_apis(cfg)

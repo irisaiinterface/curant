@@ -83,12 +83,29 @@ CUSTOMER_APPLE_ID, CUSTOMER_HANDLES = _read_customer_handles()
 # Access mode: 'approved' (default, secure) answers only CUSTOMER_HANDLES;
 # 'open' answers ANY incoming text or iMessage, no allowlist at all. Set
 # WITHOUT editing this file, same pattern as the handles above:
-#   env:    CURANT_ACCESS_MODE="open"
-#   config: {"access_mode": "open"}
+#   env:    CURANT_TEXT_ACCESS_MODE="open"
+#   config: {"text_access_mode": "open"}
 # Defaults to 'approved' on anything unset or unrecognized — a typo'd value
 # should fail toward the SAFER behavior, not accidentally open the door to
 # anyone who texts this number.
-def _read_access_mode():
+#
+# DELIBERATELY its own separate key from curant-facetime-answerer.py's call
+# access mode (CURANT_CALL_ACCESS_MODE / "call_access_mode") -- real
+# incident, not a hypothetical: both used to read the SAME shared
+# CURANT_ACCESS_MODE / "access_mode" key. Flipping that one switch to
+# "open" to test FaceTime call answering (approved mode refuses every
+# call outright -- see caller_is_approved()'s docstring) silently opened
+# the TEXT side wide open too, with no separate signal that it had
+# happened. Confirmed live: with the shared switch left on "open" from
+# call testing, this watcher auto-replied to ordinary incoming texts
+# from the customer's own contacts (friends texting the customer's real
+# number) as "Curant, your AI secretary," discussing the customer's
+# personal business with them and revealing the underlying model --
+# never something the customer approved happening, and not something a
+# person should discover after the fact. Splitting the two keys means
+# turning one feature's access wide open can never again silently do
+# the same to the other.
+def _read_text_access_mode():
     cfg = {}
     _cfg_path = os.path.expanduser("~/.curant/config.json")
     if os.path.exists(_cfg_path):
@@ -97,15 +114,15 @@ def _read_access_mode():
                 cfg = json.load(_f)
         except Exception:
             cfg = {}
-    mode = (os.environ.get("CURANT_ACCESS_MODE") or cfg.get("access_mode") or "approved").strip().lower()
+    mode = (os.environ.get("CURANT_TEXT_ACCESS_MODE") or cfg.get("text_access_mode") or "approved").strip().lower()
     if mode not in ("approved", "open"):
-        print(f"Unrecognized CURANT_ACCESS_MODE '{mode}' — falling back to 'approved' (the safe default).",
+        print(f"Unrecognized CURANT_TEXT_ACCESS_MODE '{mode}' — falling back to 'approved' (the safe default).",
               file=sys.stderr)
         mode = "approved"
     return mode
 
 
-ACCESS_MODE = _read_access_mode()
+ACCESS_MODE = _read_text_access_mode()
 POLL_INTERVAL_SECONDS = 5
 LAST_SEEN_ROWID_FILE = os.path.expanduser("~/.curant/last_seen_rowid")
 
@@ -585,6 +602,55 @@ def run_proactive_check():
         send_text_reply(CUSTOMER_APPLE_ID, message_text)
 
 
+_contact_name_cache = {}  # handle -> resolved name (or None), looked up once per handle per run
+
+
+def resolve_contact_name(handle):
+    """
+    Looks up a display name for an iMessage handle (phone number or email)
+    via the real macOS Contacts app, so the watcher (and its logs) can
+    identify WHO a message is actually from, not just a raw number/address.
+    Added directly in response to a real incident: with text access mode
+    left open, this watcher was auto-replying to ordinary contacts with no
+    record anywhere of who they actually were beyond an opaque handle
+    string -- made it hard to even audit afterward who Curant had been
+    talking to. This does NOT change who gets replied to (that's
+    ACCESS_MODE's job, see _read_text_access_mode()) -- it only makes sure
+    a real name is available wherever a handle is logged or reasoned about.
+
+    Best-effort and fails soft: returns None (never raises) if Contacts
+    access hasn't been granted, the app isn't reachable, or no match is
+    found -- callers should fall back to showing the raw handle in that
+    case, not block on this.
+    """
+    if handle in _contact_name_cache:
+        return _contact_name_cache[handle]
+    safe_handle = handle.replace('"', '\\"')
+    script = (
+        'tell application "Contacts"\n'
+        '    set matchedPeople to {}\n'
+        '    try\n'
+        f'        set matchedPeople to (people whose (value of emails contains "{safe_handle}") or (value of phones contains "{safe_handle}"))\n'
+        '    end try\n'
+        '    if (count of matchedPeople) > 0 then\n'
+        '        return name of item 1 of matchedPeople\n'
+        '    else\n'
+        '        return ""\n'
+        '    end if\n'
+        'end tell\n'
+    )
+    name = None
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+        found = (r.stdout or "").strip()
+        if r.returncode == 0 and found:
+            name = found
+    except Exception as e:
+        print(f"  Contact lookup failed for {handle} (non-fatal): {e}", file=sys.stderr)
+    _contact_name_cache[handle] = name
+    return name
+
+
 def handle_message(msg):
     # REWRITTEN (2026-08-08) to cover multiple attachments per message
     # and, critically, to never leave a sender with total silence when
@@ -673,7 +739,9 @@ def handle_message(msg):
         print(f"  Partial attachment failure(s) for message {msg['rowid']}: {failure_notes}",
               file=sys.stderr)
 
-    print(f"Incoming message, rowid {msg['rowid']}" + (" (with image)" if image_path else ""))
+    contact_name = resolve_contact_name(msg['sender'])
+    who = f"{contact_name} ({msg['sender']})" if contact_name else f"unresolved handle {msg['sender']}"
+    print(f"Incoming message, rowid {msg['rowid']}, from {who}" + (" (with image)" if image_path else ""))
     live_context = get_calendar_and_reminders_context()
     reply_json = relay_to_curant(text, context=live_context, image_path=image_path)
 
@@ -819,8 +887,8 @@ def deliver_completed_background_jobs():
 def main():
     print("curant-watcher starting — polling for new messages")
     if ACCESS_MODE == "open":
-        print("ACCESS MODE: OPEN — answering ANY incoming text or iMessage, no allowlist. "
-              "Set CURANT_ACCESS_MODE=approved (or remove the setting) to go back to only "
+        print("TEXT ACCESS MODE: OPEN — answering ANY incoming text or iMessage, no allowlist. "
+              "Set CURANT_TEXT_ACCESS_MODE=approved (or remove the setting) to go back to only "
               "answering configured handles.", file=sys.stderr)
     else:
         if not CUSTOMER_HANDLES:
