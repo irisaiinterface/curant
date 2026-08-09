@@ -3018,6 +3018,55 @@ _PROVIDER_CALLERS = {
 }
 
 
+class AllModelsExhaustedError(Exception):
+    """Raised when every model in a provider's fallback chain hit a
+    rate/quota limit for the requested tier. Deliberately a distinct
+    exception from a generic call failure -- relay() needs to tell "you
+    are genuinely out of free-tier quota everywhere right now" apart
+    from "the network/API is down," because those two situations
+    warrant different replies: a connectivity problem falls through to
+    generate_offline_reply() (a local model standing in), but that would
+    be misleading here -- quota exhaustion isn't fixed by anything local,
+    and silently answering with a degraded offline reply would hide that
+    the real answer is "wait for quota to reset or add a paid tier."
+    See _is_quota_error() and _model_fallback_chain()."""
+
+
+def _is_quota_error(e):
+    """Detects RESOURCE_EXHAUSTED / 429 rate-limit errors across every
+    SDK this file calls through (the OpenAI SDK, used directly for
+    OpenAI and via Gemini's OpenAI-compat endpoint, and the native
+    google-genai client used for Gemini tool calls) without needing a
+    separate isinstance() check per SDK's own exception class --
+    confirmed live that all of them put a recognizable marker in the
+    string form of the exception (e.g. "Error code: 429 ...
+    RESOURCE_EXHAUSTED ... quota")."""
+    msg = str(e).lower()
+    return ("429" in msg or "resource_exhausted" in msg or "resource exhausted" in msg
+            or "rate limit" in msg or "quota" in msg)
+
+
+def _model_fallback_chain(provider, tier):
+    """Ordered list of models to try for one call: the requested tier's
+    own configured model first, then every OTHER tier's model for the
+    same provider as fallbacks. Deliberately reuses only already-
+    configured, known-good model names (see PROVIDER_MODELS) rather than
+    guessing at additional model names that might not exist or might not
+    be enabled on this API key. Real basis for why this helps at all,
+    not just theoretical: live testing on 2026-08-08 hit RESOURCE_EXHAUSTED
+    on gemini-3.5-flash (the "main" model) while gemini-3.5-flash-lite
+    (the "fast" model, same API key, same day) was still serving requests
+    fine -- different models draw from separate free-tier quota buckets,
+    so falling through to another tier's model is a real way to keep
+    answering, not a no-op."""
+    models = PROVIDER_MODELS[provider]
+    chain = [models[tier]]
+    for other_tier, other_model in models.items():
+        if other_tier != tier and other_model not in chain:
+            chain.append(other_model)
+    return chain
+
+
 def call_llm(provider, api_key, system_prompt, messages, max_tokens=1000, tier="main"):
     """
     The single choke point every LLM call in this file goes through.
@@ -3025,12 +3074,34 @@ def call_llm(provider, api_key, system_prompt, messages, max_tokens=1000, tier="
     shape both providers already accept directly for user/assistant turns
     — only the system prompt needs provider-specific handling, done
     inside each _call_* function.
+
+    On a rate/quota error (RESOURCE_EXHAUSTED / 429), retries against
+    the next model in this provider's fallback chain instead of failing
+    the whole message outright -- see _model_fallback_chain(). A
+    non-quota error (bad key, network failure, etc.) is NOT retried
+    here; it propagates immediately to relay()'s existing offline-
+    fallback handling, same as before this change. Only once every
+    model in the chain has been tried and every single one hit a quota
+    error does this raise AllModelsExhaustedError.
     """
     caller = _PROVIDER_CALLERS.get(provider)
     if caller is None:
         raise ValueError(f"Unknown provider: {provider}")
-    model = PROVIDER_MODELS[provider][tier]
-    return caller(api_key, system_prompt, messages, max_tokens, model)
+    chain = _model_fallback_chain(provider, tier)
+    last_err = None
+    for i, model in enumerate(chain):
+        try:
+            return caller(api_key, system_prompt, messages, max_tokens, model)
+        except Exception as e:
+            if not _is_quota_error(e):
+                raise
+            last_err = e
+            more = f"trying next model ({chain[i + 1]})" if i + 1 < len(chain) else "no more models left to try"
+            print(f"[quota] {provider}/{model} hit a rate/quota limit ({e}) -- {more}.", file=sys.stderr)
+    raise AllModelsExhaustedError(
+        f"Every model in {provider}'s fallback chain for tier={tier} ({chain}) hit a rate/quota "
+        f"limit. Last error: {last_err}"
+    )
 
 
 MAX_TOOL_CALL_ITERATIONS = 5  # a hard ceiling so a confused model calling
@@ -3193,12 +3264,31 @@ def call_llm_with_tools(provider, api_key, system_prompt, messages, tools, avail
     `tools` is the schema list for the API call; `available_tools` is the
     same list with routing info (server command, etc.) execute_tool_call
     needs to actually run one.
+
+    Same model-fallback-then-AllModelsExhaustedError behavior as
+    call_llm() -- see its docstring and _model_fallback_chain(). Applied
+    here too because this is the path actually taken on almost every
+    real message: log_capability_gap is always in available_tools, so
+    plain call_llm() (no tools) is the less common case in practice.
     """
     caller = _PROVIDER_TOOL_CALLERS.get(provider)
     if caller is None:
         raise ValueError(f"Unknown provider: {provider}")
-    model = PROVIDER_MODELS[provider][tier]
-    return caller(api_key, system_prompt, messages, max_tokens, model, tools, available_tools)
+    chain = _model_fallback_chain(provider, tier)
+    last_err = None
+    for i, model in enumerate(chain):
+        try:
+            return caller(api_key, system_prompt, messages, max_tokens, model, tools, available_tools)
+        except Exception as e:
+            if not _is_quota_error(e):
+                raise
+            last_err = e
+            more = f"trying next model ({chain[i + 1]})" if i + 1 < len(chain) else "no more models left to try"
+            print(f"[quota] {provider}/{model} hit a rate/quota limit ({e}) -- {more}.", file=sys.stderr)
+    raise AllModelsExhaustedError(
+        f"Every model in {provider}'s fallback chain for tier={tier} ({chain}) hit a rate/quota "
+        f"limit. Last error: {last_err}"
+    )
 
 
 def update_memories_from_exchange(provider, api_key, existing_memories, user_message, reply_text):
@@ -4283,6 +4373,26 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
             )
         else:
             reply_text = call_llm(provider, api_key, system_prompt, history, max_tokens=reply_max_tokens, tier=tier)
+    except AllModelsExhaustedError as e:
+        # Every model in this provider's fallback chain hit a rate/quota
+        # limit (see call_llm/_model_fallback_chain) — deliberately NOT
+        # routed through generate_offline_reply() below: this isn't a
+        # connectivity problem a local model can stand in for, it's "you
+        # are out of free-tier quota everywhere right now," and the
+        # honest reply is a fixed, code-written notice saying so — not
+        # an LLM-generated answer (there's no quota left to generate one
+        # with) and not a misleading offline reply that looks like a
+        # normal answer.
+        reply_text = (
+            "(Automatic notice — not a generated reply) I've hit the free-tier rate/quota limit "
+            "on every model I have available right now, so I can't generate a real response to "
+            "this yet. This usually clears itself within a few minutes — try sending this again "
+            "shortly, or ask about switching to a paid tier / another provider if this keeps "
+            "happening."
+        )
+        provider = "quota_exhausted_notice"
+        print(f"[quota] all models exhausted for this message: {e}", file=sys.stderr)
+        report_error("all_models_exhausted", "curant-cli")
     except Exception as e:
         # Local front-door layer, step 3: offline fallback. Only
         # attempted after the real call has already failed — this never
