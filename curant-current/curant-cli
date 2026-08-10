@@ -1921,6 +1921,24 @@ def get_all_available_tools(config):
             "server_command": None, "raw_name": "browse_page", "builtin": True,
         })
         tools.append({
+            "qualified_name": "click_page_element",
+            "description": "Click a link, button, or toggle on a webpage and see the resulting "
+                            "page's text — for navigating (pagination, \"read more\", expanding "
+                            "an FAQ), not for completing an action. Read/navigate only, no "
+                            "confirmation needed — but will refuse (in code, not just by "
+                            "instruction) if the page or the specific element looks like a login "
+                            "or payment/checkout/purchase flow (sign in, buy now, checkout, pay, "
+                            "donate, delete account, etc.), regardless of what you intend. Use "
+                            "fill_and_submit_form instead for anything that actually needs to "
+                            "complete, like a real signup — that one requires the customer's "
+                            "explicit prior confirmation.",
+            "input_schema": {"type": "object", "properties": {
+                "url": {"type": "string"},
+                "selector": {"type": "string", "description": "CSS selector for the element to click, e.g. '#next-page' or 'a.read-more'"}},
+                "required": ["url", "selector"]},
+            "server_command": None, "raw_name": "click_page_element", "builtin": True,
+        })
+        tools.append({
             "qualified_name": "fill_and_submit_form",
             "description": "Fill in a webpage's form fields and submit it — actually "
                             "completes a signup, not just looks at it. Requires `confirmed: "
@@ -3089,6 +3107,139 @@ def browse_page(url):
         return None, f"Could not load that page: {e}"
 
 
+# Keywords that mark a page or a specific clickable element as a login,
+# payment/checkout, or other high-stakes action -- click_page_element()
+# refuses these regardless of what the model claims about intent, the
+# same belt-and-suspenders pattern as fill_and_submit_form()'s sensitive-
+# field block and confirmed-flag check. This is deliberately a lower
+# ceiling than fill_and_submit_form: clicking is for navigating/expanding
+# read-oriented content (pagination, "read more", FAQ toggles), not for
+# completing an action that has a real-world consequence -- those still
+# require fill_and_submit_form's explicit prior confirmation.
+CLICK_BLOCKED_KEYWORDS = (
+    "sign in", "log in", "login", "buy now", "add to cart", "add to bag",
+    "purchase", "place order", "pay now", "payment", "donate", "checkout",
+    "confirm order", "complete order", "delete account", "cancel subscription",
+    "unsubscribe", "transfer funds", "send money",
+)
+
+
+def _page_looks_like_login_or_payment(page):
+    """Checks the CURRENT page (not a specific element) for login/payment
+    signals -- a password field, a card-number-shaped field (reuses
+    _is_sensitive_field/PAYMENT_FIELD_KEYWORDS), or a URL containing an
+    obvious login/checkout path segment. Returns (blocked: bool, reason)."""
+    try:
+        url = (page.url or "").lower()
+        for kw in ("checkout", "payment", "login", "signin", "sign-in", "/cart"):
+            if kw in url:
+                return True, f"the page URL contains '{kw}'"
+        if page.query_selector("input[type='password']"):
+            return True, "the page has a password field"
+        field_names = page.eval_on_selector_all(
+            "input, select, textarea", "els => els.map(el => el.name || el.id || '')"
+        )
+        if any(_is_sensitive_field(n) for n in field_names):
+            return True, "the page has a payment or sensitive-ID field"
+    except Exception:
+        pass
+    return False, None
+
+
+def _click_target_is_blocked(page, selector):
+    """Checks the SPECIFIC element about to be clicked for blocked-action
+    text (its own visible text, not the whole page) -- catches a "Buy now"
+    button on an otherwise reasonable-looking page that _page_looks_like_
+    login_or_payment wouldn't flag on its own. Returns (blocked, reason)."""
+    try:
+        el = page.query_selector(selector)
+        if el is None:
+            return False, None
+        el_type = (el.evaluate("el => el.type || ''") or "").lower()
+        if el_type == "password":
+            return True, "that element is a password field"
+        text = (el.inner_text() or "").strip().lower()
+        for kw in CLICK_BLOCKED_KEYWORDS:
+            if kw in text:
+                return True, f"its text ('{text[:60]}') matches a blocked action ('{kw}')"
+    except Exception:
+        pass
+    return False, None
+
+
+def click_page_element(url, selector):
+    """
+    Navigates to `url`, clicks the element matching `selector`, and
+    returns the resulting page's text -- for things like expanding a
+    FAQ section, following "read more", or paging through results.
+    Read/navigate only, no confirmation required, same trust tier as
+    browse_page -- but NOT a general-purpose click-anything tool.
+
+    Refuses in code (not just by instruction) if:
+      - the URL fails the same SSRF check browse_page/fill_and_submit_form
+        use (_is_safe_url) -- no localhost/private-network/metadata-
+        endpoint access, same as always;
+      - the page itself looks like a login or payment/checkout flow
+        BEFORE the click (password field, payment-shaped field, or a
+        login/checkout-ish URL);
+      - the specific element being clicked has text matching
+        CLICK_BLOCKED_KEYWORDS (sign in, buy now, checkout, pay, donate,
+        delete account, etc.) -- checked on the element itself, not just
+        the page, so a stray "Buy now" button doesn't get through just
+        because the rest of the page reads as a normal article;
+      - the click LANDS somewhere that looks like login/payment even if
+        it didn't start that way (re-checked after navigation) -- still
+        returns whatever text is on that resulting page, since seeing
+        "this led to a login page" is useful information, but doesn't
+        pretend the click didn't happen.
+
+    Anything that actually needs to complete (submit a form, log in, buy
+    something) still goes through fill_and_submit_form, which requires
+    explicit prior customer confirmation -- this tool never substitutes
+    for that.
+    """
+    safe, why = _is_safe_url(url)
+    if not safe:
+        return None, f"Refusing to open that URL — {why}."
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                _install_ssrf_guard(page)
+                page.goto(url, timeout=BROWSER_TIMEOUT_MS)
+                page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+
+                blocked, reason = _page_looks_like_login_or_payment(page)
+                if blocked:
+                    return None, (f"Refusing — {reason}, which looks like a login or payment "
+                                   f"page. This tool doesn't click through those.")
+
+                blocked, reason = _click_target_is_blocked(page, selector)
+                if blocked:
+                    return None, (f"Refusing to click that element — {reason}. That kind of "
+                                   f"action needs a person to do it directly, or (if it's really "
+                                   f"a form to submit) go through fill_and_submit_form with "
+                                   f"explicit confirmation instead.")
+
+                page.click(selector, timeout=BROWSER_TIMEOUT_MS)
+                page.wait_for_load_state("networkidle", timeout=BROWSER_TIMEOUT_MS)
+
+                landed_blocked, landed_reason = _page_looks_like_login_or_payment(page)
+                text_content = page.inner_text("body")[:3000]
+                if landed_blocked:
+                    return {"text": text_content, "warning":
+                            f"That click landed on what looks like a login or payment page "
+                            f"({landed_reason}) — stopping here rather than interacting further."}, None
+                return {"text": text_content}, None
+            finally:
+                browser.close()
+    except Exception as e:
+        return None, f"Couldn't click that element: {e}"
+
+
 def get_shell_safety_mode(config):
     mode = config.get("shell_safety_mode")
     return mode if mode in DEAN_SHELL_SAFETY_MODES else DEAN_SHELL_DEFAULT_SAFETY_MODE
@@ -3663,6 +3814,13 @@ def execute_tool_call(tool_name, arguments, available_tools):
             for f in result["fields"]
         ) or "  (no fillable fields found)"
         return f"Page content:\n{result['text']}\n\nFillable fields:\n{fields_summary}"
+
+    if match["builtin"] and tool_name == "click_page_element":
+        result, error = click_page_element(arguments.get("url", ""), arguments.get("selector", ""))
+        if error:
+            return f"[click_page_element failed: {error}]"
+        warning = f"\n\n(Note: {result['warning']})" if result.get("warning") else ""
+        return f"Page content after clicking:\n{result['text']}{warning}"
 
     if match["builtin"] and tool_name == "fill_and_submit_form":
         # Routed through the hybrid wrapper, not called directly — see
@@ -4754,13 +4912,19 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
     )
     if "browser_automation" in addons:
         system_parts.append(
-            "You can browse webpages (browse_page — read-only, no confirmation needed) and fill in and "
-            "submit forms on them (fill_and_submit_form). The second one has a real effect — it can create "
+            "You can browse webpages (browse_page — read-only, no confirmation needed), click things on "
+            "them to navigate further (click_page_element — pagination, \"read more\" links, expanding an "
+            "FAQ; also no confirmation needed, but it will refuse on its own if the page or the specific "
+            "element looks like a login or payment/checkout/purchase action), and fill in and submit forms "
+            "(fill_and_submit_form). Only fill_and_submit_form has a real completing effect — it can create "
             "an account or submit real data somewhere — so ONLY call it after the customer has explicitly "
             "confirmed in a prior message, never in the same turn you first mention it. Use browse_page "
-            "first to see what fields exist before filling anything in. This will always refuse payment or "
-            "sensitive-ID fields (card numbers, CVV, SSN) no matter what — never try to work around that, "
-            "tell the customer those need to be entered by a person directly."
+            "first to see what fields exist before filling anything in. Never try to route a login, "
+            "purchase, or payment through click_page_element just because fill_and_submit_form seems like "
+            "more friction — if click_page_element refuses something, that's the correct outcome, not an "
+            "obstacle to work around. This will always refuse payment or sensitive-ID fields (card numbers, "
+            "CVV, SSN) no matter what — never try to work around that, tell the customer those need to be "
+            "entered by a person directly."
         )
     system_parts.append(
         "If the customer asks for something you genuinely can't do (no tool covers it, and it's not "

@@ -279,7 +279,10 @@ ADDON_CATALOG = {
     },
     "browser_automation": {
         "label": "Browser automation",
-        "description": "Lets Curant fill out and submit web forms on your behalf (with confirmation).",
+        "description": "Lets Curant browse webpages, click through them (pagination, expanding "
+                        "content) to read further, and fill out/submit web forms on your behalf "
+                        "(with confirmation). Always refuses to click through or fill in a login "
+                        "or payment/checkout flow, regardless of confirmation.",
         "stripe_payment_link": None,
     },
 }
