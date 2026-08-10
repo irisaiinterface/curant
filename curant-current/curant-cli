@@ -4497,16 +4497,44 @@ QUOTE_PHONE_NUMBER = "REPLACE_WITH_REAL_PHONE_NUMBER"  # the actual business lin
 def log_capability_gap(description):
     """
     Called (as a tool, from relay()) whenever the customer asks for
-    something Curant genuinely can't do. Purely local — logs it so it
-    can be reviewed later (patterns across what customers keep asking
-    for are useful even without any one customer following up), and
-    tells the customer to call for a custom quote rather than treating
-    it as a free feature request. No server round-trip at all: this
-    doesn't need confirmation before being called, since logging locally
-    has no side effect on anyone but the person running this Mac, and
-    nothing gets sent anywhere.
+    something Curant genuinely can't do. Logs it locally so patterns
+    across what gets asked for are reviewable later, AND sends an
+    immediate, separate text straight to the account owner (config's
+    customer_apple_id) via send_imessage — not just relying on it
+    showing up buried in whatever reply the model happens to write back
+    in the same turn. Real motivation: the owner explicitly asked for
+    capability gaps to be sent to them directly, not just logged
+    somewhere they'd have to go dig for (the feature_requests table) --
+    same "don't make the important thing require going and checking"
+    reasoning as _notify_task_starting's "starting now" texts.
+
+    Sending to customer_apple_id specifically (not _current_apple_id) is
+    deliberate: this should always reach the actual account owner, even
+    in a future where a capability gap gets hit in some OTHER
+    conversation thread (e.g. the screening flow) rather than the
+    owner's own chat -- _current_apple_id would be wrong in that case,
+    customer_apple_id is always right.
+
+    Fails soft on the notification send (never raises, never blocks the
+    tool's normal return) -- a failed courtesy notice shouldn't be the
+    reason the customer-facing reply itself breaks. No server round-trip
+    for the LOGGING itself: this doesn't need confirmation before being
+    called, since logging locally + texting the owner has no side effect
+    on anyone but the person running this Mac.
     """
     save_feature_request_local(description, status="logged")
+    try:
+        config = load_config()
+        owner = config.get("customer_apple_id")
+        if owner:
+            send_imessage(
+                owner,
+                f"(Capability gap logged) Just hit something I can't do yet: \"{description}\". "
+                f"Logged locally for review — let me know if you want to prioritize building it, "
+                f"or if it's worth a custom quote (call {QUOTE_PHONE_NUMBER})."
+            )
+    except Exception as e:
+        print(f"[capability-gap notice] failed to send (non-fatal): {e}", file=sys.stderr)
     return (f"Logged. For custom work like this, they'd need to call {QUOTE_PHONE_NUMBER} "
             f"for a quote — Curant doesn't build one-off custom features for free.")
 
