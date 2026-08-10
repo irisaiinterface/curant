@@ -200,8 +200,88 @@ def init_db():
             requested_at TEXT DEFAULT CURRENT_TIMESTAMP,
             resolved_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS feature_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            message TEXT,
+            status TEXT DEFAULT 'open',  -- 'open' | 'reviewed' | 'done'
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """)
         conn.commit()
+
+    # Lightweight migration: installs that created customers before the
+    # preferences columns existed won't have them -- CREATE TABLE IF NOT
+    # EXISTS above won't add a column to an already-existing table (same
+    # pattern curant-cli itself uses for its own local.db migrations).
+    #
+    # These three columns (persona/instructions/voice_tier) are a
+    # deliberate, narrow exception to this server's "sees nothing
+    # customer-specific" design (see the module docstring) -- they hold
+    # only what a customer explicitly sets via the web dashboard, never
+    # what Curant has LEARNED about them or the people in their life
+    # (that stays local-only, same as before). preferences_updated_at
+    # lets curant-cli tell whether the server's copy is newer than what
+    # it last pulled, piggybacked onto its existing /v1/status poll
+    # rather than adding a new network round-trip.
+    with closing(get_db()) as conn:
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(customers)")}
+        if "persona" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN persona TEXT DEFAULT 'curant'")
+        if "instructions" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN instructions TEXT DEFAULT ''")
+        if "voice_tier" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN voice_tier TEXT DEFAULT 'standard'")
+        if "preferences_updated_at" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN preferences_updated_at TEXT")
+        if "created_at" not in existing_cols:
+            # SQLite's ALTER TABLE ADD COLUMN specifically disallows
+            # CURRENT_TIMESTAMP as a default (only CREATE TABLE allows
+            # that) -- add the column plain, then backfill existing rows
+            # with the time of this migration. That backfilled value is
+            # NOT each customer's real original activation time -- an
+            # honest limitation worth knowing about if you're auditing
+            # "activated licenses" against this column for pre-migration
+            # customers; only customers created after this migration ran
+            # get an accurate created_at.
+            conn.execute("ALTER TABLE customers ADD COLUMN created_at TEXT")
+            conn.execute(
+                "UPDATE customers SET created_at = ? WHERE created_at IS NULL",
+                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),),
+            )
+        conn.commit()
+
+
+# --- Addon catalog ---
+# Deliberately a small, hardcoded list here rather than a DB table --
+# these are product capabilities defined in code (curant-cli's own addon
+# gates, see `unlocked_addons` checks in curant-cli), not arbitrary data,
+# so keeping them in code keeps this file the one place both sides of an
+# addon id have to agree. Add a `stripe_payment_link` once you've created
+# a real Stripe Payment Link for that addon (Stripe Dashboard > Payment
+# Links) -- until then the dashboard shows a "contact to unlock" prompt
+# instead of a broken/missing button.
+ADDON_CATALOG = {
+    "august": {
+        "label": "August (creative persona)",
+        "description": "The specialist creative persona -- image/video/voice generation tools.",
+        "stripe_payment_link": None,
+    },
+    "browser_automation": {
+        "label": "Browser automation",
+        "description": "Lets Curant fill out and submit web forms on your behalf (with confirmation).",
+        "stripe_payment_link": None,
+    },
+}
+
+# Persona catalog for the dashboard dropdown -- kept in sync manually with
+# curant-cli's own PERSONAS dict (curant-cli is the source of truth for
+# what each persona actually sounds like; this is just the list of valid
+# choices for the web form). If you add a persona to curant-cli, add its
+# id here too or customers won't be able to select it from the web.
+PERSONA_CHOICES = ["curant", "grace", "dean", "nora", "frank", "miles", "jane", "leo", "august", "aaron"]
+VOICE_TIER_CHOICES = ["standard", "natural", "realistic"]
 
 
 def get_customer(license_key):
@@ -268,6 +348,96 @@ def bind_device(license_key, device_id):
         return True, None
 
 
+def update_customer_preferences(license_key, persona, instructions, voice_tier):
+    """
+    Applies a customer's own explicit persona/instructions/voice-tier
+    choice from the web dashboard. Validates against the known-good
+    choice lists rather than trusting form input directly -- a bad
+    persona id landing in the DB would silently break curant-cli's
+    PERSONAS.get() fallback logic on the customer's Mac otherwise.
+    Stamps preferences_updated_at so curant-cli's next /v1/status poll
+    knows there's something new to pull down.
+    Returns (ok: bool, error: str | None).
+    """
+    if persona not in PERSONA_CHOICES:
+        return False, "invalid_persona"
+    if voice_tier not in VOICE_TIER_CHOICES:
+        return False, "invalid_voice_tier"
+    if len(instructions) > 4000:
+        # Sanity bound, not a hard product limit -- just guards against a
+        # pathological form submission bloating the DB indefinitely.
+        return False, "instructions_too_long"
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE customers SET persona = ?, instructions = ?, voice_tier = ?, "
+            "preferences_updated_at = ? WHERE license_key = ?",
+            (persona, instructions, voice_tier, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), license_key),
+        )
+        conn.commit()
+    return True, None
+
+
+def create_feature_request(license_key, message):
+    """
+    Logs a customer-submitted feature request from the web dashboard --
+    a suggestion box, separate from curant-cli's own LOCAL capability-gap
+    log (which fires automatically when Curant hits something it can't
+    do, and stays on the customer's Mac). This one is explicitly
+    customer-initiated and lands here specifically so you (the owner)
+    can see it without needing access to any individual customer's Mac.
+    """
+    message = (message or "").strip()
+    if not message:
+        return False, "empty_message"
+    if len(message) > 2000:
+        return False, "message_too_long"
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO feature_requests (license_key, message) VALUES (?, ?)",
+            (license_key, message),
+        )
+        conn.commit()
+    return True, None
+
+
+def list_feature_requests_for(license_key):
+    """Customer-facing: just this customer's own requests, oldest first isn't
+    as useful here as newest first -- so they see their most recent submission
+    without scrolling."""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            "SELECT id, message, status, created_at FROM feature_requests "
+            "WHERE license_key = ? ORDER BY created_at DESC",
+            (license_key,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_all_feature_requests():
+    """Owner-facing: every customer's requests, newest first, joined with
+    the customer's name so you don't have to cross-reference a license key
+    by hand."""
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """SELECT feature_requests.id, feature_requests.license_key, feature_requests.message,
+                      feature_requests.status, feature_requests.created_at,
+                      customers.customer_name
+               FROM feature_requests
+               JOIN customers ON customers.license_key = feature_requests.license_key
+               ORDER BY feature_requests.created_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_feature_request_status(request_id, status):
+    if status not in ("open", "reviewed", "done"):
+        return False, "invalid_status"
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE feature_requests SET status = ? WHERE id = ?", (status, request_id))
+        conn.commit()
+    return True, None
+
+
 # --- Endpoints ---
 
 @app.route("/health", methods=["GET"])
@@ -330,6 +500,17 @@ def status():
         "active": bool(customer["active"]),
         "plan": customer["plan"],
         "unlocked_addons": json.loads(customer["unlocked_addons"] or "[]"),
+        # Piggybacked onto this existing poll rather than a new endpoint --
+        # see update_customer_preferences()'s docstring for why these three
+        # fields (and only these three) are the one thing this server
+        # deliberately does hold about a customer beyond billing basics.
+        # preferences_updated_at is null until a customer has ever touched
+        # the dashboard's preferences form, so curant-cli can tell "never
+        # set via web, leave my local config alone" apart from a real update.
+        "persona": customer["persona"],
+        "instructions": customer["instructions"],
+        "voice_tier": customer["voice_tier"],
+        "preferences_updated_at": customer["preferences_updated_at"],
     })
 
 
@@ -658,6 +839,12 @@ def customer_dashboard():
             (license_key,),
         ).fetchone()
 
+    unlocked = json.loads(customer["unlocked_addons"] or "[]")
+    addons_view = [
+        {"id": addon_id, **info, "unlocked": addon_id in unlocked}
+        for addon_id, info in ADDON_CATALOG.items()
+    ]
+
     return render_template_string(
         BASE_STYLE + """
         <h1>Welcome, {{ customer.customer_name }}</h1>
@@ -665,7 +852,75 @@ def customer_dashboard():
           <div class="row"><span class="label">Plan</span><span>{{ customer.plan }}</span></div>
           <div class="row"><span class="label">Status</span><span>{{ "Active" if customer.active else "Inactive" }}</span></div>
           <div class="row"><span class="label">Device</span><span>{{ "Bound to a Mac" if customer.device_id else "Not yet activated on a Mac" }}</span></div>
+          <div class="row"><span class="label">Activated</span><span>{{ customer.created_at or "-" }}</span></div>
         </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Preferences</h2>
+          <p class="muted">Sets what Curant picks up on this Mac — it never sees what Curant has
+          learned about you or the people in your life, only these three choices.
+          Changes are picked up next time curant-cli checks in (up to a few hours,
+          not instant).</p>
+          {% if prefs_message %}<p class="muted">{{ prefs_message }}</p>{% endif %}
+          <form method="post" action="/dashboard/preferences">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Persona</label>
+            <select name="persona" style="width:100%; padding:8px; margin:8px 0;">
+              {% for p in persona_choices %}
+              <option value="{{ p }}" {% if customer.persona == p %}selected{% endif %}>{{ p|capitalize }}</option>
+              {% endfor %}
+            </select>
+            <label>Standing instructions</label>
+            <textarea name="instructions" rows="4" style="width:100%; padding:8px; margin:8px 0; box-sizing:border-box; font-family:inherit;" placeholder="e.g. Always confirm before sending anything to my mom.">{{ customer.instructions or "" }}</textarea>
+            <label>Voice reply tier</label>
+            <select name="voice_tier" style="width:100%; padding:8px; margin:8px 0;">
+              {% for v in voice_tier_choices %}
+              <option value="{{ v }}" {% if customer.voice_tier == v %}selected{% endif %}>{{ v|capitalize }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit">Save preferences</button>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Add-ons</h2>
+          {% for addon in addons %}
+          <div class="row">
+            <span class="label">{{ addon.label }}</span>
+            <span>
+              {% if addon.unlocked %}
+                Active
+              {% elif addon.stripe_payment_link %}
+                <a href="{{ addon.stripe_payment_link }}">Unlock</a>
+              {% else %}
+                <span class="muted">Contact support to add this</span>
+              {% endif %}
+            </span>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Feature requests</h2>
+          <p class="muted">Something Curant can't do yet that you wish it could? Tell us here —
+          this is separate from the automatic capability-gap log on your own Mac; this one, we
+          can actually see.</p>
+          {% if feature_message %}<p class="muted">{{ feature_message }}</p>{% endif %}
+          <form method="post" action="/dashboard/feature-request">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <textarea name="feature_message" rows="3" style="width:100%; padding:8px; margin:8px 0; box-sizing:border-box; font-family:inherit;" placeholder="What do you wish Curant could do?"></textarea>
+            <button type="submit">Submit</button>
+          </form>
+          {% if my_feature_requests %}
+          <table>
+            <tr><th>Submitted</th><th>Message</th><th>Status</th></tr>
+            {% for r in my_feature_requests %}
+            <tr><td>{{ r.created_at }}</td><td>{{ r.message }}</td><td>{{ r.status }}</td></tr>
+            {% endfor %}
+          </table>
+          {% endif %}
+        </div>
+
         <div class="card">
           <p>If you've moved to a new Mac and need this license released from the old one:</p>
           {% if pending %}
@@ -682,7 +937,43 @@ def customer_dashboard():
         <p><a href="/logout">Log out</a></p>
         """,
         customer=customer, pending=pending, message=message, csrf_token=get_csrf_token(),
+        addons=addons_view, persona_choices=PERSONA_CHOICES, voice_tier_choices=VOICE_TIER_CHOICES,
+        prefs_message=request.args.get("prefs_message"), feature_message=request.args.get("feature_message"),
+        my_feature_requests=list_feature_requests_for(license_key),
     )
+
+
+@app.route("/dashboard/preferences", methods=["POST"])
+@require_customer_login
+def dashboard_update_preferences():
+    license_key = session["license_key"]
+    if not validate_csrf():
+        return redirect(url_for("customer_dashboard", prefs_message="Session expired — please try again."))
+
+    persona = request.form.get("persona", "curant")
+    instructions = request.form.get("instructions", "")
+    voice_tier = request.form.get("voice_tier", "standard")
+    ok, error = update_customer_preferences(license_key, persona, instructions, voice_tier)
+    if ok:
+        msg = "Saved — Curant will pick this up next time it checks in with the server."
+    else:
+        msg = f"Couldn't save ({error})."
+    return redirect(url_for("customer_dashboard", prefs_message=msg))
+
+
+@app.route("/dashboard/feature-request", methods=["POST"])
+@require_customer_login
+def dashboard_submit_feature_request():
+    license_key = session["license_key"]
+    if not validate_csrf():
+        return redirect(url_for("customer_dashboard", feature_message="Session expired — please try again."))
+
+    ok, error = create_feature_request(license_key, request.form.get("feature_message", ""))
+    if ok:
+        msg = "Submitted — thanks, we'll take a look."
+    else:
+        msg = "Couldn't submit that (it looked empty or too long)."
+    return redirect(url_for("customer_dashboard", feature_message=msg))
 
 
 @app.route("/owner", methods=["GET", "POST"])
@@ -736,8 +1027,14 @@ def owner_dashboard():
     pending = list_pending_release_requests()
     with closing(get_db()) as conn:
         customers = conn.execute(
-            "SELECT license_key, customer_name, plan, active, device_id, total_messages FROM customers ORDER BY customer_name"
+            "SELECT license_key, customer_name, plan, active, device_id, total_messages, "
+            "unlocked_addons, persona, created_at FROM customers ORDER BY created_at DESC"
         ).fetchall()
+    customers = [dict(c) for c in customers]
+    for c in customers:
+        c["addons_display"] = ", ".join(json.loads(c["unlocked_addons"] or "[]")) or "—"
+
+    feature_requests = list_all_feature_requests()
 
     return render_template_string(
         BASE_STYLE + """
@@ -772,15 +1069,51 @@ def owner_dashboard():
         </div>
 
         <div class="card">
-          <h2 style="font-size:1.1rem;">Customers</h2>
+          <h2 style="font-size:1.1rem;">Feature requests</h2>
+          {% if feature_requests %}
           <table>
-            <tr><th>Name</th><th>Plan</th><th>Active</th><th>Device bound</th><th>Messages</th></tr>
+            <tr><th>Customer</th><th>Request</th><th>Status</th><th>Submitted</th><th></th></tr>
+            {% for r in feature_requests %}
+            <tr>
+              <td>{{ r.customer_name }}</td>
+              <td>{{ r.message }}</td>
+              <td>{{ r.status }}</td>
+              <td>{{ r.created_at }}</td>
+              <td>
+                {% if r.status != "reviewed" %}
+                <form class="inline" method="post" action="/owner/feature-request/{{ r.id }}/reviewed">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit">Mark reviewed</button>
+                </form>
+                {% endif %}
+                {% if r.status != "done" %}
+                <form class="inline" method="post" action="/owner/feature-request/{{ r.id }}/done">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit">Mark done</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </table>
+          {% else %}
+          <p class="muted">None right now.</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Activated licenses</h2>
+          <table>
+            <tr><th>Name</th><th>Plan</th><th>Persona</th><th>Add-ons</th><th>Active</th><th>Device bound</th><th>Activated</th><th>Messages</th></tr>
             {% for c in customers %}
             <tr>
               <td>{{ c.customer_name }}</td>
               <td>{{ c.plan }}</td>
+              <td>{{ c.persona }}</td>
+              <td>{{ c.addons_display }}</td>
               <td>{{ "Yes" if c.active else "No" }}</td>
               <td>{{ "Yes" if c.device_id else "No" }}</td>
+              <td>{{ c.created_at }}</td>
               <td>{{ c.total_messages }}</td>
             </tr>
             {% endfor %}
@@ -789,8 +1122,17 @@ def owner_dashboard():
 
         <p><a href="/owner/logout">Log out</a></p>
         """,
-        pending=pending, customers=customers, csrf_token=get_csrf_token(),
+        pending=pending, customers=customers, feature_requests=feature_requests, csrf_token=get_csrf_token(),
     )
+
+
+@app.route("/owner/feature-request/<int:request_id>/<status>", methods=["POST"])
+@require_admin
+def owner_set_feature_request_status(request_id, status):
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard"))
+    set_feature_request_status(request_id, status)
+    return redirect(url_for("owner_dashboard"))
 
 
 @app.route("/owner/approve/<int:request_id>", methods=["POST"])

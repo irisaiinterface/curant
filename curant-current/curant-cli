@@ -4316,12 +4316,62 @@ def refresh_status_if_stale(config):
         config["last_status_active"] = bool(result.get("active"))
         config["plan"] = result.get("plan", config.get("plan", "base"))
         config["unlocked_addons"] = result.get("unlocked_addons", config.get("unlocked_addons", []))
+        apply_synced_preferences_if_newer(config, result)
         save_config(config)
         report_usage_if_pending(config)
         return config, config["last_status_active"]
     except Exception as e:
         print(f"Could not reach Curant's server to re-verify status (using cached result): {e}", file=sys.stderr)
         return config, config.get("last_status_active", False)
+
+
+def apply_synced_preferences_if_newer(config, status_result):
+    """
+    Pulls persona/instructions/voice_tier from the server's /v1/status
+    response (piggybacked there, not a separate endpoint -- see the
+    server's own docstring on this) and applies them locally, but ONLY
+    if the customer has actually set something via the web dashboard
+    AND it's newer than what was already applied here.
+
+    This is a narrow, deliberate exception to "the server never sees
+    customer-specific data" -- persona/instructions/voice_tier are the
+    one thing a customer can now set from the web instead of only
+    locally via `curant-cli set-persona` etc. What Curant has LEARNED
+    (memories, important_people) is unaffected and stays local-only,
+    same as always -- this function never touches those tables.
+
+    preferences_updated_at being None means the customer has never
+    touched the dashboard's preferences form -- in that case this is a
+    no-op, so a customer who's only ever configured Curant locally never
+    has their local settings silently overwritten by server defaults.
+    Comparing against config["last_synced_preferences_at"] (not
+    last_status_check) means a genuinely unchanged server value doesn't
+    re-apply (and re-log) on every single status poll.
+    """
+    updated_at = status_result.get("preferences_updated_at")
+    if not updated_at:
+        return
+    if updated_at == config.get("last_synced_preferences_at"):
+        return
+
+    persona = status_result.get("persona")
+    instructions = status_result.get("instructions")
+    voice_tier = status_result.get("voice_tier")
+
+    changed = []
+    if persona and persona != config.get("persona"):
+        config["persona"] = persona
+        changed.append(f"persona -> {persona}")
+    if instructions is not None and instructions != config.get("instructions"):
+        config["instructions"] = instructions
+        changed.append("instructions updated")
+    if voice_tier and voice_tier != config.get("voice_tier"):
+        config["voice_tier"] = voice_tier
+        changed.append(f"voice_tier -> {voice_tier}")
+
+    config["last_synced_preferences_at"] = updated_at
+    if changed:
+        print(f"[preferences sync] applied from web dashboard: {', '.join(changed)}", file=sys.stderr)
 
 
 def report_usage_if_pending(config):
