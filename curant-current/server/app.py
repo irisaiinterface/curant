@@ -1153,6 +1153,39 @@ def owner_deny(request_id):
     return redirect(url_for("owner_dashboard"))
 
 
+def _open_browser_once_server_is_up(port):
+    """
+    Auto-opens the owner dashboard in the default browser shortly after
+    startup -- purely a local-dev convenience (this is why it's gated on
+    __name__ == "__main__" below, never runs when a real WSGI server
+    imports this module for production). Runs on a background thread with
+    a short delay rather than opening immediately, since the Flask dev
+    server needs a moment to actually be listening -- opening instantly
+    risks a connection-refused page loading before the server's ready.
+
+    Flask's debug-mode reloader forks a second process (the one that
+    actually serves requests); WERKZEUG_RUN_MAIN is only set in that
+    child, not in the initial parent process, so gating on it here stops
+    the browser from popping open twice on every debug-mode restart.
+    """
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true" and app.debug:
+        return
+    import threading
+    import webbrowser
+
+    def _open():
+        webbrowser.open(f"http://localhost:{port}/owner")
+
+    threading.Timer(1.0, _open).start()
+
+
 if __name__ == "__main__":
     init_db()
-    app.run(port=5050, debug=True)
+    PORT = 5050
+    print("")
+    print("Curant server starting -- open one of these once it's up:")
+    print(f"  Owner dashboard:    http://localhost:{PORT}/owner")
+    print(f"  Customer dashboard: http://localhost:{PORT}/login")
+    print("")
+    _open_browser_once_server_is_up(PORT)
+    app.run(port=PORT, debug=True)
