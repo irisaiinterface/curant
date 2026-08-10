@@ -370,13 +370,28 @@ def relay_to_curant(text, context="", image_path=None):
     directly, and returns the reply. No message content is sent to
     Curant's own server. Passes CUSTOMER_APPLE_ID through so an async
     tool (Veo video generation) knows who to deliver its result to later,
-    once the background job actually finishes."""
+    once the background job actually finishes.
+
+    REAL BUG FIXED: subprocess.run(capture_output=True) captures
+    curant-cli's stderr too, but this used to only ever read
+    result.stdout -- stderr (quota-fallback notices, capability-gap
+    logging, any Python warning/traceback) was silently thrown away on
+    every single call, live, with no trace of it anywhere -- not even
+    /tmp/curant-watcher-error.log, since nothing ever re-printed it.
+    That's the opposite of what "always gets shared, even on a local-
+    only setup" needs: local-only visibility has to mean it reliably
+    shows up in THIS process's own logs, and launchd already pipes this
+    process's stderr to /tmp/curant-watcher-error.log (see the plist) --
+    so forwarding curant-cli's stderr into this process's stderr is
+    enough to make that guarantee true with no new infrastructure."""
     args = ["curant-cli", "relay", text, "--apple-id", CUSTOMER_APPLE_ID]
     if context:
         args += ["--context", context]
     if image_path:
         args += ["--image", image_path]
     result = subprocess.run(args, capture_output=True, text=True)
+    if result.stderr:
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
     return result.stdout.strip()
 
 
@@ -396,11 +411,16 @@ def screen_with_curant(sender, text, contact_name=None):
     if contact_name:
         args += ["--contact-name", contact_name]
     result = subprocess.run(args, capture_output=True, text=True)
+    if result.stderr:
+        # Same stderr-forwarding fix as relay_to_curant() above -- otherwise
+        # anything curant-cli prints to stderr during screening (including a
+        # capability-gap notice, if one ever fires from this path) vanishes
+        # instead of landing in /tmp/curant-watcher-error.log.
+        print(result.stderr, end="" if result.stderr.endswith("\n") else "\n", file=sys.stderr)
     try:
         return json.loads(result.stdout.strip())
     except (json.JSONDecodeError, ValueError):
-        print(f"screen-message returned non-JSON output: {result.stdout[:300]!r} "
-              f"(stderr: {result.stderr[:300]!r})", file=sys.stderr)
+        print(f"screen-message returned non-JSON output: {result.stdout[:300]!r}", file=sys.stderr)
         return None
 
 

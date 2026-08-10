@@ -4573,10 +4573,27 @@ def log_capability_gap(description):
     on anyone but the person running this Mac.
     """
     save_feature_request_local(description, status="logged")
+
+    xlsx_path = None
     try:
-        export_capability_gaps_xlsx()
+        xlsx_path = export_capability_gaps_xlsx()
     except Exception as e:
         print(f"[capability-gap xlsx export] failed (non-fatal, local.db entry still saved): {e}", file=sys.stderr)
+
+    # ALWAYS print a clear, unconditional line -- this is the guaranteed
+    # "gets shared even on a local-only setup" channel: curant-watcher.py
+    # now forwards curant-cli's stderr into ITS OWN stderr (see the fix
+    # in relay_to_curant()/screen_with_curant()), which launchd already
+    # pipes to /tmp/curant-watcher-error.log -- so this line lands
+    # somewhere real and persistent regardless of whether iMessage
+    # sending works, whether a customer_apple_id is even configured, or
+    # whether this is being run by hand with no watcher at all (in which
+    # case it just prints straight to the terminal). The text/xlsx
+    # notification below is the NICE-TO-HAVE on top of this, not a
+    # replacement for it.
+    print(f"[capability gap] \"{description}\" -- logged"
+          + (f", spreadsheet updated at {xlsx_path}" if xlsx_path else ""), file=sys.stderr)
+
     try:
         config = load_config()
         owner = config.get("customer_apple_id")
@@ -4588,6 +4605,9 @@ def log_capability_gap(description):
                 f"— let me know if you want to prioritize building it, or if it's worth a custom quote "
                 f"(call {QUOTE_PHONE_NUMBER})."
             )
+        else:
+            print("[capability gap] no customer_apple_id configured -- couldn't text a notice, "
+                  "but it's saved in feature_requests and the .xlsx above.", file=sys.stderr)
     except Exception as e:
         print(f"[capability-gap notice] failed to send (non-fatal): {e}", file=sys.stderr)
     return (f"Logged. For custom work like this, they'd need to call {QUOTE_PHONE_NUMBER} "
