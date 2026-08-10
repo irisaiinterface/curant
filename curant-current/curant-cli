@@ -3340,16 +3340,93 @@ def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id, co
             "I'll let you know as soon as it's done.")
 
 
+# Short, persona-flavored "starting on it" notices -- sent as a SEPARATE,
+# immediate text via send_imessage the moment a slow tool call begins
+# (see _notify_task_starting below), before the actual work happens.
+# Real gap this closes: generate_video already had a "you'll hear back
+# when it's done" pattern (background job + "Your video is ready!"
+# follow-up), but everything else in a single relay() call is silent
+# until the WHOLE turn finishes -- for a slideshow/document/spreadsheet
+# or a multi-tool-call turn, that can be a real, noticeable wait with
+# zero acknowledgment that anything is even happening. One canned line
+# per persona (not a separate LLM call) -- deliberately, so the "started"
+# notice itself doesn't add the very latency it exists to paper over,
+# and doesn't risk hallucinating something off-persona in a rushed
+# low-context call. {task} is filled in per call site (see
+# _notify_task_starting).
+TASK_START_TEMPLATES = {
+    "curant": "On it — starting on {task} now, I'll let you know when it's ready.",
+    "grace": "Understood. I'm beginning work on {task} now and will follow up once it's complete.",
+    "dean": "Yep, starting on {task} now. Ping when it's done.",
+    "nora": "Okay — I'll start on {task} now and check back in once it's ready.",
+    "frank": "You got it! Kicking off {task} right now — back in a bit!",
+    "miles": "Starting {task}.",
+    "jane": "Starting {task} now. I'll confirm once it's finished.",
+    "leo": "Alright, I'm starting on {task} now — no rush, I'll let you know when it's done.",
+    "august": "Diving into {task} now — give me a moment to make it good.",
+    "aaron": "Starting on {task} now — I'll let you know as soon as it's ready.",
+}
+
+
+def _notify_task_starting(task_label):
+    """
+    Best-effort, fire-and-forget: sends an immediate, persona-flavored
+    "starting now" text via send_imessage, separate from and BEFORE the
+    tool's own (possibly slow) work happens. Uses _current_apple_id (set
+    once per relay() call — see relay()'s docstring) as the recipient,
+    same as generate_video's existing background-job delivery. Never
+    raises and never blocks the actual tool call on failure -- a failed
+    courtesy notice should not be the reason a real task doesn't run.
+    """
+    if not _current_apple_id:
+        return
+    try:
+        config = load_config()
+        persona = config.get("persona", "curant")
+        template = TASK_START_TEMPLATES.get(persona, TASK_START_TEMPLATES["curant"])
+        send_imessage(_current_apple_id, template.format(task=task_label))
+    except Exception as e:
+        print(f"[task-start notice] failed to send (non-fatal): {e}", file=sys.stderr)
+
+
 def execute_tool_call(tool_name, arguments, available_tools):
     """Routes a tool call to either the built-in capability-gap logger,
     one of August's specialist generation tools, or the right MCP
     server, based on the qualified name the model was given. Never
     raises — a tool failure becomes a text result the model can react
     to. Successful generations append their local file path to
-    _last_generated_files so relay() can surface it for delivery."""
+    _last_generated_files so relay() can surface it for delivery.
+
+    Slow/generation-style tools get an immediate "starting now" text via
+    _notify_task_starting BEFORE the real work runs — see its docstring
+    and TASK_START_TEMPLATES above. Fast, near-instant tools (lookup_person,
+    log_capability_gap, mark_sender_as_spam, etc.) deliberately do NOT get
+    one; announcing something that finishes before the notice would even
+    plausibly be read is just noise.
+    """
     match = next((t for t in available_tools if t["qualified_name"] == tool_name), None)
     if match is None:
         return f"[Unknown tool: {tool_name}]"
+
+    _TASK_START_LABELS = {
+        "generate_slideshow": "your slideshow",
+        "generate_document": "your document",
+        "generate_spreadsheet": "your spreadsheet",
+        "generate_image": "your image",
+        "generate_image_with_text": "your image",
+        "generate_voice": "your voice clip",
+        "edit_media": "that edit",
+        "generate_video": "your video (this one takes a few minutes)",
+        "fill_and_submit_form": "that form",
+        "fill_and_submit_form_hybrid": "that form",
+        # NOTE: send_message_to_person is deliberately excluded -- it's a
+        # single, near-instant AppleScript send, same speed class as the
+        # fast tools this notice is meant to skip (see the docstring
+        # above); a "starting" notice immediately followed by the actual
+        # message would just be noise, not a useful heads-up.
+    }
+    if match["builtin"] and tool_name in _TASK_START_LABELS:
+        _notify_task_starting(_TASK_START_LABELS[tool_name])
 
     if match["builtin"] and tool_name == "log_capability_gap":
         description = arguments.get("description", "").strip()
