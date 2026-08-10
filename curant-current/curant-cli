@@ -1682,6 +1682,109 @@ def get_all_available_tools(config):
         "builtin": True,
     })
 
+    # Local artifact generation -- always available, no persona/addon gate
+    # and no spend cap, because these run entirely locally (python-pptx/
+    # python-docx/openpyxl) with no external API call and no per-use cost,
+    # unlike August's paid generate_image/generate_voice/generate_video
+    # below. See generate_slideshow_pptx/generate_document_docx/
+    # generate_spreadsheet_xlsx's docstrings for the actual generation.
+    tools.append({
+        "qualified_name": "generate_slideshow",
+        "description": (
+            "Build a real .pptx slideshow and send it as an attachment. Use this whenever the "
+            "customer asks for a presentation, deck, or slideshow. Structure the content into a "
+            "title and a list of slides, each with a heading and a few short bullet points -- "
+            "keep bullets brief (phrases, not paragraphs), the way an actual slide reads."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Title of the slideshow (shown on the title slide)"},
+                "slides": {
+                    "type": "array",
+                    "description": "The content slides, in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string"},
+                            "bullets": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["heading"],
+                    },
+                },
+            },
+            "required": ["title", "slides"],
+        },
+        "server_command": None,
+        "raw_name": "generate_slideshow",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "generate_document",
+        "description": (
+            "Build a real .docx Word document and send it as an attachment. Use this for anything "
+            "the customer wants as a proper written document -- a letter, a report, a summary, "
+            "notes -- rather than just replying with the text in the chat itself."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Document title (shown as the top heading)"},
+                "sections": {
+                    "type": "array",
+                    "description": "The document's sections, in order",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string", "description": "Section heading (optional)"},
+                            "body": {"type": "string", "description": "Section body text"},
+                        },
+                        "required": ["body"],
+                    },
+                },
+            },
+            "required": ["title", "sections"],
+        },
+        "server_command": None,
+        "raw_name": "generate_document",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "generate_spreadsheet",
+        "description": (
+            "Build a real .xlsx spreadsheet and send it as an attachment. Use this whenever the "
+            "customer wants tabular data as an actual spreadsheet -- a budget, a tracker, a list "
+            "with columns -- rather than a table typed out in the chat."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "Used as the sheet name if only one sheet is given"},
+                "sheets": {
+                    "type": "array",
+                    "description": "One or more sheets to include",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Sheet tab name"},
+                            "headers": {"type": "array", "items": {"type": "string"}, "description": "Column headers (first row)"},
+                            "rows": {
+                                "type": "array",
+                                "description": "Data rows, each a list of cell values in column order",
+                                "items": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            "required": ["title", "sheets"],
+        },
+        "server_command": None,
+        "raw_name": "generate_spreadsheet",
+        "builtin": True,
+    })
+
     # August's specialist tools — only when actively talking to August AND
     # the customer has the addon unlocked. Any other persona, or August
     # without the addon, can still think through a creative project; these
@@ -2116,6 +2219,124 @@ def _download_generated_file(url, extension):
     resp = requests.get(url, timeout=60)
     resp.raise_for_status()
     return _save_generated_bytes(resp.content, extension)
+
+
+# ── Local artifact generation (slideshows, documents, spreadsheets) ────────
+# Deliberately NOT gated behind the August persona/addon or a spend cap
+# the way generate_image/generate_voice/generate_video are -- those call
+# real paid third-party APIs (FLUX, ElevenLabs, Veo) with a per-use cost
+# to track; these three build the file entirely locally with well-known
+# free Python libraries (python-pptx/python-docx/openpyxl), so there's
+# no external cost, no API key needed, and no principled reason to
+# restrict them to one persona. Registered as always-available builtin
+# tools instead (see get_all_available_tools), same tier as
+# log_capability_gap/lookup_person.
+#
+# Each function follows the same (bytes_saved_path, error) contract as
+# the paid generators above so they can share _save_generated_bytes and
+# the same _last_generated_files/attachment-delivery plumbing without
+# any special-casing in execute_tool_call or relay().
+
+def generate_slideshow_pptx(title, slides):
+    """
+    Builds a real .pptx via python-pptx -- entirely local, no network
+    call. `slides` is a list of {"heading": str, "bullets": [str, ...]}
+    dicts; a title slide is always added first from `title`. Lazy-
+    imports pptx (same pattern as curant-watcher.py's whisper/pypdf
+    imports) so this file doesn't hard-require python-pptx just to run
+    unrelated commands -- returns a clear, sender-safe install
+    instruction instead of a raw ImportError traceback if it's missing.
+    """
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+    except ImportError:
+        return None, "python-pptx isn't installed on this Mac yet — run: pip install python-pptx --break-system-packages"
+    try:
+        import io
+        prs = Presentation()
+        title_layout = prs.slide_layouts[0]
+        bullet_layout = prs.slide_layouts[1]
+
+        title_slide = prs.slides.add_slide(title_layout)
+        title_slide.shapes.title.text = title or "Untitled"
+        if len(title_slide.placeholders) > 1:
+            title_slide.placeholders[1].text = ""
+
+        for s in (slides or []):
+            slide = prs.slides.add_slide(bullet_layout)
+            slide.shapes.title.text = s.get("heading", "")
+            body = slide.placeholders[1].text_frame
+            bullets = s.get("bullets") or []
+            if bullets:
+                body.text = bullets[0]
+                for b in bullets[1:]:
+                    p = body.add_paragraph()
+                    p.text = b
+            else:
+                body.text = ""
+
+        buf = io.BytesIO()
+        prs.save(buf)
+        return _save_generated_bytes(buf.getvalue(), "pptx"), None
+    except Exception as e:
+        return None, f"something went wrong building the slideshow: {e}"
+
+
+def generate_document_docx(title, sections):
+    """
+    Builds a real .docx via python-docx -- same local-only, no-network,
+    lazy-import pattern as generate_slideshow_pptx above. `sections` is
+    a list of {"heading": str, "body": str} dicts.
+    """
+    try:
+        from docx import Document
+    except ImportError:
+        return None, "python-docx isn't installed on this Mac yet — run: pip install python-docx --break-system-packages"
+    try:
+        import io
+        doc = Document()
+        doc.add_heading(title or "Untitled", level=0)
+        for s in (sections or []):
+            if s.get("heading"):
+                doc.add_heading(s["heading"], level=1)
+            if s.get("body"):
+                doc.add_paragraph(s["body"])
+        buf = io.BytesIO()
+        doc.save(buf)
+        return _save_generated_bytes(buf.getvalue(), "docx"), None
+    except Exception as e:
+        return None, f"something went wrong building the document: {e}"
+
+
+def generate_spreadsheet_xlsx(title, sheets):
+    """
+    Builds a real .xlsx via openpyxl -- same local-only, no-network,
+    lazy-import pattern as the other two. `sheets` is a list of
+    {"name": str, "headers": [str, ...], "rows": [[str, ...], ...]}
+    dicts -- at least one sheet is always created even if `sheets` is
+    empty, so the file is never invalid/blank.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return None, "openpyxl isn't installed on this Mac yet — run: pip install openpyxl --break-system-packages"
+    try:
+        import io
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        for s in (sheets or [{"name": title or "Sheet1", "headers": [], "rows": []}]):
+            ws = wb.create_sheet(title=(s.get("name") or "Sheet")[:31])  # Excel caps sheet names at 31 chars
+            headers = s.get("headers") or []
+            if headers:
+                ws.append(headers)
+            for row in (s.get("rows") or []):
+                ws.append(row)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return _save_generated_bytes(buf.getvalue(), "xlsx"), None
+    except Exception as e:
+        return None, f"something went wrong building the spreadsheet: {e}"
 
 
 def generate_image_flux(prompt, config):
@@ -3182,6 +3403,27 @@ def execute_tool_call(tool_name, arguments, available_tools):
         is_spam = arguments.get("is_spam", True)
         set_person_spam(handle, is_spam=bool(is_spam))
         return f"{handle} is now {'marked as spam — future texts from them will be silently dropped' if is_spam else 'un-marked as spam'}."
+
+    if match["builtin"] and tool_name == "generate_slideshow":
+        path, error = generate_slideshow_pptx(arguments.get("title", ""), arguments.get("slides", []))
+        if error:
+            return f"[generate_slideshow failed: {error}]"
+        _last_generated_files.append(path)
+        return f"Slideshow generated successfully, saved at {path}."
+
+    if match["builtin"] and tool_name == "generate_document":
+        path, error = generate_document_docx(arguments.get("title", ""), arguments.get("sections", []))
+        if error:
+            return f"[generate_document failed: {error}]"
+        _last_generated_files.append(path)
+        return f"Document generated successfully, saved at {path}."
+
+    if match["builtin"] and tool_name == "generate_spreadsheet":
+        path, error = generate_spreadsheet_xlsx(arguments.get("title", ""), arguments.get("sheets", []))
+        if error:
+            return f"[generate_spreadsheet failed: {error}]"
+        _last_generated_files.append(path)
+        return f"Spreadsheet generated successfully, saved at {path}."
 
     if match["builtin"] and tool_name == "send_message_to_person":
         handle = (arguments.get("handle") or "").strip()
