@@ -1107,6 +1107,56 @@ def get_feature_requests_local():
         return [dict(r) for r in rows]
 
 
+CAPABILITY_GAPS_XLSX_PATH = os.path.join(CONFIG_DIR, "capability_gaps.xlsx")
+
+
+def export_capability_gaps_xlsx():
+    """
+    Writes every logged capability gap (the feature_requests table) out
+    to a real, directly-viewable .xlsx at a FIXED path
+    (~/.curant/capability_gaps.xlsx) -- deliberately NOT run through the
+    same at-rest Fernet encryption as generated attachments/backups,
+    because the whole point is a file the owner can just double-click
+    and look at in Excel/Numbers whenever, not one that needs a decrypt
+    step first. "Secure" here means the same standard local.db already
+    uses: chmod 0600 (owner-only read/write), same as the database this
+    data is pulled from -- not full encryption-at-rest.
+
+    Called automatically at the end of log_capability_gap() (see below)
+    so this file is always current the moment a new gap is logged --
+    no separate manual export step required. Also exposed as its own
+    `curant-cli export-capability-gaps` command for an on-demand
+    refresh (e.g. after the local.db was restored from a backup, or if
+    the file gets deleted).
+
+    Overwrites the whole file each time rather than trying to append --
+    feature_requests is small (capability gaps are, by definition, rare
+    enough to be worth a custom-quote conversation) so a full rewrite
+    is cheap, and it sidesteps any question of the sheet drifting out
+    of sync with the database.
+    """
+    import openpyxl
+    from openpyxl.styles import Font
+
+    rows = get_feature_requests_local()
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Capability Gaps"
+    ws.append(["Logged At", "Status", "Request"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    for r in rows:
+        ws.append([r.get("created_at", ""), r.get("status", ""), r.get("request_text", "")])
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 12
+    ws.column_dimensions["C"].width = 80
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    wb.save(CAPABILITY_GAPS_XLSX_PATH)
+    os.chmod(CAPABILITY_GAPS_XLSX_PATH, 0o600)  # owner-only, same standard as local.db
+    return CAPABILITY_GAPS_XLSX_PATH
+
+
 # --- Provider abstraction ---
 # The whole point of the portable memory format (see PORTABLE_MEMORY_SPEC.md)
 # falls flat if the actual running assistant is still hardcoded to one
@@ -4524,14 +4574,19 @@ def log_capability_gap(description):
     """
     save_feature_request_local(description, status="logged")
     try:
+        export_capability_gaps_xlsx()
+    except Exception as e:
+        print(f"[capability-gap xlsx export] failed (non-fatal, local.db entry still saved): {e}", file=sys.stderr)
+    try:
         config = load_config()
         owner = config.get("customer_apple_id")
         if owner:
             send_imessage(
                 owner,
                 f"(Capability gap logged) Just hit something I can't do yet: \"{description}\". "
-                f"Logged locally for review — let me know if you want to prioritize building it, "
-                f"or if it's worth a custom quote (call {QUOTE_PHONE_NUMBER})."
+                f"Full list is at {CAPABILITY_GAPS_XLSX_PATH} on this Mac (kept in sync automatically) "
+                f"— let me know if you want to prioritize building it, or if it's worth a custom quote "
+                f"(call {QUOTE_PHONE_NUMBER})."
             )
     except Exception as e:
         print(f"[capability-gap notice] failed to send (non-fatal): {e}", file=sys.stderr)
@@ -6396,6 +6451,12 @@ def feature_requests_cmd():
         print(f"[{r['created_at']}] {r['request_text']}")
 
 
+def export_capability_gaps_cmd():
+    path = export_capability_gaps_xlsx()
+    count = len(get_feature_requests_local())
+    print(f"Wrote {count} logged capability gap(s) to {path}")
+
+
 def grading_assignments_cmd():
     """Direct CLI visibility into Aaron's grading calibration — a teacher
     (or you, debugging) can check this without going through a
@@ -6594,6 +6655,7 @@ def main():
     p_mcp_toggle.add_argument("state", choices=["on", "off"])
 
     sub.add_parser("feature-requests", help="Show feature requests submitted from this Mac")
+    sub.add_parser("export-capability-gaps", help="Refresh the viewable .xlsx of logged capability gaps (~/.curant/capability_gaps.xlsx)")
 
     sub.add_parser("grading-assignments", help="Show Aaron's grading calibration assignments and example counts")
 
@@ -6696,6 +6758,8 @@ def main():
         mcp_toggle_cmd(args.name, args.state)
     elif args.command == "feature-requests":
         feature_requests_cmd()
+    elif args.command == "export-capability-gaps":
+        export_capability_gaps_cmd()
     elif args.command == "grading-assignments":
         grading_assignments_cmd()
     elif args.command == "dashboard":
