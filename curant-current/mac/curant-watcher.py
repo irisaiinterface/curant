@@ -939,7 +939,24 @@ def deliver_completed_background_jobs():
                 )
                 temp_path = decrypt_result.stdout.strip()
                 if temp_path and os.path.exists(temp_path):
-                    send_text_reply(apple_id, "Your video is ready!")
+                    ready_message = "Your video is ready!"
+                    # Veo's cost is logged at completion (see
+                    # run_background_job_cmd in curant-cli), so this is
+                    # the first point where a remaining-balance figure
+                    # actually reflects this video's cost — appending it
+                    # here rather than at kickoff time, when it wouldn't
+                    # yet be accurate.
+                    try:
+                        balance_result = subprocess.run(
+                            ["curant-cli", "remaining-generation-balance"],
+                            capture_output=True, text=True,
+                        )
+                        balance_line = balance_result.stdout.strip()
+                        if balance_line:
+                            ready_message += f" ({balance_line})"
+                    except Exception as e:
+                        print(f"Could not fetch remaining generation balance (non-fatal): {e}", file=sys.stderr)
+                    send_text_reply(apple_id, ready_message)
                     send_file_reply(apple_id, temp_path)
                     os.remove(temp_path)
                 else:

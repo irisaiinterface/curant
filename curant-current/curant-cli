@@ -2115,12 +2115,18 @@ GENERATED_FILE_MAX_AGE_HOURS = 24  # these exist only to get delivered to the
 # treating these as trustworthy, same as the FLUX endpoint itself needed.
 ESTIMATED_COST_USD = {
     "flux": 0.04,        # BFL's own stated price for FLUX1.1 [pro], confirmed
-    "ideogram": 0.08,    # ESTIMATE — not independently verified
-    "elevenlabs": 0.02,  # ESTIMATE — actual ElevenLabs billing is per-character and varies a lot by length
+    "ideogram": 0.06,    # Ideogram V4 Default, per-image API rate — re-verified via web search
+                          # Aug 2026 (was a rough $0.08 estimate before; actual rate is lower)
+    "elevenlabs": 0.10,  # Per 1,000 characters, Multilingual v2/v3 tier — re-verified Aug 2026.
+                          # Previous $0.02 flat estimate badly understated anything beyond ~200
+                          # characters; this is still an approximation since real narration
+                          # length varies, but it's per-1000-chars now, not a flat per-call guess.
+                          # ElevenLabs' cheaper Flash/Turbo tier runs ~$0.05/1,000 chars instead.
     "veo": 3.20,         # Google's own Veo 3.1 Standard rate ($0.40/sec) for a typical 8-second
-                          # clip — confirmed consistently across multiple independent sources.
-                          # Real generations can run shorter/longer or use Fast/Lite tiers at
-                          # different per-second rates, so still an estimate, not exact billing.
+                          # clip — confirmed consistently across multiple independent sources,
+                          # re-verified Aug 2026. Real generations can run shorter/longer or use
+                          # Fast/Lite tiers at different per-second rates (as low as $0.15/sec on
+                          # Fast), so still an estimate, not exact billing.
     "descript": 0.0,     # not a per-call cost the way FLUX/ElevenLabs/Veo are — Descript's
                           # MCP connection uses the customer's own account, billed to their
                           # own existing Descript subscription (media minutes/AI credits),
@@ -2128,11 +2134,21 @@ ESTIMATED_COST_USD = {
 }
 
 
-def log_generation_cost(service):
+def log_generation_cost(service, cost_override=None):
+    """
+    cost_override lets a caller pass an actually-computed cost instead of
+    the flat per-service estimate — used for ElevenLabs specifically,
+    since voice generation is billed per-character, not per-call, and a
+    flat estimate badly misrepresents a long narration vs. a short one.
+    Everything else (FLUX, Ideogram, Veo) is genuinely a flat per-call
+    rate, so the flat ESTIMATED_COST_USD value is accurate for those
+    without an override.
+    """
+    cost = cost_override if cost_override is not None else ESTIMATED_COST_USD.get(service, 0.0)
     with closing(get_local_db()) as conn:
         conn.execute(
             "INSERT INTO generation_costs (service, estimated_cost_usd) VALUES (?, ?)",
-            (service, ESTIMATED_COST_USD.get(service, 0.0)),
+            (service, cost),
         )
         conn.commit()
 
@@ -2154,15 +2170,32 @@ def get_total_estimated_spend():
 
 # Default monthly cap on August's paid generation tools (FLUX/Ideogram/
 # ElevenLabs/Veo) — applied to a fresh config that hasn't set one
-# explicitly. Deliberately conservative: at Veo's ~$3.20/generation, this
-# still allows real use (dozens of images, several videos) while putting
-# a real ceiling on a runaway-loop scenario, which is a documented real
-# risk category for AI agent products (not hypothetical — a misconfigured
-# loop has produced a $34,000 bill in 8 days for another product, from a
-# lack of exactly this kind of safeguard). The customer can raise or
-# remove this themselves at any time via `curant-cli set-spend-cap` —
-# this is a safety default, not a hard business limit imposed on them.
-DEFAULT_MONTHLY_SPEND_CAP_USD = 25.0
+# explicitly. Changed from $25 to $4 (Aug 2026) at the owner's explicit
+# direction: $4/month of real generation cost is what's included/covered
+# as part of the August addon subscription price; beyond that, the
+# customer pays for more (see GENERATION_TOPUP_CONTACT below) rather than
+# it being an open-ended safety-net figure. This is now a real cost
+# boundary the business is relying on, not just a courtesy default.
+#
+# Honest limitation, unchanged from before this was tightened: this cap
+# is enforced entirely by curant-cli running locally on the customer's
+# own Mac, reading a value from their own config.json. A technically
+# sophisticated customer could edit that file directly or otherwise
+# bypass this. It's a real, effective default for normal usage — not a
+# server-enforced hard limit, since generation calls are made directly
+# from the customer's Mac to FLUX/Ideogram/ElevenLabs/Veo, never proxied
+# through Curant's own server. `curant-cli set-spend-cap` still lets a
+# customer LOWER this if they want to spend less than $4; there's no
+# code-level way to stop them from raising it too, the same way there
+# was no way to stop that at $25 either.
+DEFAULT_MONTHLY_SPEND_CAP_USD = 4.0
+
+# Where a customer is told to go once they've used their included $4 and
+# want more generations this month. Placeholder, same pattern as
+# QUOTE_PHONE_NUMBER elsewhere in this file — needs a real value (a
+# phone number, or once one exists, a Stripe Payment Link for a
+# generation top-up) before this is actually useful to a real customer.
+GENERATION_TOPUP_CONTACT = "REPLACE_WITH_REAL_TOPUP_CONTACT_OR_PAYMENT_LINK"
 
 
 def get_monthly_estimated_spend():
@@ -2186,7 +2219,7 @@ def get_monthly_spend_cap(config):
     return config["monthly_spend_cap_usd"]  # may be None (uncapped)
 
 
-def check_spend_cap(config, service):
+def check_spend_cap(config, service, cost_override=None):
     """
     Returns (ok: bool, message: str | None). Checked BEFORE a paid
     generation call fires, not after — the whole point of a cap is
@@ -2194,20 +2227,43 @@ def check_spend_cap(config, service):
     current month-to-date spend PLUS this generation's estimated cost
     against the cap, so the generation that would cross the line is the
     one that gets blocked, not the one after it.
+
+    cost_override: see log_generation_cost's docstring — used for
+    ElevenLabs, where the real cost depends on how much text is being
+    narrated, not a flat per-call estimate.
     """
     cap = get_monthly_spend_cap(config)
     if cap is None:
         return True, None
     current = get_monthly_estimated_spend()
-    projected = current + ESTIMATED_COST_USD.get(service, 0.0)
+    this_cost = cost_override if cost_override is not None else ESTIMATED_COST_USD.get(service, 0.0)
+    projected = current + this_cost
     if projected > cap:
         return False, (
             f"This would put this month's generation spend at an estimated ${projected:.2f}, "
-            f"over the ${cap:.2f} monthly cap currently set. Nothing was generated. The "
-            f"customer can raise this cap themselves anytime with `curant-cli set-spend-cap "
-            f"<amount>`, or remove it entirely with `curant-cli set-spend-cap none`."
+            f"over the ${cap:.2f} included this month. Nothing was generated. For more "
+            f"generations this month, get in touch: {GENERATION_TOPUP_CONTACT}. (You can also "
+            f"lower this cap yourself anytime with `curant-cli set-spend-cap <amount>` if you'd "
+            f"rather spend less than the included ${cap:.2f}.)"
         )
     return True, None
+
+
+def format_remaining_generation_balance(config):
+    """
+    One-line "here's what you have left" string, shared by the explicit
+    get_spending_summary tool AND appended automatically after every
+    successful paid generation (image/voice/video) — the automatic
+    version is what the owner asked for directly: telling the customer
+    where they stand after every generation, not only when they think to
+    ask. Returns None when uncapped (nothing meaningful to report).
+    """
+    cap = get_monthly_spend_cap(config)
+    if cap is None:
+        return None
+    monthly_spend = get_monthly_estimated_spend()
+    remaining = max(cap - monthly_spend, 0)
+    return f"${remaining:.2f} of your ${cap:.2f} included generation budget left this month."
 
 # Reset at the start of each relay() call, appended to by successful
 # generation tool calls during that turn — lets relay() know what to
@@ -3750,7 +3806,17 @@ def execute_tool_call(tool_name, arguments, available_tools):
         }
         service = service_map[tool_name]
 
-        ok, cap_message = check_spend_cap(config, service)
+        # ElevenLabs is billed per-character, not a flat per-call rate —
+        # compute the real estimated cost from the actual text length so
+        # both the cap check and the logged spend reflect a long
+        # narration costing more than a short one, instead of every
+        # voice generation counting the same regardless of length.
+        cost_override = None
+        if tool_name == "generate_voice":
+            text_len = len(arguments.get("text", ""))
+            cost_override = (text_len / 1000.0) * ESTIMATED_COST_USD.get("elevenlabs", 0.0)
+
+        ok, cap_message = check_spend_cap(config, service, cost_override=cost_override)
         if not ok:
             return cap_message
 
@@ -3769,8 +3835,10 @@ def execute_tool_call(tool_name, arguments, available_tools):
         # Only log a cost for a generation that actually happened — the
         # Descript stub always returns an error above and never reaches
         # here, so no spend gets recorded for something that didn't run.
-        log_generation_cost(service)
-        return f"Generated successfully, saved at {path}."
+        log_generation_cost(service, cost_override=cost_override)
+        balance_line = format_remaining_generation_balance(config)
+        balance_suffix = f" ({balance_line})" if balance_line else ""
+        return f"Generated successfully, saved at {path}.{balance_suffix}"
 
     if match["builtin"] and tool_name == "generate_video":
         # Runs in a detached background process instead of blocking this
@@ -3795,9 +3863,8 @@ def execute_tool_call(tool_name, arguments, available_tools):
         total = get_total_estimated_spend()
         config = load_config()
         monthly_spend = get_monthly_estimated_spend()
-        cap = get_monthly_spend_cap(config)
-        cap_line = (f"No monthly cap set." if cap is None else
-                    f"Monthly cap: ${cap:.2f} — ~${max(cap - monthly_spend, 0):.2f} remaining this month.")
+        balance_line = format_remaining_generation_balance(config)
+        cap_line = balance_line or "No monthly cap set."
         if not summary:
             return f"No generation spend yet this account. {cap_line}"
         lines = [f"{row['service']}: {row['count']} generation(s), ~${row['total']:.2f}" for row in summary]
@@ -6846,6 +6913,9 @@ def main():
     p_spend_cap.add_argument("amount", nargs="?", default=None,
                               help="Dollar amount, e.g. '25' or '25.00'. Use 'none' to remove the cap entirely. Omit to just view the current cap and this month's spend.")
 
+    sub.add_parser("remaining-generation-balance", help="Internal — prints the one-line remaining-budget "
+                    "string, used by curant-watcher.py to append it after delivering a completed video job")
+
     p_shell_mode = sub.add_parser("set-shell-mode", help="Set (or view) how much confirmation Dean's shell access needs before running a command")
     p_shell_mode.add_argument("mode", nargs="?", default=None, choices=list(DEAN_SHELL_SAFETY_MODES),
                                help="'confirm' (ask every time, default), 'allowlist' (pre-approved read-only commands only), or 'autonomous' (no confirmation). Omit to just view the current mode.")
@@ -6964,6 +7034,10 @@ def main():
         status()
     elif args.command == "set-spend-cap":
         set_spend_cap_cmd(args.amount)
+    elif args.command == "remaining-generation-balance":
+        line = format_remaining_generation_balance(load_config())
+        if line:
+            print(line)
     elif args.command == "set-shell-mode":
         if args.mode is None:
             print(f"Current shell safety mode: {get_shell_safety_mode(load_config())}")
