@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/opt/python@3.12/bin/python3.12
 """
 curant-cli — the local Curant client AND brain.
 

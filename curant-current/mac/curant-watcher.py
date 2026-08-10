@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/opt/python@3.12/bin/python3.12
 """
 curant-watcher — runs on the Mac Mini, watches Messages for new
 incoming texts or voice memos from a customer, hands them to curant-cli

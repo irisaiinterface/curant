@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/opt/homebrew/opt/python@3.12/bin/python3.12
 """
 curant-facetime-answerer — EXPERIMENTAL. Auto-answers incoming FaceTime
 AUDIO calls and lets the caller talk to your Curant in real time: it
