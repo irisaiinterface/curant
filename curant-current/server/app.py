@@ -176,6 +176,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS customers (
             license_key TEXT PRIMARY KEY,
             customer_name TEXT,
+            email TEXT,
             phone_number TEXT,
             plan TEXT DEFAULT 'base',
             active INTEGER DEFAULT 1,
@@ -235,6 +236,8 @@ def init_db():
             conn.execute("ALTER TABLE customers ADD COLUMN voice_tier TEXT DEFAULT 'standard'")
         if "preferences_updated_at" not in existing_cols:
             conn.execute("ALTER TABLE customers ADD COLUMN preferences_updated_at TEXT")
+        if "email" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN email TEXT")
         if "created_at" not in existing_cols:
             # SQLite's ALTER TABLE ADD COLUMN specifically disallows
             # CURRENT_TIMESTAMP as a default (only CREATE TABLE allows
@@ -294,18 +297,24 @@ def get_customer(license_key):
 
 # --- Helper: create a new customer (call this from your signup/payment webhook) ---
 
-def provision_customer(customer_name, phone_number=None, plan="base"):
+def provision_customer(customer_name, email=None, phone_number=None, plan="base"):
     """Call this after a successful Stripe payment to create a new customer
     and generate their license key. Notably: no Anthropic API key is taken
     or stored here anymore — the customer enters their own key locally on
-    their Mac via `curant-cli set-api-key`, and it never reaches this server."""
+    their Mac via `curant-cli set-api-key`, and it never reaches this server.
+
+    `email` was added alongside the manual owner-triggered creation flow
+    (see owner_create_customer()) specifically so send_license_email() has
+    somewhere to send the key -- Stripe Checkout will supply this
+    automatically once the webhook exists; the manual flow collects it
+    directly from the owner instead."""
     license_key = "CRT-" + "-".join(
         secrets.token_hex(2).upper() for _ in range(3)
     )
     with closing(get_db()) as conn:
         conn.execute(
-            "INSERT INTO customers (license_key, customer_name, phone_number, plan) VALUES (?, ?, ?, ?)",
-            (license_key, customer_name, phone_number, plan),
+            "INSERT INTO customers (license_key, customer_name, email, phone_number, plan) VALUES (?, ?, ?, ?, ?)",
+            (license_key, customer_name, email, phone_number, plan),
         )
         conn.commit()
     return license_key
@@ -346,6 +355,63 @@ def bind_device(license_key, device_id):
         )
         conn.commit()
         return True, None
+
+
+# Sender address for license-delivery email -- override via env var if you
+# switch senders later (e.g. once a real authenticated domain exists,
+# rather than the free-tier Gmail address used to get this working).
+LICENSE_EMAIL_FROM = os.environ.get("SENDGRID_FROM_EMAIL", "curant.interface@gmail.com")
+
+
+def send_license_email(customer_name, email, license_key):
+    """
+    Emails a newly-provisioned customer their license key via SendGrid.
+    Lazy-imports the sendgrid package so this server can still start and
+    serve everything else (activation, dashboards, etc.) even if it isn't
+    installed or SENDGRID_API_KEY isn't set -- email delivery is a nice-
+    to-have layered on top of provisioning, not something that should be
+    able to take the whole server down if it's misconfigured.
+
+    Deliberately best-effort: the license key is ALWAYS visible to the
+    owner in the dashboard regardless of whether this succeeds (see
+    owner_create_customer()), so a SendGrid outage or a bad API key never
+    means the key is lost -- just that it has to be relayed by hand this
+    once. Returns (ok: bool, error: str | None).
+    """
+    if not email:
+        return False, "no_email_on_file"
+
+    api_key = os.environ.get("SENDGRID_API_KEY")
+    if not api_key:
+        return False, "SENDGRID_API_KEY not set on this server"
+
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Mail
+    except ImportError:
+        return False, "sendgrid package not installed (pip install sendgrid --break-system-packages)"
+
+    message = Mail(
+        from_email=LICENSE_EMAIL_FROM,
+        to_emails=email,
+        subject="Your Curant license key",
+        html_content=(
+            f"<p>Hi {customer_name or 'there'},</p>"
+            f"<p>Thanks for signing up for Curant. Your license key is:</p>"
+            f"<p style=\"font-size:1.2rem; font-family:monospace; font-weight:bold;\">{license_key}</p>"
+            f"<p>Activate it on your Mac with:</p>"
+            f"<p style=\"font-family:monospace;\">curant-cli activate {license_key}</p>"
+            f"<p>Keep this email -- you'll need the key again if you ever set up on a new Mac.</p>"
+        ),
+    )
+    try:
+        sg = SendGridAPIClient(api_key)
+        response = sg.send(message)
+        if response.status_code >= 300:
+            return False, f"SendGrid returned status {response.status_code}"
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def update_customer_preferences(license_key, persona, instructions, voice_tier):
@@ -1027,7 +1093,7 @@ def owner_dashboard():
     pending = list_pending_release_requests()
     with closing(get_db()) as conn:
         customers = conn.execute(
-            "SELECT license_key, customer_name, plan, active, device_id, total_messages, "
+            "SELECT license_key, customer_name, email, plan, active, device_id, total_messages, "
             "unlocked_addons, persona, created_at FROM customers ORDER BY created_at DESC"
         ).fetchall()
     customers = [dict(c) for c in customers]
@@ -1039,6 +1105,27 @@ def owner_dashboard():
     return render_template_string(
         BASE_STYLE + """
         <h1>Owner Dashboard</h1>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Add a customer</h2>
+          <p class="muted">Manual provisioning -- generates a license key and, if an
+          email is given and SendGrid is configured, sends it automatically. This is
+          separate from (and doesn't require) the Stripe webhook -- useful for
+          testing delivery, or provisioning by hand until that's wired up.</p>
+          {% if create_message %}<p class="muted">{{ create_message }}</p>{% endif %}
+          <form method="post" action="/owner/create-customer">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label>Name</label>
+            <input type="text" name="customer_name" required>
+            <label>Email</label>
+            <input type="text" name="email" placeholder="optional, but required to send the license by email">
+            <label>Phone</label>
+            <input type="text" name="phone_number" placeholder="optional">
+            <label>Plan</label>
+            <input type="text" name="plan" value="base">
+            <button type="submit">Create + email license</button>
+          </form>
+        </div>
 
         <div class="card">
           <h2 style="font-size:1.1rem;">Pending device release requests</h2>
@@ -1104,10 +1191,11 @@ def owner_dashboard():
         <div class="card">
           <h2 style="font-size:1.1rem;">Activated licenses</h2>
           <table>
-            <tr><th>Name</th><th>Plan</th><th>Persona</th><th>Add-ons</th><th>Active</th><th>Device bound</th><th>Activated</th><th>Messages</th></tr>
+            <tr><th>Name</th><th>Email</th><th>Plan</th><th>Persona</th><th>Add-ons</th><th>Active</th><th>Device bound</th><th>Activated</th><th>Messages</th></tr>
             {% for c in customers %}
             <tr>
               <td>{{ c.customer_name }}</td>
+              <td>{{ c.email or "—" }}</td>
               <td>{{ c.plan }}</td>
               <td>{{ c.persona }}</td>
               <td>{{ c.addons_display }}</td>
@@ -1123,7 +1211,45 @@ def owner_dashboard():
         <p><a href="/owner/logout">Log out</a></p>
         """,
         pending=pending, customers=customers, feature_requests=feature_requests, csrf_token=get_csrf_token(),
+        create_message=request.args.get("create_message"),
     )
+
+
+@app.route("/owner/create-customer", methods=["POST"])
+@require_admin
+def owner_create_customer():
+    """
+    Manual provisioning path for the owner -- generates a license key
+    the same way Stripe's eventual webhook will, and immediately shows
+    it in the flash message REGARDLESS of whether the email send
+    succeeds (see send_license_email()'s docstring on why this is
+    deliberately best-effort) -- so a bad SendGrid key or a customer
+    who didn't give an email never means the key is lost, just that it
+    has to be relayed by hand.
+    """
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard", create_message="Session expired — please try again."))
+
+    customer_name = request.form.get("customer_name", "").strip()
+    email = request.form.get("email", "").strip() or None
+    phone_number = request.form.get("phone_number", "").strip() or None
+    plan = request.form.get("plan", "base").strip() or "base"
+
+    if not customer_name:
+        return redirect(url_for("owner_dashboard", create_message="Name is required — nothing created."))
+
+    license_key = provision_customer(customer_name, email=email, phone_number=phone_number, plan=plan)
+
+    if email:
+        ok, error = send_license_email(customer_name, email, license_key)
+        if ok:
+            msg = f"Created {license_key} for {customer_name} — license emailed to {email}."
+        else:
+            msg = f"Created {license_key} for {customer_name} — email NOT sent ({error}). Relay the key by hand."
+    else:
+        msg = f"Created {license_key} for {customer_name} — no email on file, relay the key by hand."
+
+    return redirect(url_for("owner_dashboard", create_message=msg))
 
 
 @app.route("/owner/feature-request/<int:request_id>/<status>", methods=["POST"])
