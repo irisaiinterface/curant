@@ -101,6 +101,10 @@ REQUIREMENTS
     instead of erroring, which looks like a detection bug but isn't.
   - `brew install ffmpeg switchaudio-osx cliclick`
   - `pip3 install pillow --break-system-packages` (screenshot analysis)
+  - `brew install tesseract` and `pip3 install pytesseract --break-system-packages`
+    (OCR caller-ID reading for "approved" mode — see caller_is_approved()).
+    Without these, "approved" mode fails closed on every call rather than
+    answering unverified — "open" mode still works with no OCR at all.
   - An OpenAI API key set (for Whisper transcription).
   - FaceTime.app signed in (does not need to be open — see above).
 
@@ -122,11 +126,12 @@ ACCESS CONTROL: uses its OWN access-mode setting, CURANT_CALL_ACCESS_MODE
 curant-watcher.py's CURANT_TEXT_ACCESS_MODE, after a real incident where
 sharing one switch between calls and texts meant opening call access for
 testing silently opened text access to everyone too (see
-_read_call_access_mode()'s docstring). There's also a real capability gap
-for calls specifically — see the REGRESSION note above and
-caller_is_approved()'s docstring. "approved" mode currently refuses every
-call; "open" mode answers every call, with no verification of who's
-calling.
+_read_call_access_mode()'s docstring). "approved" mode now verifies callers
+via screenshot + OCR against configured handles (see caller_is_approved()
+and _ocr_caller_matches_customer()) — this is a real check, but the crop
+region it reads from is UNVERIFIED against a real live call (see
+CURANT_FACETIME_CALLERID_REGION if it needs tuning); "open" mode still
+answers every call with no verification at all, same as before.
 """
 
 from __future__ import annotations
@@ -396,6 +401,127 @@ def _facetime_call_daemon_active():
         return bool(r.stdout.strip())
     except Exception:
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Caller-ID verification via OCR -- closes the REGRESSION noted in
+# caller_is_approved()'s docstring below: Accessibility scripting cannot
+# read any text out of the call banner at all (confirmed by testing --
+# same finding that forced accept_call() over to visual template
+# matching), so there was previously no way to identify who's calling at
+# all, and 'approved' mode refused every single call as a result.
+#
+# A different approach was considered and deliberately NOT taken: reading
+# the caller's info out of macOS's own notification store directly (the
+# usernoted database some versions of macOS keep under
+# ~/Library/Group Containers/group.com.apple.usernoted/) instead of a
+# screenshot. Rejected because that format is private, undocumented, has
+# changed across macOS versions before, and -- critically -- there's no
+# live Mac available in the environment building this to actually verify
+# it works or find the right schema/query; shipping a guess at an
+# undocumented private database format is worse than being honest that
+# it's unverified. A screenshot + OCR is comparatively simple, uses only
+# public APIs (screencapture, already used elsewhere in this file, plus
+# an OCR library), and is the same approach this file's own prior
+# docstring already flagged as the real fix -- see caller_is_approved().
+#
+# REAL CAVEAT, stated plainly per this file's own house rule of not
+# hiding what's untested: the exact screen region the caller's name/
+# number renders in has NOT been confirmed against a live incoming call
+# (no live Mac available while building this) -- it starts from the same
+# region already confirmed to contain the Accept button
+# (_SEARCH_REGION_FRACTION), on the reasoning that the caller-ID text
+# lives in the same banner, but this needs a real call to verify. If it
+# doesn't work first try, CURANT_FACETIME_CALLERID_REGION lets you
+# override the crop without touching code -- see below.
+CALLERID_OCR_REGION_ENV = "CURANT_FACETIME_CALLERID_REGION"  # e.g. "0.55,1.0,0.0,0.30"
+
+
+def _callerid_search_region_fraction():
+    """Override via CURANT_FACETIME_CALLERID_REGION="x0,x1,y0,y1" (same
+    fraction-of-screen-size format as _SEARCH_REGION_FRACTION) if the
+    default (reusing the Accept button's own confirmed search region)
+    turns out not to actually contain the caller's name/number on a
+    real call."""
+    override = os.environ.get(CALLERID_OCR_REGION_ENV)
+    if override:
+        try:
+            parts = tuple(float(x) for x in override.split(","))
+            if len(parts) == 4:
+                return parts
+        except Exception:
+            print(f"  {CALLERID_OCR_REGION_ENV} isn't valid 'x0,x1,y0,y1' — ignoring, using the default region.",
+                  file=sys.stderr)
+    return _SEARCH_REGION_FRACTION  # same region already confirmed to contain the Accept button/banner
+
+
+def _ocr_text_from_screenshot(screenshot_path, region_fraction):
+    """
+    Crops the given region out of a full screenshot and runs OCR on it
+    via pytesseract (Tesseract under the hood) -- lazy-imported, same
+    pattern as curant-watcher.py's whisper/pypdf handling, so this file
+    doesn't hard-require the OCR stack just to run unrelated commands.
+    Returns (text_or_None, error_or_None) -- error is always a short,
+    actionable string (missing dependency, or the real exception),
+    never a raw traceback.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return None, ("OCR dependencies aren't installed — run: brew install tesseract && "
+                       "pip3 install pytesseract --break-system-packages")
+    try:
+        img = Image.open(screenshot_path).convert("RGB")
+        width, height = img.size
+        xf0, xf1, yf0, yf1 = region_fraction
+        x0, x1 = int(width * xf0), int(width * xf1)
+        y0, y1 = int(height * yf0), int(height * yf1)
+        region = img.crop((x0, y0, x1, y1))
+        text = pytesseract.image_to_string(region)
+        return text.strip(), None
+    except Exception as e:
+        return None, f"OCR failed: {e}"
+
+
+def _normalize_digits(s):
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+
+def _ocr_caller_matches_customer(ocr_text, customer_handles):
+    """
+    Matches OCR'd banner text against configured handles via SUFFIX
+    matching on digits only, not exact equality -- deliberate: a
+    caller-ID display doesn't always show a country code, and OCR can
+    drop a leading '+', but the actual subscriber number (the last
+    7-10 digits) is what's diagnostic regardless of formatting.
+
+    Compares per LINE rather than across the whole OCR blob, and that
+    matters: a formatted number like "+1 (614) 717-8753" tokenizes into
+    separate short digit runs ("1", "614", "717", "8753") if you
+    naively regex for contiguous digits anywhere in the text, and none
+    of those fragments is long enough to match on its own -- caught by
+    the synthetic-image smoke test that motivated this fix. Stripping
+    digits per LINE (not per contiguous run) fixes that, while still
+    avoiding concatenating digits across DIFFERENT lines, which would
+    let two unrelated short numbers stitch together into a false match.
+
+    Returns (matched: bool, matched_handle_or_None).
+    """
+    if not ocr_text:
+        return False, None
+    handle_digit_pairs = [(h, _normalize_digits(h)) for h in customer_handles if _normalize_digits(h)]
+    handle_digit_pairs = [(h, d) for h, d in handle_digit_pairs if len(d) >= 7]
+    if not handle_digit_pairs:
+        return False, None
+    for line in ocr_text.splitlines():
+        line_digits = _normalize_digits(line)
+        if len(line_digits) < 7:
+            continue
+        for original_handle, handle_digits in handle_digit_pairs:
+            if line_digits.endswith(handle_digits[-7:]) or handle_digits.endswith(line_digits[-7:]):
+                return True, original_handle
+    return False, None
 
 
 # Set once you've found the real coordinates by hovering your mouse over
@@ -790,35 +916,64 @@ def accept_call():
 
 def caller_is_approved(window_desc, cfg):
     """
-    IMPORTANT REGRESSION vs. the text-based watcher: caller ID
-    verification for FaceTime calls is NOT currently implemented. The
-    old version of this function tried to read the caller's name/number
-    out of the call window's title text — but live testing proved the
-    banner exposes no text to Accessibility scripting at all (same
-    finding that forced accept_call() over to visual detection). There's
-    no caller-identifying string available to check against configured
-    handles right now.
+    Real caller-ID verification for 'approved' mode, via screenshot +
+    OCR -- see the module-level comment above _callerid_search_region_fraction
+    for why OCR (not Accessibility scripting, which genuinely cannot see
+    inside the banner at all -- confirmed by testing) and not a
+    notification-database read. STILL UNVERIFIED against a real live
+    call (no live Mac available while building this) -- see that same
+    comment for the honest caveat and the CURANT_FACETIME_CALLERID_REGION
+    escape hatch if the default crop region turns out wrong.
 
-    The caller's number IS visible as rendered pixels in the banner
-    (confirmed from screenshots) — OCR (e.g. via Vision framework or
-    pytesseract) could read it back out and restore real verification,
-    but that's unbuilt. Until then, this fails CLOSED: 'approved' mode
-    (the safe default) refuses every call, since it cannot tell who's
-    calling. Only 'open' mode (already an explicit, documented
-    no-allowlist choice for the text watcher too) will actually answer.
+    Fails CLOSED at every step: no configured handles, a screenshot
+    failure, a missing OCR dependency, or OCR finding no matching digit
+    sequence all result in REFUSING the call, never answering an
+    unverified one. Only 'open' mode (explicit, no-allowlist, same
+    pattern as the text watcher's CURANT_TEXT_ACCESS_MODE=open) skips
+    verification entirely.
     """
     mode = _read_call_access_mode(cfg)
     if mode == "open":
         return True, "open call access mode (caller ID verification not implemented for calls)"
+
+    _primary, customer_handles = _read_customer_handles(cfg)
+    if not customer_handles:
+        return False, (
+            "approved mode requires verifying the caller against a configured handle, but none is "
+            "set (CURANT_CUSTOMER_APPLE_ID / CURANT_CUSTOMER_HANDLES / config.json) — refusing rather "
+            "than answering an unverified caller."
+        )
+
+    try:
+        screenshot_path = _capture_screenshot()
+    except Exception as e:
+        return False, f"approved mode requires verifying the caller, but the screenshot needed for OCR failed: {e}"
+
+    try:
+        region = _callerid_search_region_fraction()
+        ocr_text, ocr_error = _ocr_text_from_screenshot(screenshot_path, region)
+    finally:
+        if os.path.exists(screenshot_path):
+            os.remove(screenshot_path)
+
+    if ocr_error:
+        return False, (
+            f"approved mode requires verifying the caller via OCR, but OCR isn't available right now "
+            f"({ocr_error}) — refusing rather than answering an unverified caller. Set "
+            f"CURANT_CALL_ACCESS_MODE=open to bypass verification entirely (answers ANY call, no "
+            f"allowlist), or install the OCR dependency above to restore real verification."
+        )
+
+    matched, matched_handle = _ocr_caller_matches_customer(ocr_text, customer_handles)
+    if matched:
+        return True, f"caller ID OCR matched configured handle {matched_handle}"
+
     return False, (
-        "approved mode requires verifying the caller, but caller-ID text isn't "
-        "readable from the call banner (Accessibility scripting can't see it — "
-        "confirmed by testing) — refusing to auto-answer rather than answer an "
-        "unverified caller. Set CURANT_CALL_ACCESS_MODE=open if you want this Mac to "
-        "auto-answer any FaceTime call regardless of who it's from (this no longer "
-        "affects text access at all -- see CURANT_TEXT_ACCESS_MODE in curant-watcher.py "
-        "separately), or build OCR-based caller-ID reading before trusting 'approved' "
-        "mode for calls."
+        f"approved mode requires verifying the caller — OCR read the call banner but found no digit "
+        f"sequence matching any configured handle ({', '.join(customer_handles)}). Raw OCR text: "
+        f"{ocr_text!r}. This means either the caller genuinely isn't approved, OR (this is UNVERIFIED "
+        f"against a real call) the crop region needs tuning — set CURANT_FACETIME_CALLERID_REGION="
+        f'"x0,x1,y0,y1" if the raw OCR text above looks like it missed the actual caller-ID text entirely.'
     )
 
 
