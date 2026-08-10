@@ -78,6 +78,7 @@ import sys
 from contextlib import closing
 from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
+import stripe
 
 app = Flask(__name__)
 DB_PATH = os.environ.get("CURANT_DB_PATH", "curant.db")
@@ -208,6 +209,11 @@ def init_db():
             message TEXT,
             status TEXT DEFAULT 'open',  -- 'open' | 'reviewed' | 'done'
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_stripe_events (
+            event_id TEXT PRIMARY KEY,
+            processed_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         """)
         conn.commit()
@@ -355,6 +361,83 @@ def bind_device(license_key, device_id):
         )
         conn.commit()
         return True, None
+
+
+# --- Stripe checkout -> plan/addon mapping ---
+# Fill this in with your real Stripe Price IDs once you have them (Stripe
+# Dashboard > Product catalog > click into a price to see its id, looks
+# like "price_1AbC..."). Left empty until then -- an unmapped price
+# still provisions successfully (falls back to plan="base", no addons)
+# rather than silently failing the whole checkout, but gets flagged in
+# the server log so it doesn't go unnoticed.
+PRICE_PLAN_MAP = {
+    # "price_XXXXXXXXXXXXXX": {"plan": "base", "addons": []},
+    # "price_YYYYYYYYYYYYYY": {"plan": "pro", "addons": ["august"]},
+}
+
+
+def set_customer_addons(license_key, addons):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE customers SET unlocked_addons = ? WHERE license_key = ?",
+            (json.dumps(addons), license_key),
+        )
+        conn.commit()
+
+
+def is_stripe_event_processed(event_id):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM processed_stripe_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_stripe_event_processed(event_id):
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_stripe_events (event_id) VALUES (?)", (event_id,)
+        )
+        conn.commit()
+
+
+def plan_and_addons_for_checkout_session(session_id):
+    """
+    Looks up which plan/addons a completed Checkout Session actually paid
+    for, by listing its line items and matching each price id against
+    PRICE_PLAN_MAP. A checkout webhook payload doesn't include line items
+    by default (you'd need `expand: ["line_items"]` set at Checkout
+    Session CREATION time, which this server doesn't control if Checkout
+    was set up directly in the Stripe dashboard) -- so this makes a
+    separate API call instead, which works regardless of how the session
+    was created.
+
+    Any price id not found in PRICE_PLAN_MAP still provisions (falls back
+    to "base", no addons) rather than failing the whole checkout -- a
+    customer who paid should never end up with nothing over a mapping
+    typo -- but prints a warning so it doesn't go unnoticed.
+    """
+    plan = "base"
+    addons = []
+    try:
+        line_items = stripe.checkout.Session.list_line_items(session_id, limit=10)
+    except Exception as e:
+        print(f"[stripe webhook] couldn't list line items for session {session_id}: {e}", file=sys.stderr)
+        return plan, addons
+
+    for item in line_items.get("data", []):
+        price_id = (item.get("price") or {}).get("id")
+        if not price_id:
+            continue
+        mapping = PRICE_PLAN_MAP.get(price_id)
+        if mapping:
+            plan = mapping.get("plan", plan)
+            addons.extend(mapping.get("addons", []))
+        else:
+            print(f"[stripe webhook] price {price_id} isn't in PRICE_PLAN_MAP -- "
+                  f"provisioning with plan={plan!r} anyway rather than failing the checkout. "
+                  f"Add it to PRICE_PLAN_MAP once you know what it should unlock.", file=sys.stderr)
+    return plan, list(set(addons))
 
 
 # Sender address for license-delivery email -- override via env var if you
@@ -658,6 +741,95 @@ def error_report():
         )
         conn.commit()
     return jsonify({"ok": True})
+
+
+@app.route("/v1/stripe-webhook", methods=["POST"])
+def stripe_webhook():
+    """
+    Real Stripe webhook -- provisions a customer and emails their license
+    key automatically after a successful Checkout, no manual owner action
+    needed (see owner_create_customer() for the manual fallback path this
+    complements, not replaces).
+
+    Signature verification happens BEFORE anything else touches the
+    request body, using the raw bytes (request.get_data(), not
+    request.get_json()) -- Stripe's signature is computed over the exact
+    raw payload, and re-serializing parsed JSON can produce different
+    bytes (key order, whitespace) that would fail verification even for
+    a genuine Stripe request. This is what stops a malicious actor from
+    POSTing a fake "payment succeeded" event and getting a free license.
+
+    Idempotent by Stripe event id (see is_stripe_event_processed()) --
+    Stripe redelivers events on timeout/non-200 responses, and can
+    legitimately send the same event more than once even without an
+    error on your end. Without this check, a redelivered
+    checkout.session.completed would provision a second customer (and
+    send a second license email) for the same payment.
+
+    Returns 200 quickly on every recognized outcome (including "already
+    processed" and "unhandled event type") -- Stripe treats a slow or
+    non-200 response as failure and retries, so this deliberately never
+    does slow work (like actually sending the email) before responding...
+    except that it currently does, inline, synchronously. That's an
+    honest limitation: send_license_email() making a real network call to
+    SendGrid inside the request handler means a SendGrid slowdown could
+    approach Stripe's timeout and trigger a retry (which the idempotency
+    check makes SAFE, just not efficient). Moving email sending to a
+    background thread/queue would fix this properly but is more
+    infrastructure than this deployment has right now -- worth revisiting
+    before real volume, not before.
+    """
+    payload = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+
+    if not webhook_secret:
+        print("[stripe webhook] STRIPE_WEBHOOK_SECRET not set -- refusing to process "
+              "(would mean accepting webhook requests with no way to verify they're really "
+              "from Stripe).", file=sys.stderr)
+        return jsonify({"error": "webhook_not_configured"}), 500
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    except ValueError:
+        return jsonify({"error": "invalid_payload"}), 400
+    except stripe.error.SignatureVerificationError:
+        return jsonify({"error": "invalid_signature"}), 400
+
+    if is_stripe_event_processed(event["id"]):
+        return jsonify({"ok": True, "status": "already_processed"}), 200
+
+    if event["type"] == "checkout.session.completed":
+        session_obj = event["data"]["object"]
+        customer_details = session_obj.get("customer_details") or {}
+        customer_name = customer_details.get("name") or "Customer"
+        email = customer_details.get("email")
+
+        plan, addons = plan_and_addons_for_checkout_session(session_obj["id"])
+        license_key = provision_customer(customer_name, email=email, plan=plan)
+        if addons:
+            set_customer_addons(license_key, addons)
+
+        if email:
+            ok, error = send_license_email(customer_name, email, license_key)
+            if not ok:
+                print(f"[stripe webhook] provisioned {license_key} for {customer_name} but the "
+                      f"license email failed ({error}) -- visible in the owner dashboard, but "
+                      f"nothing was sent to the customer automatically. Relay it by hand.",
+                      file=sys.stderr)
+        else:
+            print(f"[stripe webhook] provisioned {license_key} for {customer_name} but Stripe "
+                  f"gave no email on the checkout session -- relay the key by hand.", file=sys.stderr)
+
+        mark_stripe_event_processed(event["id"])
+        return jsonify({"ok": True, "license_key": license_key}), 200
+
+    # Any other event type is acknowledged, not an error -- e.g.
+    # payment_method.attached, customer.updated, etc. that this server
+    # doesn't act on yet. Returning 200 (not 4xx/5xx) tells Stripe not to
+    # retry something there was never going to be a handler for.
+    mark_stripe_event_processed(event["id"])
+    return jsonify({"ok": True, "status": "unhandled_event_type"}), 200
 
 
 def create_release_request(license_key):
