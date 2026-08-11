@@ -2012,6 +2012,29 @@ def get_all_available_tools(config):
         "builtin": True,
     })
 
+    if get_customer_august_tier(config) == "grace":
+        tools.append({
+            "qualified_name": "search_order_status",
+            "description": (
+                "Search the customer's connected email for order confirmations or shipping "
+                "updates (e.g. Amazon, or any retailer that emails receipts/tracking) -- use this "
+                "when they ask something like 'where's my package' or 'did my order ship.' This "
+                "does NOT log into any retailer account -- it only searches email the customer's "
+                "already connected an MCP tool for, read-only. Never try to log into Amazon or any "
+                "retailer directly (browser tools will refuse login pages anyway) -- if this "
+                "doesn't turn up an answer, say so honestly rather than guessing or trying to work "
+                "around the refusal."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "What to search email for, e.g. 'Amazon order' or the retailer/item name"}},
+                "required": ["query"],
+            },
+            "server_command": None,
+            "raw_name": "search_order_status",
+            "builtin": True,
+        })
+
     # People-memory tools -- always available, same reasoning as
     # log_capability_gap above (no MCP server involved, no confirmation
     # needed: these only ever read/write LOCAL people-memory, they never
@@ -4233,6 +4256,13 @@ def execute_tool_call(tool_name, arguments, available_tools):
         if not description:
             return "[No description provided — nothing was logged.]"
         return log_capability_gap(description)
+
+    if match["builtin"] and tool_name == "search_order_status":
+        query = (arguments.get("query") or "").strip()
+        if not query:
+            return "[No search query provided.]"
+        config = load_config()
+        return search_order_status_email(query, config)
 
     if match["builtin"] and tool_name == "lookup_person":
         handle = (arguments.get("handle") or "").strip()
@@ -6935,6 +6965,85 @@ def proactive_check(context):
 
 
 EMAIL_SERVER_NAME_HINTS = ("gmail", "email", "outlook", "mail")
+ORDER_SEARCH_TOOL_NAME_HINTS = ("search",)  # prefer an actual query-capable tool over a
+                                              # blind "list everything" one for this use case
+ORDER_SEARCH_PARAM_NAME_HINTS = ("query", "q", "search", "term", "text")
+
+
+def _pick_query_param_name(input_schema):
+    """Best-effort guess at which property name a given MCP tool's
+    input_schema expects the search string under -- server authors
+    don't agree on this (query/q/search/term/text all show up in the
+    wild), and this file has no fixed contract with whatever email MCP
+    server the customer happened to connect. Falls back to the first
+    required string property, then the first property at all, then
+    None (meaning: don't guess, don't call it) if the schema is empty
+    or unreadable."""
+    try:
+        props = (input_schema or {}).get("properties") or {}
+        for hint in ORDER_SEARCH_PARAM_NAME_HINTS:
+            if hint in props:
+                return hint
+        required = (input_schema or {}).get("required") or []
+        for name in required:
+            if props.get(name, {}).get("type") == "string":
+                return name
+        return next(iter(props), None)
+    except Exception:
+        return None
+
+
+def search_order_status_email(query, config):
+    """
+    Grace-exclusive, best-effort (Step: closing the Amazon-order-status
+    capability gap logged via log_capability_gap). Deliberately does
+    NOT attempt to log into Amazon or any retailer -- fill_and_submit_form
+    already refuses login pages on its own, and this file has no
+    business storing a customer's retailer credentials to work around
+    that. What's actually buildable and safe: Amazon (and most
+    retailers) email order confirmations and shipping updates, so if
+    the customer has an email-like MCP server connected, this searches
+    it for the query and returns a short raw excerpt for the model to
+    summarize -- same read-only, best-effort pattern as
+    _get_email_summary_for_briefing, just query-driven instead of a
+    blind inbox listing, and callable mid-conversation instead of only
+    for the daily digest.
+
+    Returns a plain string on success. Returns a clear "couldn't find
+    a connected email tool" string (not None) on failure, so the model
+    always has something honest to tell the customer rather than
+    silently going quiet -- this is called directly as a tool result,
+    not folded into a larger digest the way the briefing version is.
+    """
+    try:
+        for server in get_mcp_servers(enabled_only=True):
+            name_lower = (server.get("name") or "").lower()
+            if not any(hint in name_lower for hint in EMAIL_SERVER_NAME_HINTS):
+                continue
+            tools = _get_server_tools_cached(server)
+            candidate = next(
+                (t for t in tools if any(hint in t["name"].lower() for hint in ORDER_SEARCH_TOOL_NAME_HINTS)),
+                None,
+            ) or next(
+                (t for t in tools if any(hint in t["name"].lower() for hint in EMAIL_TOOL_NAME_HINTS)),
+                None,
+            )
+            if not candidate:
+                continue
+            param_name = _pick_query_param_name(candidate.get("input_schema"))
+            arguments = {param_name: query} if param_name else {}
+            result = call_mcp_tool(server, candidate["name"], arguments)
+            if not result or (isinstance(result, str) and result.startswith("[Error")):
+                continue
+            text = result if isinstance(result, str) else json.dumps(result)
+            return text[:2000]
+    except Exception as e:
+        print(f"[order status search] email lookup failed (non-fatal): {e}", file=sys.stderr)
+    return ("No connected email tool could be searched for this -- either nothing's connected, "
+            "or the search didn't turn up a matching order/shipping email.")
+
+
+
 EMAIL_TOOL_NAME_HINTS = ("list", "search", "unread", "messages", "inbox")
 
 
