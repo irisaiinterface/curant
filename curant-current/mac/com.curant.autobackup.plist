@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.autobackup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/curant-cli</string>
+        <string>run-automated-backup</string>
+    </array>
+
+    <!-- Runs once a week, Sunday 3:00am. Grace-exclusive and opt-in
+         (curant-cli set-auto-backup on) -- safe to load on every Mac
+         regardless of tier/setup, same "safe to always run" pattern as
+         the other scheduled jobs; run_automated_backup() itself no-ops
+         for anyone who isn't Grace or hasn't turned this on. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-autobackup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-autobackup-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.autobackup.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.autobackup.plist
+
+Turn the feature itself on with:
+  curant-cli set-auto-backup on
+(Grace-exclusive -- this will refuse for any other tier, and prompts
+once for a passphrase which is stored in macOS Keychain, not any
+Curant config file. See run_automated_backup()'s docstring in
+curant-cli for the full design.)
+
+Logs land at /tmp/curant-autobackup.log and /tmp/curant-autobackup-error.log.
+-->

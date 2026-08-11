@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.weeklyrollup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+        <string>--weekly-rollup</string>
+    </array>
+
+    <!-- Runs once a week, Sunday 6:00pm -- ahead of the new work week,
+         a longer-form summary on top of the twice-daily briefing
+         everyone gets. Grace-exclusive (curant-cli's weekly_rollup()
+         checks the tier); safe to load on every Mac regardless of
+         tier, same "safe to always run" pattern as the other scheduled
+         jobs. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>18</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-weeklyrollup.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-weeklyrollup-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.weeklyrollup.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.weeklyrollup.plist
+
+Grace-exclusive, gated in curant-cli's weekly_rollup() function (checks
+get_customer_august_tier(config) == "grace") -- loading this job on a
+non-Grace customer's Mac is harmless, it just always results in
+should_send=false, same "safe to always run" pattern as the other
+scheduled jobs.
+
+To test immediately rather than waiting for Sunday evening, run
+curant-watcher.py with the --weekly-rollup flag directly (see
+ProgramArguments above).
+
+Logs land at /tmp/curant-weeklyrollup.log and /tmp/curant-weeklyrollup-error.log.
+-->

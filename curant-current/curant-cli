@@ -214,6 +214,36 @@ STATUS_RECHECK_SECONDS = 12 * 60 * 60  # re-verify with the server at most every
 MESSAGE_HISTORY_KEEP = 20     # ~10 exchanges — enough for a coherent back-and-forth
 MESSAGE_HISTORY_MAX_AGE_HOURS = 48  # also expire by time regardless of count
 
+# Grace gets a much larger conversational memory window -- both how much
+# raw history is RETAINED (write-time, in save_message) and how much of
+# it is actually READ into the system prompt each turn (get_history's
+# limit param at its relay() call site). Raising one without the other
+# wouldn't do anything: retaining more than what's ever read is wasted,
+# and reading a higher limit than what's retained just returns the same
+# small set anyway.
+MESSAGE_HISTORY_KEEP_GRACE = 200
+MESSAGE_HISTORY_MAX_AGE_HOURS_GRACE = 24 * 14  # 2 weeks instead of 48 hours
+
+
+def _message_history_keep(config=None):
+    try:
+        cfg = config if config is not None else load_config()
+        if get_customer_august_tier(cfg) == "grace":
+            return MESSAGE_HISTORY_KEEP_GRACE
+    except Exception:
+        pass
+    return MESSAGE_HISTORY_KEEP
+
+
+def _message_history_max_age_hours(config=None):
+    try:
+        cfg = config if config is not None else load_config()
+        if get_customer_august_tier(cfg) == "grace":
+            return MESSAGE_HISTORY_MAX_AGE_HOURS_GRACE
+    except Exception:
+        pass
+    return MESSAGE_HISTORY_MAX_AGE_HOURS
+
 # Urgency classification is a deliberately lightweight, free heuristic —
 # not another paid API call per message, the way the routing decision is.
 # It only flags things clearly signaled as urgent by surface wording or
@@ -760,6 +790,12 @@ def init_local_db():
             conn.execute("ALTER TABLE important_people ADD COLUMN is_spam INTEGER DEFAULT 0")
             conn.execute("ALTER TABLE important_people ADD COLUMN updated_at TEXT")
             conn.commit()
+        # Grace-exclusive VIP escalation -- separate migration check since
+        # this was added well after the columns above (a fresh install
+        # already has "handle" so the block above won't re-run for it).
+        if "is_vip" not in people_cols:
+            conn.execute("ALTER TABLE important_people ADD COLUMN is_vip INTEGER DEFAULT 0")
+            conn.commit()
     os.chmod(LOCAL_DB_PATH, 0o600)  # this db holds memories/history — owner-only
 
 
@@ -787,7 +823,7 @@ def get_important_people():
     # just because a row still exists for it (see set_person_spam).
     with closing(get_local_db()) as conn:
         rows = conn.execute(
-            "SELECT name, relationship, note, handle, gender, role, is_spam "
+            "SELECT name, relationship, note, handle, gender, role, is_spam, is_vip "
             "FROM important_people WHERE is_spam IS NOT 1"
         ).fetchall()
         return [dict(r) for r in rows]
@@ -803,7 +839,7 @@ def get_person_by_handle(handle):
         return None
     with closing(get_local_db()) as conn:
         row = conn.execute(
-            "SELECT name, relationship, note, handle, gender, role, is_spam "
+            "SELECT name, relationship, note, handle, gender, role, is_spam, is_vip "
             "FROM important_people WHERE handle = ?", (handle,)
         ).fetchone()
         return dict(row) if row else None
@@ -868,6 +904,72 @@ def set_person_spam(handle, is_spam=True):
         conn.commit()
 
 
+def set_vip(handle, is_vip=True):
+    """
+    Grace-exclusive VIP escalation. Flags (or un-flags) a handle as VIP
+    -- see get_vip_handles() for how this actually changes behavior
+    (curant-watcher.py's fetch_new_messages allows VIP handles through
+    even in the default secure 'approved' text-access mode, where every
+    OTHER non-customer sender's messages are never even fetched from
+    chat.db at all). Same "create a minimal record if none exists yet"
+    pattern as set_person_spam. Caller (mark_vip_cmd) is responsible for
+    the tier gate -- this function itself has no gate, matching how
+    set_person_spam has none either (it's a pure data-layer function)."""
+    if not handle:
+        raise ValueError("set_vip requires a handle")
+    existing = get_person_by_handle(handle)
+    with closing(get_local_db()) as conn:
+        if existing:
+            conn.execute(
+                "UPDATE important_people SET is_vip = ?, updated_at = CURRENT_TIMESTAMP WHERE handle = ?",
+                (1 if is_vip else 0, handle),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO important_people (name, handle, is_vip, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                (handle, handle, 1 if is_vip else 0),
+            )
+        conn.commit()
+
+
+def get_vip_handles():
+    """Every handle currently flagged VIP -- used by curant-watcher.py's
+    fetch_new_messages to let these specific senders' messages through
+    even in 'approved' access mode, where every other non-customer
+    sender is filtered out at the SQL level before Curant ever sees
+    their message exists. VIP messages still only ever go through the
+    notify-the-owner screening path, never full auto-reply -- being VIP
+    means "always tell me when they text," not "let Curant talk to them
+    on my behalf." """
+    with closing(get_local_db()) as conn:
+        rows = conn.execute(
+            "SELECT handle FROM important_people WHERE is_vip = 1 AND handle IS NOT NULL AND handle != ''"
+        ).fetchall()
+        return [r["handle"] for r in rows]
+
+
+def vip_handles_cmd():
+    """Internal -- prints VIP handles as a JSON array, for
+    curant-watcher.py to call once at startup (same pattern as how it
+    reads CUSTOMER_HANDLES from config once at module load)."""
+    print(json.dumps(get_vip_handles()))
+
+
+def mark_vip_cmd(handle, enabled_str):
+    """Grace-exclusive. `curant-cli mark-vip <handle> <on|off>`."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("VIP contact escalation is a Grace-exclusive feature.")
+        sys.exit(1)
+    if enabled_str not in ("on", "off"):
+        print("Usage: curant-cli mark-vip <handle> <on|off>")
+        sys.exit(1)
+    set_vip(handle, is_vip=(enabled_str == "on"))
+    print(f"{handle} marked {'VIP' if enabled_str == 'on' else 'not VIP'}. "
+          + ("Their texts will now reach you even if your text access mode is 'approved'."
+             if enabled_str == "on" else ""))
+
+
 def is_spam_handle(handle):
     with closing(get_local_db()) as conn:
         row = conn.execute("SELECT is_spam FROM important_people WHERE handle = ?", (handle,)).fetchone()
@@ -890,16 +992,17 @@ def save_message(role, content, provider=None, urgency=None):
         )
         # Data minimization: keep only enough raw history for conversational
         # continuity. Anything durable should already be promoted into
-        # `memories` by update_memories_from_exchange.
+        # `memories` by update_memories_from_exchange. Grace gets a larger
+        # retention window -- see MESSAGE_HISTORY_KEEP_GRACE.
         conn.execute(
             """DELETE FROM messages WHERE id NOT IN (
                    SELECT id FROM messages ORDER BY id DESC LIMIT ?
                )""",
-            (MESSAGE_HISTORY_KEEP,),
+            (_message_history_keep(),),
         )
         conn.execute(
             "DELETE FROM messages WHERE created_at < datetime('now', ?)",
-            (f"-{MESSAGE_HISTORY_MAX_AGE_HOURS} hours",),
+            (f"-{_message_history_max_age_hours()} hours",),
         )
         conn.commit()
 
@@ -5747,7 +5850,7 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
             provider = routed_provider
             api_key = routed_api_key
 
-    history = get_history()
+    history = get_history(limit=_message_history_keep(config))
     is_first_message = len(history) == 0
     urgency = classify_urgency(message_text)
 
@@ -5960,7 +6063,18 @@ def screen_message(sender, text, contact_name=None):
 
     Always prints exactly one JSON object to stdout:
       {"action": "ignore", "reason": "..."}
-      {"action": "notify_owner", "notice": "...", "sender": "...", "resolved_name": "..." or null}
+      {"action": "notify_owner", "notice": "...", "sender": "...", "resolved_name": "..." or null, "vip": true/false}
+
+    VIP escalation (Grace-exclusive -- see get_vip_handles/mark_vip_cmd):
+    a VIP sender's message is NEVER auto-ignored as spam, even if it
+    happens to trip the heuristic spam-phrase matcher below, and the
+    notice text is explicitly flagged so it stands out from an ordinary
+    unknown-sender notice. This function itself doesn't check tier --
+    that's enforced at the point VIP status can be SET (mark_vip_cmd) and
+    at the point a VIP's message is even allowed to reach here at all in
+    'approved' access mode (curant-watcher.py's fetch_new_messages,
+    gated on get_vip_handles which is only ever non-empty for Grace
+    customers in practice, since mark_vip_cmd refuses to set it otherwise).
     """
     init_local_db()
 
@@ -5969,7 +6083,9 @@ def screen_message(sender, text, contact_name=None):
         return
 
     person = get_person_by_handle(sender)
-    if person is None and _looks_like_spam(sender, text):
+    is_vip = bool(person and person.get("is_vip"))
+
+    if not is_vip and person is None and _looks_like_spam(sender, text):
         set_person_spam(sender, is_spam=True)
         print(json.dumps({"action": "ignore", "reason": "heuristic spam match — marked spam so it won't ask again"}))
         return
@@ -5982,13 +6098,27 @@ def screen_message(sender, text, contact_name=None):
     known_note = ""
     if person and (person.get("relationship") or person.get("role")):
         known_note = f" You've got them saved as: {person.get('relationship') or ''} {person.get('role') or ''}.".strip()
-    notice = (
-        f"You got a text from {who} that I haven't replied to — I only ever text people back if "
-        f"it's you, or you've told me to.{known_note}\n\nTheir message: \"{preview}\"\n\n"
-        f"Want me to reply, and if so what should I say? (Or tell me to mark them as spam if this "
-        f"isn't someone you know.)"
-    )
-    print(json.dumps({"action": "notify_owner", "notice": notice, "sender": sender, "resolved_name": resolved_name}))
+
+    urgency = classify_urgency(preview) if preview else None
+    urgency_note = " (This message also reads as urgent.)" if urgency == "urgent" else ""
+
+    if is_vip:
+        notice = (
+            f"🚨 VIP CONTACT: {who} just texted.{known_note}{urgency_note}\n\n"
+            f"Their message: \"{preview}\"\n\n"
+            f"Want me to reply, and if so what should I say?"
+        )
+    else:
+        notice = (
+            f"You got a text from {who} that I haven't replied to — I only ever text people back if "
+            f"it's you, or you've told me to.{known_note}{urgency_note}\n\nTheir message: \"{preview}\"\n\n"
+            f"Want me to reply, and if so what should I say? (Or tell me to mark them as spam if this "
+            f"isn't someone you know.)"
+        )
+    print(json.dumps({
+        "action": "notify_owner", "notice": notice, "sender": sender,
+        "resolved_name": resolved_name, "vip": is_vip,
+    }))
 
 
 def proactive_check(context):
@@ -6163,6 +6293,93 @@ def daily_briefing(context):
     }))
 
 
+def weekly_rollup(context):
+    """
+    Grace-exclusive. A longer-form weekly summary on top of the
+    twice-daily briefing everyone now gets by default -- scheduled
+    separately (see com.curant.weeklyrollup.plist, Sunday evening),
+    genuinely different in shape from daily_briefing: looks across the
+    week ahead rather than just today, and is expected to be a longer,
+    more thorough read since it only runs once a week rather than twice
+    a day. Reuses the same live context daily_briefing does (the
+    watcher's calendar/reminders lookup already pulls a week's worth of
+    events -- "eventsToday+7" -- so no separate data source is needed).
+
+    Same fail-closed contract as daily_briefing/proactive_check.
+    """
+    config = load_config()
+    key = config.get("license_key")
+    if not key:
+        print(json.dumps({"should_send": False, "error": "not_activated"}))
+        return
+
+    config, active = refresh_status_if_stale(config)
+    if not active:
+        print(json.dumps({"should_send": False, "error": "inactive_or_invalid_license"}))
+        return
+
+    if get_customer_august_tier(config) != "grace":
+        # Silent, not an error -- safe to schedule on every Mac regardless
+        # of tier, same pattern as the other scheduled jobs.
+        print(json.dumps({"should_send": False}))
+        return
+
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        print(json.dumps({"should_send": False, "error": "no_api_key_set"}))
+        return
+
+    if not context:
+        print(json.dumps({"should_send": False}))
+        return
+
+    memories = get_memories()
+    people = get_important_people()
+    extra = (
+        "Write this week's executive rollup -- a longer, more thorough weekly summary than "
+        "a normal daily briefing, based on the live calendar/reminders context below (which "
+        "covers roughly the next 7 days). Always produce a real rollup as long as there's "
+        "something in the context to summarize -- you are not deciding whether this is "
+        "worth sending. Organize it by day or by theme, whichever fits the actual week "
+        "ahead better; call out anything that looks like a scheduling conflict, an unusually "
+        "busy day, or something easy to lose track of across the week. No filler, no "
+        "'let me know if you need anything else' -- just the rollup itself.\n\n"
+        f"This week's live context:\n{context}\n\n"
+        'Respond with ONLY a JSON object: {"message": "..."}.'
+    )
+    system_prompt = build_system_prompt(config, memories, people, "", extra_instruction=extra)
+
+    try:
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Write this week's executive rollup."}],
+            max_tokens=1200, tier="main",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        message = (result.get("message") or "").strip()
+    except Exception as e:
+        print(f"Weekly rollup failed (non-fatal, not sending): {e}", file=sys.stderr)
+        print(json.dumps({"should_send": False}))
+        return
+
+    if not message:
+        print(json.dumps({"should_send": False}))
+        return
+
+    save_message("assistant", message)
+    print(json.dumps({
+        "should_send": True,
+        "message": message,
+        "reply_format": config.get("reply_format", "text"),
+        "voice_tier": config.get("voice_tier", "standard"),
+    }))
+
+
 # --- Local backup (encrypted with a customer-chosen passphrase; entirely local, no server involvement) ---
 
 def _derive_backup_key(passphrase, salt):
@@ -6195,6 +6412,43 @@ def _derive_backup_key(passphrase, salt):
 DEFAULT_BACKUP_PATH = os.path.join(CONFIG_DIR, "backup.curantbackup")
 
 
+def _write_encrypted_backup(passphrase, path=None, quiet=False):
+    """
+    Shared encryption/write logic used by both the interactive
+    backup_now() and the automated (Grace-only) scheduled backup path --
+    same payload scope, same scrypt-derived key, same file format either
+    way. See backup_now()'s docstring for exactly what is and isn't
+    included and why. `quiet` suppresses the human-facing print()s for
+    the unattended scheduled-job path (still writes to stderr on error).
+    """
+    import base64
+    from cryptography.fernet import Fernet
+
+    config = load_config()
+    payload_data = {
+        "persona": config.get("persona"),
+        "instructions": config.get("instructions"),
+        "reply_format": config.get("reply_format"),
+        "voice_tier": config.get("voice_tier"),
+        "proactivity_enabled": config.get("proactivity_enabled"),
+    }
+    plaintext = json.dumps(payload_data).encode()
+    salt = os.urandom(16)
+    if not quiet:
+        print("Deriving encryption key (this takes a couple seconds by design — "
+              "it should be similarly slow for anyone trying to guess your passphrase)...")
+    derived_key = _derive_backup_key(passphrase, salt)
+    ciphertext = Fernet(derived_key).encrypt(plaintext)
+    blob = base64.b64encode(salt).decode() + ":" + ciphertext.decode()
+
+    target = os.path.expanduser(path) if path else DEFAULT_BACKUP_PATH
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w") as f:
+        f.write(blob)
+    os.chmod(target, 0o600)
+    return target
+
+
 def backup_now(path=None):
     """
     Encrypts settings/preferences LOCALLY with a key derived from a
@@ -6222,10 +6476,11 @@ def backup_now(path=None):
     this machine, so it stays local-only even in a backup file; and
     message history already auto-expires by design, so there's no reason
     to preserve it.
+
+    See run_automated_backup() below for Grace's unattended weekly
+    version of this same underlying logic.
     """
-    import base64
     import getpass
-    from cryptography.fernet import Fernet
 
     config = load_config()
     if not config.get("license_key"):
@@ -6241,26 +6496,7 @@ def backup_now(path=None):
         print("Passphrases didn't match — nothing was written.")
         sys.exit(1)
 
-    payload_data = {
-        "persona": config.get("persona"),
-        "instructions": config.get("instructions"),
-        "reply_format": config.get("reply_format"),
-        "voice_tier": config.get("voice_tier"),
-        "proactivity_enabled": config.get("proactivity_enabled"),
-    }
-    plaintext = json.dumps(payload_data).encode()
-    salt = os.urandom(16)
-    print("Deriving encryption key (this takes a couple seconds by design — "
-          "it should be similarly slow for anyone trying to guess your passphrase)...")
-    derived_key = _derive_backup_key(passphrase, salt)
-    ciphertext = Fernet(derived_key).encrypt(plaintext)
-    blob = base64.b64encode(salt).decode() + ":" + ciphertext.decode()
-
-    target = os.path.expanduser(path) if path else DEFAULT_BACKUP_PATH
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w") as f:
-        f.write(blob)
-    os.chmod(target, 0o600)
+    target = _write_encrypted_backup(passphrase, path)
 
     print(f"Backup written to {target}")
     print("This backs up your settings only (persona, instructions, reply/voice "
@@ -6272,6 +6508,118 @@ def backup_now(path=None):
               "survives losing this Mac (an external drive, iCloud Drive, Dropbox, etc.) "
               "if you want it to actually protect against that. You can also just run "
               "`curant-cli backup-now --path <somewhere else>` directly next time.")
+
+
+BACKUP_KEYCHAIN_SERVICE = "curant-auto-backup"  # macOS Keychain item name, not a config.json value
+
+
+def set_auto_backup_cmd(enabled_str):
+    """
+    Grace-exclusive: turns on unattended weekly encrypted backups (see
+    run_automated_backup / com.curant.autobackup.plist). The real design
+    problem this solves: backup_now()'s passphrase is deliberately never
+    stored anywhere, by design (see its docstring) -- fine for a command
+    a customer runs themselves, impossible for a scheduled job with no
+    one there to type it in. This asks for the passphrase ONCE, right
+    now, interactively, and stores it in the macOS Keychain (via the
+    `security` CLI) rather than anywhere in config.json -- Keychain
+    entries are protected by the user's own login, encrypted at rest by
+    macOS itself, and specifically designed for exactly this "let a
+    background process retrieve a secret without a human typing it"
+    use case. This is a genuinely different security posture than a
+    plaintext config value would be, though it's honest to note it's
+    still a lower bar than a passphrase that's NEVER stored anywhere at
+    all, which is what backup_now() gives you if you run it yourself.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Automatic backups are a Grace-exclusive feature. Everyone else can still run "
+              "`curant-cli backup-now` manually anytime.")
+        sys.exit(1)
+
+    if enabled_str is None:
+        current = config.get("auto_backup_enabled", False)
+        print(f"Automatic weekly backup is currently {'on' if current else 'off'}.")
+        return
+
+    if enabled_str.lower() not in ("on", "off"):
+        print("Usage: curant-cli set-auto-backup <on|off>")
+        sys.exit(1)
+
+    if enabled_str.lower() == "off":
+        config["auto_backup_enabled"] = False
+        save_config(config)
+        subprocess.run(
+            ["security", "delete-generic-password", "-s", BACKUP_KEYCHAIN_SERVICE],
+            capture_output=True,
+        )
+        print("Automatic weekly backup turned off, and the stored passphrase was removed "
+              "from Keychain.")
+        return
+
+    import getpass
+    passphrase = getpass.getpass("Choose a passphrase for automatic weekly backups (input hidden): ")
+    if not passphrase:
+        print("Passphrase can't be empty.")
+        sys.exit(1)
+    confirm = getpass.getpass("Confirm passphrase: ")
+    if passphrase != confirm:
+        print("Passphrases didn't match — automatic backup was not enabled.")
+        sys.exit(1)
+
+    # -U updates an existing Keychain entry instead of erroring if one's already there
+    result = subprocess.run(
+        ["security", "add-generic-password", "-a", os.environ.get("USER", "curant"),
+         "-s", BACKUP_KEYCHAIN_SERVICE, "-w", passphrase, "-U"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Couldn't save the passphrase to Keychain: {result.stderr.strip()}")
+        sys.exit(1)
+
+    config["auto_backup_enabled"] = True
+    save_config(config)
+    print("Automatic weekly backup turned on. Your passphrase is stored in macOS Keychain "
+          "(not in any Curant config file) so the scheduled job can use it without you "
+          "typing it in each time. Remember it anyway -- Curant still has no way to recover "
+          "it if you ever need to restore on a different Mac.")
+
+
+def run_automated_backup():
+    """
+    Grace-exclusive, unattended -- invoked by com.curant.autobackup.plist
+    on a weekly schedule, never by a human directly. Retrieves the
+    passphrase from Keychain (set up via `curant-cli set-auto-backup on`)
+    rather than prompting, since nothing is watching stdin on a
+    scheduled job. Silently does nothing if auto backups aren't enabled,
+    the tier isn't Grace, or no passphrase is in Keychain yet -- this is
+    meant to be safe to schedule on every Mac regardless of tier/setup,
+    same "safe to always run" pattern as the other scheduled jobs.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        return
+    if not config.get("auto_backup_enabled"):
+        return
+
+    result = subprocess.run(
+        ["security", "find-generic-password", "-a", os.environ.get("USER", "curant"),
+         "-s", BACKUP_KEYCHAIN_SERVICE, "-w"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"[auto-backup] no passphrase in Keychain, skipping: {result.stderr.strip()}", file=sys.stderr)
+        return
+    passphrase = result.stdout.strip()
+    if not passphrase:
+        print("[auto-backup] Keychain entry was empty, skipping", file=sys.stderr)
+        return
+
+    try:
+        target = _write_encrypted_backup(passphrase, path=None, quiet=True)
+        print(f"[auto-backup] wrote {target}", file=sys.stderr)
+    except Exception as e:
+        print(f"[auto-backup] failed (non-fatal): {e}", file=sys.stderr)
 
 
 def backup_restore(path=None):
@@ -7393,6 +7741,17 @@ def main():
     p_briefing_toggle = sub.add_parser("set-daily-briefing", help="Turn the twice-daily executive briefing on or off (on by default)")
     p_briefing_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
 
+    p_auto_backup = sub.add_parser("set-auto-backup", help="Grace-exclusive: turn on unattended weekly encrypted backups")
+    p_auto_backup.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
+
+    sub.add_parser("run-automated-backup", help="Internal — runs the scheduled weekly auto-backup (Grace-only, no-op otherwise)")
+
+    p_mark_vip = sub.add_parser("mark-vip", help="Grace-exclusive: mark a contact as VIP -- their texts reach you even in 'approved' access mode")
+    p_mark_vip.add_argument("handle", help="Phone number or email, as it appears in Messages")
+    p_mark_vip.add_argument("enabled", choices=["on", "off"])
+
+    sub.add_parser("vip-handles", help="Internal — prints VIP contact handles as JSON (used by curant-watcher.py)")
+
     p_provider = sub.add_parser("set-provider", help="Switch which model provider handles messages — same persona/memories carry over")
     p_provider.add_argument("provider", choices=sorted(PROVIDER_MODELS))
 
@@ -7489,6 +7848,12 @@ def main():
     p_proactive = sub.add_parser("proactive-check", help="Check if a proactive check-in is warranted (internal use)")
     p_proactive.add_argument("--context", default="", help="Live device context (calendar/reminders)")
 
+    p_briefing = sub.add_parser("daily-briefing", help="Generate today's executive daily briefing (internal use)")
+    p_briefing.add_argument("--context", default="", help="Live device context (calendar/reminders)")
+
+    p_rollup = sub.add_parser("weekly-rollup", help="Grace-exclusive: generate this week's executive rollup (internal use)")
+    p_rollup.add_argument("--context", default="", help="Live device context (calendar/reminders)")
+
     p_backup_now = sub.add_parser("backup-now", help="Write an encrypted local backup of your settings only (passphrase prompted, not a CLI arg)")
     p_backup_now.add_argument("--path", default=None, help="Where to write the backup file (default: ~/.curant/backup.curantbackup)")
 
@@ -7523,6 +7888,14 @@ def main():
         set_voice_cmd(args.voice_id)
     elif args.command == "set-daily-briefing":
         set_daily_briefing_cmd(args.enabled)
+    elif args.command == "set-auto-backup":
+        set_auto_backup_cmd(args.enabled)
+    elif args.command == "run-automated-backup":
+        run_automated_backup()
+    elif args.command == "mark-vip":
+        mark_vip_cmd(args.handle, args.enabled)
+    elif args.command == "vip-handles":
+        vip_handles_cmd()
     elif args.command == "set-provider":
         set_provider(args.provider)
     elif args.command == "status":
@@ -7585,6 +7958,8 @@ def main():
         proactive_check(args.context)
     elif args.command == "daily-briefing":
         daily_briefing(args.context)
+    elif args.command == "weekly-rollup":
+        weekly_rollup(args.context)
     elif args.command == "backup-now":
         backup_now(args.path)
     elif args.command == "backup-restore":

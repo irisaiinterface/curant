@@ -80,6 +80,35 @@ def _read_customer_handles():
 
 CUSTOMER_APPLE_ID, CUSTOMER_HANDLES = _read_customer_handles()
 
+
+def _read_vip_handles():
+    """
+    Grace-exclusive VIP escalation (curant-cli's get_vip_handles/
+    mark_vip_cmd) -- read once at module load, same pattern as
+    CUSTOMER_HANDLES above, rather than shelling out on every single
+    poll cycle. A VIP's messages are allowed through fetch_new_messages'
+    SQL filter even in the default 'approved' access mode, where every
+    other non-customer sender is filtered out before Curant ever sees
+    their message exists -- but they still only ever go through
+    screen_with_curant's notify-only path (see its call site below),
+    never full auto-reply. Fails closed (empty list) on any error --
+    a broken VIP lookup should never accidentally widen who gets
+    fetched, it should just mean no VIP escalation this run.
+    """
+    try:
+        result = subprocess.run(
+            ["curant-cli", "vip-handles"], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        print(f"VIP handle lookup failed (non-fatal, no VIP escalation this run): {e}", file=sys.stderr)
+        return []
+
+
+VIP_HANDLES = _read_vip_handles()
+
 # Access mode: 'approved' (default, secure) answers only CUSTOMER_HANDLES;
 # 'open' answers ANY incoming text or iMessage, no allowlist at all. Set
 # WITHOUT editing this file, same pattern as the handles above:
@@ -157,8 +186,8 @@ def fetch_new_messages(since_rowid):
     common structure; verify column names against your OS version with
     `sqlite3 ~/Library/Messages/chat.db ".schema message"` if this breaks.
     """
-    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES:
-        return []  # no customer identity configured — nothing to match (see main()'s guard)
+    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES:
+        return []  # no customer identity configured and no VIP contacts either — nothing to match
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     base_query = """
@@ -178,11 +207,20 @@ def fetch_new_messages(since_rowid):
         # skipped.
         cur = conn.execute(base_query + " ORDER BY message.ROWID ASC", (since_rowid,))
     else:
+        # Allowlist is the customer's own handles PLUS any Grace-exclusive
+        # VIP handles (VIP_HANDLES, read once at startup -- see
+        # _read_vip_handles). This is the one deliberate widening of
+        # 'approved' mode's normally-strict filter: a VIP contact's
+        # message is allowed through to screen_with_curant (never full
+        # auto-reply -- see its call site below) even though every OTHER
+        # non-customer sender stays completely invisible to Curant in
+        # this mode, same as before VIP escalation existed.
+        allowed_handles = CUSTOMER_HANDLES + [h for h in VIP_HANDLES if h not in CUSTOMER_HANDLES]
         # placeholders is our own controlled "?,?" string — values stay parameterized.
-        placeholders = ",".join("?" for _ in CUSTOMER_HANDLES)
+        placeholders = ",".join("?" for _ in allowed_handles)
         cur = conn.execute(
             base_query + f" AND handle.id IN ({placeholders}) ORDER BY message.ROWID ASC",
-            (since_rowid, *CUSTOMER_HANDLES),
+            (since_rowid, *allowed_handles),
         )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
@@ -687,6 +725,42 @@ def run_daily_briefing():
         send_text_reply(CUSTOMER_APPLE_ID, message_text)
 
 
+def run_weekly_rollup():
+    """
+    Grace-exclusive weekly executive rollup -- scheduled separately (see
+    com.curant.weeklyrollup.plist, Sunday evening). curant-cli's
+    weekly_rollup() does the actual Grace-tier gating; this function is
+    safe to run unconditionally on every Mac's schedule, same pattern as
+    run_daily_briefing/run_proactive_check.
+    """
+    live_context = get_calendar_and_reminders_context()
+    result = subprocess.run(
+        ["curant-cli", "weekly-rollup", "--context", live_context],
+        capture_output=True, text=True,
+    )
+    try:
+        decision = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        print(f"Unexpected weekly-rollup output (length {len(result.stdout)})", file=sys.stderr)
+        return
+
+    if not decision.get("should_send"):
+        return
+
+    message_text = decision.get("message", "")
+    if not message_text:
+        return
+
+    if decision.get("reply_format") == "voice":
+        try:
+            audio_path = text_to_speech(message_text, decision.get("voice_tier", "standard"))
+            send_voice_reply(CUSTOMER_APPLE_ID, audio_path)
+        except Exception:
+            report_watcher_error("tts_failed")
+    else:
+        send_text_reply(CUSTOMER_APPLE_ID, message_text)
+
+
 _contact_name_cache = {}  # handle -> resolved name (or None), looked up once per handle per run
 
 
@@ -1065,5 +1139,9 @@ if __name__ == "__main__":
         # Invoked once by com.curant.dailybriefing.plist on a schedule —
         # same run-and-exit pattern as --proactive-check above.
         run_daily_briefing()
+    elif "--weekly-rollup" in sys.argv:
+        # Invoked once by com.curant.weeklyrollup.plist on a schedule —
+        # same run-and-exit pattern as --proactive-check above.
+        run_weekly_rollup()
     else:
         main()
