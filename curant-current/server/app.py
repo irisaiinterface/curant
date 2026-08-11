@@ -79,6 +79,7 @@ from contextlib import closing
 from functools import wraps
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
 import stripe
+import requests
 
 app = Flask(__name__)
 DB_PATH = os.environ.get("CURANT_DB_PATH", "curant.db")
@@ -215,6 +216,14 @@ def init_db():
             event_id TEXT PRIMARY KEY,
             processed_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS server_generation_costs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            service TEXT,          -- 'flux' | 'ideogram' (Veo intentionally not here yet -- see AUGUST_TIER_CONFIG's docstring)
+            estimated_cost_usd REAL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """)
         conn.commit()
 
@@ -272,9 +281,23 @@ def init_db():
 # Links) -- until then the dashboard shows a "contact to unlock" prompt
 # instead of a broken/missing button.
 ADDON_CATALOG = {
-    "august": {
-        "label": "August (creative persona)",
-        "description": "The specialist creative persona -- image/video/voice generation tools.",
+    "august_standard": {
+        "label": "August Standard ($4.99/mo)",
+        "description": "The specialist creative persona, with $2/mo of image generation "
+                        "(FLUX/Ideogram) included -- covered by us, not billed to your own "
+                        "provider accounts. No video generation on this tier.",
+        "stripe_payment_link": None,
+    },
+    "august_pro": {
+        "label": "August Pro ($10.99/mo)",
+        "description": "Everything in Standard, plus video generation (Veo) and a $5/mo "
+                        "covered generation budget across images and video.",
+        "stripe_payment_link": None,
+    },
+    "august_max": {
+        "label": "August Max ($20.99/mo)",
+        "description": "Everything in Pro, plus a $10/mo covered generation budget and access "
+                        "to additional creative features as they're built.",
         "stripe_payment_link": None,
     },
     "browser_automation": {
@@ -286,6 +309,137 @@ ADDON_CATALOG = {
         "stripe_payment_link": None,
     },
 }
+
+# --- August tier -> covered-generation-budget config ---
+# Deliberately separate from ADDON_CATALOG (which is customer-facing
+# display text) -- this is the actual enforcement data: how much of
+# FLUX/Ideogram/Veo cost is covered per month for each tier, and whether
+# video is allowed at all. A customer's tier is whichever ONE of these
+# three keys appears in their unlocked_addons (set by provision_customer
+# via PRICE_PLAN_MAP, same as any other addon).
+#
+# Veo is NOT proxied yet -- video_allowed here reflects the PRICING
+# promise (Pro/Max tiers include video in what they pay for), but the
+# actual server-side Veo proxy (holding a Google API key, tracking an
+# async job, hosting the finished file for retrieval) hasn't been built.
+# Until it is, video_allowed=True tiers should still fail gracefully if
+# a video is requested -- see the "not yet implemented" note on the
+# generate-video path once/if that's added.
+AUGUST_TIER_CONFIG = {
+    "august_standard": {"monthly_cap_usd": 2.0, "video_allowed": False},
+    "august_pro": {"monthly_cap_usd": 5.0, "video_allowed": True},
+    "august_max": {"monthly_cap_usd": 10.0, "video_allowed": True},
+}
+
+# Server's own FLUX/Ideogram keys -- these are what actually get spent
+# against a customer's tier cap, never sent to any customer's Mac. Set
+# these as real env vars before this proxy can do anything; a missing
+# key fails closed (see generate_image_flux_proxy/generate_image_ideogram_proxy).
+FLUX_API_KEY = os.environ.get("FLUX_API_KEY")
+IDEOGRAM_API_KEY = os.environ.get("IDEOGRAM_API_KEY")
+
+# Same verified-Aug-2026 rates as curant-cli's own ESTIMATED_COST_USD
+# (kept as a separate constant, not imported, since the server and
+# curant-cli are separate deployables with no shared module) -- FLUX is
+# BFL's own stated per-image price; Ideogram is V4 Default's per-image
+# API rate. Both re-verified via web search, not assumed.
+ESTIMATED_GENERATION_COST_USD = {
+    "flux": 0.04,
+    "ideogram": 0.06,
+}
+
+# Contact shown once a customer has used their tier's covered budget for
+# the month -- placeholder, same unfilled pattern as curant-cli's own
+# QUOTE_PHONE_NUMBER / GENERATION_TOPUP_CONTACT. Needs a real value.
+GENERATION_SALES_CONTACT = "REPLACE_WITH_REAL_SALES_CONTACT"
+
+
+def get_customer_august_tier(customer):
+    """Returns the customer's august_* tier key (one of AUGUST_TIER_CONFIG's
+    keys) or None if they don't have any August tier unlocked. A customer
+    should only ever have ONE of the three -- if somehow more than one is
+    present (shouldn't happen via normal provisioning), the highest cap
+    tier wins, since refusing to serve someone who's clearly paid for
+    *something* would be a worse failure mode than picking generously."""
+    unlocked = json.loads(customer["unlocked_addons"] or "[]")
+    tiers = [a for a in unlocked if a in AUGUST_TIER_CONFIG]
+    if not tiers:
+        return None
+    return max(tiers, key=lambda t: AUGUST_TIER_CONFIG[t]["monthly_cap_usd"])
+
+
+def get_server_monthly_spend(license_key):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT SUM(estimated_cost_usd) as total FROM server_generation_costs "
+            "WHERE license_key = ? AND created_at >= date('now', 'start of month')",
+            (license_key,),
+        ).fetchone()
+        return row["total"] or 0.0
+
+
+def check_and_log_server_generation_cost(license_key, tier, service, cost):
+    """
+    Atomically checks this month's spend-plus-this-generation against the
+    tier's cap AND logs it, as a single database transaction -- not two
+    separate steps. This closes a real race condition: if "check the cap"
+    and "log the cost" were separate operations, a burst of near-
+    simultaneous requests could each see a spend total that doesn't yet
+    include the others' cost, and all pass the check before any of them
+    got counted -- letting total spend blow past the cap in a fast burst
+    even though each individual request looked fine when it checked.
+
+    BEGIN IMMEDIATE acquires SQLite's write lock up front, serializing
+    concurrent calls to this function against each other -- the second
+    concurrent request has to wait for the first's transaction to fully
+    commit (cost logged) before it can even read the current total, so
+    it sees the first request's spend already counted.
+
+    Returns (ok: bool, error: str | None).
+    """
+    cap = AUGUST_TIER_CONFIG[tier]["monthly_cap_usd"]
+    with closing(get_db()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT SUM(estimated_cost_usd) as total FROM server_generation_costs "
+                "WHERE license_key = ? AND created_at >= date('now', 'start of month')",
+                (license_key,),
+            ).fetchone()
+            current = row["total"] or 0.0
+            projected = current + cost
+            if projected > cap:
+                conn.execute("ROLLBACK")
+                return False, None, (
+                    f"This would put this month's covered generation spend at an estimated "
+                    f"${projected:.2f}, over your ${cap:.2f}/mo included budget. Nothing was "
+                    f"generated. For more this month: {GENERATION_SALES_CONTACT}."
+                )
+            cursor = conn.execute(
+                "INSERT INTO server_generation_costs (license_key, service, estimated_cost_usd) VALUES (?, ?, ?)",
+                (license_key, service, cost),
+            )
+            conn.commit()
+            return True, cursor.lastrowid, None
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def refund_server_generation_cost(cost_row_id):
+    """
+    Deletes a cost row that was reserved by check_and_log_server_generation_cost
+    but whose actual generation call then failed (bad response from FLUX/
+    Ideogram, network error, etc.) -- a customer shouldn't be charged
+    against their monthly budget for a generation that never happened.
+    Reserving first and refunding on failure (rather than checking without
+    reserving, then logging only after success) is what keeps the cap
+    check race-free -- see check_and_log_server_generation_cost's
+    docstring for why the atomic reserve matters.
+    """
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM server_generation_costs WHERE id = ?", (cost_row_id,))
+        conn.commit()
 
 # Persona catalog for the dashboard dropdown -- kept in sync manually with
 # curant-cli's own PERSONAS dict (curant-cli is the source of truth for
@@ -588,6 +742,174 @@ def set_feature_request_status(request_id, status):
         conn.execute("UPDATE feature_requests SET status = ? WHERE id = ?", (status, request_id))
         conn.commit()
     return True, None
+
+
+# --- August generation proxy (FLUX / Ideogram) ---
+# The server holds the real keys and makes these calls itself -- a
+# customer's Mac never receives FLUX_API_KEY/IDEOGRAM_API_KEY, only the
+# resulting image URL, so there's nothing here for a customer to extract
+# and reuse outside the tier cap. Mirrors curant-cli's own
+# generate_image_flux/generate_image_ideogram request shapes exactly
+# (verified against the same BFL/Ideogram integration docs those were
+# built from) -- this replaces where that code runs for August-tier
+# customers, it doesn't reimplement it differently.
+
+def generate_image_flux_proxy(prompt):
+    """Returns (image_url, error). Fails closed if FLUX_API_KEY isn't
+    configured on the server -- never falls back to anything, since
+    there's no customer key to fall back to in this proxied path."""
+    if not FLUX_API_KEY:
+        return None, "Image generation isn't configured on the server yet (FLUX_API_KEY unset)."
+    try:
+        submit = requests.post(
+            "https://api.bfl.ai/v1/flux-pro-1.1",
+            headers={"accept": "application/json", "x-key": FLUX_API_KEY, "Content-Type": "application/json"},
+            json={"prompt": prompt, "width": 1024, "height": 1024},
+            timeout=30,
+        )
+        submit.raise_for_status()
+        submit_data = submit.json()
+        task_id = submit_data.get("id")
+        polling_url = submit_data.get("polling_url")
+        if not task_id or not polling_url:
+            return None, "FLUX didn't return an id/polling_url."
+        for _ in range(60):
+            time.sleep(0.5)
+            result = requests.get(
+                polling_url, params={"id": task_id},
+                headers={"accept": "application/json", "x-key": FLUX_API_KEY}, timeout=15,
+            )
+            result.raise_for_status()
+            data = result.json()
+            status = data.get("status")
+            if status == "Ready":
+                image_url = (data.get("result") or {}).get("sample")
+                if not image_url:
+                    return None, "FLUX reported ready but returned no image URL."
+                return image_url, None
+            if status in ("Error", "Failed"):
+                return None, "FLUX generation failed."
+        return None, "FLUX generation timed out waiting for a result."
+    except Exception:
+        # Deliberately NOT including str(e) in what reaches the customer —
+        # some providers echo request details (occasionally including
+        # partial key/account info) into error bodies, and that exception
+        # text could carry it. Full detail goes to the server's own
+        # stderr for you to debug; the customer gets a generic message.
+        print(f"[generate-image proxy] FLUX call failed", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return None, "Image generation failed. Nothing was charged."
+
+
+def generate_image_ideogram_proxy(prompt):
+    """Returns (image_url, error). Same fail-closed/error-sanitizing
+    pattern as generate_image_flux_proxy."""
+    if not IDEOGRAM_API_KEY:
+        return None, "Text-in-image generation isn't configured on the server yet (IDEOGRAM_API_KEY unset)."
+    try:
+        resp = requests.post(
+            "https://api.ideogram.ai/v1/ideogram-v4/generate",
+            headers={"Api-Key": IDEOGRAM_API_KEY, "Content-Type": "application/json"},
+            json={"prompt": prompt},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("data") or []
+        image_url = items[0].get("url") if items else None
+        if not image_url:
+            return None, "Ideogram didn't return an image URL."
+        return image_url, None
+    except Exception:
+        print(f"[generate-image-with-text proxy] Ideogram call failed", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return None, "Image generation failed. Nothing was charged."
+
+
+def _august_proxy_precheck(request):
+    """
+    Shared setup for both generation-proxy endpoints: validates the
+    license key, confirms an August tier is actually unlocked, and
+    applies a tighter rate limit than the general API limit (these
+    endpoints spend real money per successful call, unlike most of this
+    server's other endpoints, so they get their own stricter budget).
+
+    Returns (customer, tier, error_response_tuple). error_response_tuple
+    is None on success; otherwise it's exactly what the route should
+    `return` directly.
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(f"generate:{license_key or 'unknown'}"):
+        return None, None, (jsonify({"error": "rate_limited"}), 429)
+
+    customer = get_customer(license_key)
+    if not customer or not customer["active"]:
+        return None, None, (jsonify({"error": "invalid_or_inactive_license"}), 403)
+
+    tier = get_customer_august_tier(customer)
+    if not tier:
+        return None, None, (jsonify({"error": "no_august_tier_unlocked"}), 403)
+
+    return customer, tier, None
+
+
+@app.route("/v1/generate-image", methods=["POST"])
+def generate_image_endpoint():
+    customer, tier, err = _august_proxy_precheck(request)
+    if err:
+        return err
+
+    data = request.get_json(force=True)
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt_required"}), 400
+    if len(prompt) > 4000:
+        return jsonify({"error": "prompt_too_long"}), 400
+
+    license_key = customer["license_key"]
+    ok, cost_row_id, cap_error = check_and_log_server_generation_cost(
+        license_key, tier, "flux", ESTIMATED_GENERATION_COST_USD["flux"]
+    )
+    if not ok:
+        return jsonify({"error": "cap_exceeded", "message": cap_error}), 402
+
+    image_url, error = generate_image_flux_proxy(prompt)
+    if error:
+        # Generation didn't actually happen -- don't charge the customer's
+        # monthly budget for it.
+        refund_server_generation_cost(cost_row_id)
+        return jsonify({"error": "generation_failed", "message": error}), 502
+    return jsonify({"ok": True, "image_url": image_url})
+
+
+@app.route("/v1/generate-image-with-text", methods=["POST"])
+def generate_image_with_text_endpoint():
+    customer, tier, err = _august_proxy_precheck(request)
+    if err:
+        return err
+
+    data = request.get_json(force=True)
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt_required"}), 400
+    if len(prompt) > 4000:
+        return jsonify({"error": "prompt_too_long"}), 400
+
+    license_key = customer["license_key"]
+    ok, cost_row_id, cap_error = check_and_log_server_generation_cost(
+        license_key, tier, "ideogram", ESTIMATED_GENERATION_COST_USD["ideogram"]
+    )
+    if not ok:
+        return jsonify({"error": "cap_exceeded", "message": cap_error}), 402
+
+    image_url, error = generate_image_ideogram_proxy(prompt)
+    if error:
+        refund_server_generation_cost(cost_row_id)
+        return jsonify({"error": "generation_failed", "message": error}), 502
+    return jsonify({"ok": True, "image_url": image_url})
 
 
 # --- Endpoints ---

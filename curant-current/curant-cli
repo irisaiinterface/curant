@@ -2536,6 +2536,86 @@ def generate_image_ideogram(prompt, config):
         return None, f"Ideogram call failed: {e}"
 
 
+AUGUST_COVERED_GENERATION_TIERS = ("august_standard", "august_pro", "august_max")
+
+
+def get_customer_august_tier(config):
+    """Returns the customer's active August tier ('august_standard' /
+    'august_pro' / 'august_max') if they have one unlocked, else None.
+    Used to decide whether generate_image/generate_image_with_text
+    should go through Curant's server proxy (business-covered, real
+    key never touches this Mac) or fall back to the customer's own BYOK
+    key. If more than one tier is somehow present, the highest one wins
+    -- mirrors the server's own get_customer_august_tier in app.py."""
+    addons = config.get("unlocked_addons", []) or []
+    for tier in ("august_max", "august_pro", "august_standard"):
+        if tier in addons:
+            return tier
+    return None
+
+
+def _handle_server_generation_response(resp):
+    """Shared (path, error) handling for both server-proxied generation
+    endpoints. The server never sends back its own FLUX/Ideogram key --
+    only a hosted image_url to download, or a sanitized error message
+    (cap exceeded, generation failed, etc.)."""
+    try:
+        data = resp.json()
+    except Exception:
+        return None, f"Curant's server returned an unreadable response (status {resp.status_code})."
+    if resp.status_code == 200 and data.get("ok"):
+        image_url = data.get("image_url")
+        if not image_url:
+            return None, "Curant's server reported success but returned no image URL."
+        return _download_generated_file(image_url, "png"), None
+    return None, data.get("message") or data.get("error") or f"Curant's server returned status {resp.status_code}."
+
+
+def generate_image_flux_server(prompt, config):
+    """
+    Server-proxied version of generate_image_flux, used for customers
+    on an August tier (august_standard/pro/max) -- FLUX generation is
+    covered by the business up to that tier's monthly budget, paid for
+    with Curant's own FLUX key, which lives only on the server and is
+    never sent to this Mac. This Mac just sends the prompt + its license
+    key and gets back a finished image_url. Same (path, error) contract
+    as generate_image_flux so callers don't need to care which path ran.
+    """
+    import requests
+    key = config.get("license_key")
+    if not key:
+        return None, "No license key found on this Mac — run: curant-cli activate <key>"
+    try:
+        resp = requests.post(
+            f"{SERVER_BASE}/v1/generate-image",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            json={"prompt": prompt},
+            timeout=90,
+        )
+    except Exception as e:
+        return None, f"Couldn't reach Curant's server for image generation: {e}"
+    return _handle_server_generation_response(resp)
+
+
+def generate_image_ideogram_server(prompt, config):
+    """Server-proxied version of generate_image_ideogram -- see
+    generate_image_flux_server's docstring, same architecture."""
+    import requests
+    key = config.get("license_key")
+    if not key:
+        return None, "No license key found on this Mac — run: curant-cli activate <key>"
+    try:
+        resp = requests.post(
+            f"{SERVER_BASE}/v1/generate-image-with-text",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            json={"prompt": prompt},
+            timeout=90,
+        )
+    except Exception as e:
+        return None, f"Couldn't reach Curant's server for image generation: {e}"
+    return _handle_server_generation_response(resp)
+
+
 def generate_voice_elevenlabs(text, config, voice_id="21m00Tcm4TlvDq8ikWAM"):
     import requests
     api_key = get_api_key(config, "elevenlabs")
@@ -3815,6 +3895,31 @@ def execute_tool_call(tool_name, arguments, available_tools):
         if tool_name == "generate_voice":
             text_len = len(arguments.get("text", ""))
             cost_override = (text_len / 1000.0) * ESTIMATED_COST_USD.get("elevenlabs", 0.0)
+
+        # FLUX and Ideogram are covered by the business for customers on an
+        # August tier (august_standard/pro/max) -- those calls go through
+        # Curant's own server, which holds the real keys and enforces its
+        # own per-tier monthly budget server-side. Everyone else (no
+        # August tier unlocked) falls back to their own BYOK key and the
+        # local per-customer spend cap, same as before. Voice
+        # (ElevenLabs, pure BYOK) and edit_media are unaffected either way.
+        august_tier = None
+        if tool_name in ("generate_image", "generate_image_with_text"):
+            august_tier = get_customer_august_tier(config)
+
+        if august_tier:
+            if tool_name == "generate_image":
+                path, error = generate_image_flux_server(arguments.get("prompt", ""), config)
+            else:
+                path, error = generate_image_ideogram_server(arguments.get("prompt", ""), config)
+            if error:
+                return f"[{tool_name} failed: {error}]"
+            _last_generated_files.append(path)
+            # Cost is already checked-and-logged (or refunded on failure)
+            # server-side against the tier's own budget -- nothing to log
+            # locally here, and the local $4 cap doesn't apply to a
+            # generation the business is covering.
+            return f"Generated successfully, saved at {path}."
 
         ok, cap_message = check_spend_cap(config, service, cost_override=cost_override)
         if not ok:
