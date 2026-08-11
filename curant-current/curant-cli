@@ -1693,7 +1693,14 @@ async def _mcp_list_tools_stdio_async(command):
             await session.initialize()
             result = await session.list_tools()
             return [
-                {"name": t.name, "description": t.description or "", "input_schema": t.inputSchema or {}}
+                # The official mcp SDK's Tool model has used both inputSchema (older,
+                # camelCase, matching the MCP wire protocol's JSON field name directly)
+                # and input_schema (newer, snake_case, matching Python convention) across
+                # different released versions -- found the hard way when a real customer's
+                # Mac had mcp>=2 installed and every .inputSchema access here raised
+                # AttributeError. Try both rather than pin to one, so this keeps working
+                # across whichever mcp version happens to be installed locally.
+                {"name": t.name, "description": t.description or "", "input_schema": getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}}
                 for t in result.tools
             ]
 
@@ -1725,7 +1732,14 @@ async def _mcp_list_tools_http_async(url, headers, auth=None):
             await session.initialize()
             result = await session.list_tools()
             return [
-                {"name": t.name, "description": t.description or "", "input_schema": t.inputSchema or {}}
+                # The official mcp SDK's Tool model has used both inputSchema (older,
+                # camelCase, matching the MCP wire protocol's JSON field name directly)
+                # and input_schema (newer, snake_case, matching Python convention) across
+                # different released versions -- found the hard way when a real customer's
+                # Mac had mcp>=2 installed and every .inputSchema access here raised
+                # AttributeError. Try both rather than pin to one, so this keeps working
+                # across whichever mcp version happens to be installed locally.
+                {"name": t.name, "description": t.description or "", "input_schema": getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}}
                 for t in result.tools
             ]
 
@@ -1756,7 +1770,14 @@ async def _mcp_list_tools_sse_async(url, headers, auth=None):
             await session.initialize()
             result = await session.list_tools()
             return [
-                {"name": t.name, "description": t.description or "", "input_schema": t.inputSchema or {}}
+                # The official mcp SDK's Tool model has used both inputSchema (older,
+                # camelCase, matching the MCP wire protocol's JSON field name directly)
+                # and input_schema (newer, snake_case, matching Python convention) across
+                # different released versions -- found the hard way when a real customer's
+                # Mac had mcp>=2 installed and every .inputSchema access here raised
+                # AttributeError. Try both rather than pin to one, so this keeps working
+                # across whichever mcp version happens to be installed locally.
+                {"name": t.name, "description": t.description or "", "input_schema": getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}}
                 for t in result.tools
             ]
 
