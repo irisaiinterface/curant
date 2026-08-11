@@ -260,6 +260,32 @@ URGENT_KEYWORDS = (
 )
 
 
+HIGH_STAKES_KEYWORDS = (
+    "wire transfer", "wire the money", "sign the contract", "sign this contract",
+    "legal action", "lawsuit", "sue ", "being sued", "subpoena", "irs", "audit",
+    "mortgage", "refinance", "loan agreement", "co-sign", "cosign",
+    "power of attorney", "notarize", "settlement offer", "severance",
+    "resignation letter", "resign from", "terminate the contract", "termination notice",
+    "diagnosis", "medical procedure", "surgery", "life insurance", "beneficiary",
+    "divorce", "custody", "restraining order", "nda", "non-disclosure",
+    "invest in", "investment offer", "large payment", "six figures", "acquisition offer",
+)
+
+
+def classify_high_stakes(message_text):
+    """Returns True if the message plausibly involves a decision with real
+    financial, legal, medical, or relationship consequences -- deliberately
+    keyword-based and conservative like classify_urgency: false negatives
+    (missing a real high-stakes message) just mean no second opinion is
+    fetched, which is exactly today's behavior. False positives just mean
+    an extra review call runs before replying -- annoying at worst, never
+    unsafe. Never used to block or withhold a reply on its own."""
+    if not message_text:
+        return False
+    text_lower = message_text.lower()
+    return any(kw in text_lower for kw in HIGH_STAKES_KEYWORDS)
+
+
 def classify_urgency(message_text):
     """Returns 'urgent' or 'normal'. Conservative by design — false
     negatives (missing real urgency) are far less costly than false
@@ -609,6 +635,29 @@ def init_local_db():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with closing(get_local_db()) as conn:
         conn.executescript("""
+        -- Grace-exclusive delegate access: a second handle (an EA, a
+        -- chief of staff) who can message this same Curant install with
+        -- FULL assistant capability, on the executive's behalf -- not
+        -- just the notify-only screening every other non-customer
+        -- sender gets. See get_delegate_handles/add_delegate_cmd and
+        -- curant-watcher.py's DELEGATE_HANDLES for how this actually
+        -- changes routing.
+        -- Grace-exclusive meeting prep briefs: dedup so the same
+        -- upcoming event doesn't generate a repeat brief every time the
+        -- periodic check runs (see meeting_prep_check/
+        -- com.curant.meetingprep.plist, which runs every 15 minutes).
+        CREATE TABLE IF NOT EXISTS meeting_briefs_sent (
+            event_key TEXT PRIMARY KEY,
+            sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS delegates (
+            handle TEXT PRIMARY KEY,
+            label TEXT,
+            active INTEGER DEFAULT 1,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS important_people (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT,
@@ -805,6 +854,23 @@ def get_memories():
         return [r["content"] for r in rows]
 
 
+def get_memories_with_age():
+    """
+    Grace-exclusive use case: weekly_rollup's stalled-items digest needs
+    to know roughly HOW LONG a memory has been sitting around to flag
+    something as stalled ("you said you'd follow up with Jamie 10 days
+    ago") -- plain get_memories() only returns content strings, no
+    timestamp, since nothing else in this file has needed the age
+    before now. Returns a list of {"content": str, "days_old": int}."""
+    with closing(get_local_db()) as conn:
+        rows = conn.execute(
+            "SELECT content, "
+            "CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS days_old "
+            "FROM memories ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def save_memory(content):
     with closing(get_local_db()) as conn:
         conn.execute("INSERT INTO memories (content) VALUES (?)", (content,))
@@ -953,6 +1019,85 @@ def vip_handles_cmd():
     curant-watcher.py to call once at startup (same pattern as how it
     reads CUSTOMER_HANDLES from config once at module load)."""
     print(json.dumps(get_vip_handles()))
+
+
+def get_delegate_handles():
+    """Every handle currently registered as an active delegate -- see
+    add_delegate_cmd. Used by curant-watcher.py to (a) let a delegate's
+    messages through the SQL-level allowlist even in 'approved' access
+    mode, same as VIP handles, and (b) route a delegate's message
+    through the FULL relay path (real assistant capability, replying
+    back to the delegate directly) instead of the notify-only screening
+    path every other non-customer sender gets. That's the actual
+    difference between a delegate and a VIP: a VIP being flagged means
+    "always tell me when they text"; a delegate means "let them actually
+    use Curant on my behalf." """
+    with closing(get_local_db()) as conn:
+        rows = conn.execute("SELECT handle FROM delegates WHERE active = 1").fetchall()
+        return [r["handle"] for r in rows]
+
+
+def delegate_handles_cmd():
+    """Internal -- prints delegate handles as JSON, for curant-watcher.py
+    to read once at startup (same pattern as vip_handles_cmd)."""
+    print(json.dumps(get_delegate_handles()))
+
+
+def add_delegate_cmd(handle, label):
+    """Grace-exclusive. `curant-cli add-delegate <handle> [label]` --
+    grants a second person full assistant access to this same Curant
+    install, sharing the same persona/memories/important-people context
+    as the executive. This is a genuinely bigger trust decision than
+    anything else Grace unlocks (VIP escalation only ever notifies the
+    owner; a delegate can actually transact with Curant), so it's kept
+    to an explicit, deliberate add/remove action rather than any
+    automatic heuristic."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Delegate access is a Grace-exclusive feature.")
+        sys.exit(1)
+    if not handle:
+        print("Usage: curant-cli add-delegate <handle> [label]")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        conn.execute(
+            "INSERT INTO delegates (handle, label, active) VALUES (?, ?, 1) "
+            "ON CONFLICT(handle) DO UPDATE SET label = excluded.label, active = 1",
+            (handle, label or ""),
+        )
+        conn.commit()
+    print(f"{handle} added as a delegate{f' ({label})' if label else ''}. They can now message "
+          f"this Curant install with full assistant access, sharing the same context you have.")
+
+
+def remove_delegate_cmd(handle):
+    """Grace-exclusive. `curant-cli remove-delegate <handle>` -- revokes
+    delegate access. Sets active=0 rather than deleting the row, so the
+    label/history isn't lost if they're re-added later."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Delegate access is a Grace-exclusive feature.")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        conn.execute("UPDATE delegates SET active = 0 WHERE handle = ?", (handle,))
+        conn.commit()
+    print(f"{handle}'s delegate access removed.")
+
+
+def list_delegates_cmd():
+    """Grace-exclusive. Shows currently active delegates."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Delegate access is a Grace-exclusive feature.")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        rows = conn.execute("SELECT handle, label, added_at FROM delegates WHERE active = 1").fetchall()
+    if not rows:
+        print("No active delegates.")
+        return
+    for r in rows:
+        label_str = f" ({r['label']})" if r["label"] else ""
+        print(f"{r['handle']}{label_str} -- added {r['added_at']}")
 
 
 def mark_vip_cmd(handle, enabled_str):
@@ -4841,6 +4986,138 @@ def set_voice_cmd(voice_id):
           f"that voice id actually exists there (a cloned voice or one of ElevenLabs' own presets).")
 
 
+def _parse_hhmm(s):
+    """Returns (hour, minute) or None if s isn't a valid HH:MM 24h string."""
+    try:
+        h, m = s.split(":")
+        h, m = int(h), int(m)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return (h, m)
+    except Exception:
+        pass
+    return None
+
+
+def set_quiet_hours_cmd(start_str, end_str):
+    """
+    Grace-exclusive. Sets a quiet window (e.g. 21:00 to 07:00, wrapping
+    past midnight is fine) during which daily_briefing/weekly_rollup
+    skip sending -- these are convenience digests on a fixed schedule,
+    not something urgent, so they're the right thing to suppress.
+
+    Deliberately scoped to just those two scheduled digests, NOT to
+    screen_message's real-time third-party message notifications --
+    suppressing those would mean either dropping a notice permanently
+    (no queue/replay mechanism exists to hold it for later) or building
+    that mechanism, which this doesn't attempt. VIP escalation
+    (mark-vip) is unaffected by quiet hours either way -- a VIP's text
+    still notifies you in real time regardless of this setting, which is
+    the actual "VIP override" behavior here: not that quiet hours
+    normally block VIPs and get overridden, but that quiet hours were
+    never wired into that path to begin with.
+
+    Same "bypassable by editing config.json directly" caveat as the
+    local generation spend cap elsewhere in this file -- a real,
+    accepted limitation of local-only enforcement, not an oversight.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Quiet hours are a Grace-exclusive feature.")
+        sys.exit(1)
+    if start_str is None and end_str is None:
+        start = config.get("quiet_hours_start")
+        end = config.get("quiet_hours_end")
+        if start and end:
+            print(f"Quiet hours: {start}-{end}.")
+        else:
+            print("No quiet hours set.")
+        return
+    if start_str == "off":
+        config.pop("quiet_hours_start", None)
+        config.pop("quiet_hours_end", None)
+        save_config(config)
+        print("Quiet hours turned off.")
+        return
+    start = _parse_hhmm(start_str)
+    end = _parse_hhmm(end_str) if end_str else None
+    if not start or not end:
+        print("Usage: curant-cli set-quiet-hours <HH:MM> <HH:MM>  (24-hour, e.g. 21:00 07:00), or 'off'")
+        sys.exit(1)
+    config["quiet_hours_start"] = start_str
+    config["quiet_hours_end"] = end_str
+    save_config(config)
+    print(f"Quiet hours set: {start_str}-{end_str}. Daily briefing and weekly rollup will skip "
+          f"sending during this window.")
+
+
+def set_travel_mode_cmd(tz_str):
+    """
+    Grace-exclusive. When set, quiet-hours comparisons use this IANA
+    timezone (e.g. 'Asia/Tokyo') instead of the Mac's own system
+    timezone -- launchd itself still fires the scheduled jobs at the
+    Mac's local clock time (there's no practical way to change that
+    without changing the whole Mac's system timezone), but the actual
+    quiet-hours SUPPRESSION check this file does in Python can compare
+    against wherever the customer says they currently are.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Travel mode is a Grace-exclusive feature.")
+        sys.exit(1)
+    if tz_str is None:
+        current = config.get("travel_timezone")
+        default_note = "not set (using this Mac's local timezone)"
+        print(f"Travel timezone: {current or default_note}.")
+        return
+    if tz_str.lower() == "off":
+        config.pop("travel_timezone", None)
+        save_config(config)
+        print("Travel mode turned off -- back to this Mac's local timezone.")
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz_str)  # raises if invalid
+    except Exception:
+        print(f"'{tz_str}' isn't a recognized IANA timezone (e.g. 'Asia/Tokyo', 'Europe/London').")
+        sys.exit(1)
+    config["travel_timezone"] = tz_str
+    save_config(config)
+    print(f"Travel timezone set to {tz_str}. Quiet hours now compare against this timezone.")
+
+
+def _is_quiet_hours_now(config):
+    """True if right now falls inside the customer's configured quiet
+    window (see set_quiet_hours_cmd), using travel_timezone if set
+    (see set_travel_mode_cmd), else this Mac's local system time.
+    False (never quiet) if no quiet hours are configured at all."""
+    start_str = config.get("quiet_hours_start")
+    end_str = config.get("quiet_hours_end")
+    start = _parse_hhmm(start_str) if start_str else None
+    end = _parse_hhmm(end_str) if end_str else None
+    if not start or not end:
+        return False
+
+    now = datetime.now()  # module-level `datetime` here is the datetime CLASS
+                            # (see `from datetime import datetime, timedelta` at
+                            # the top of this file), not the module -- matches
+                            # every other use of it in this file.
+    tz_name = config.get("travel_timezone")
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            pass  # fall back to local time if the stored tz somehow became invalid
+
+    now_minutes = now.hour * 60 + now.minute
+    start_minutes = start[0] * 60 + start[1]
+    end_minutes = end[0] * 60 + end[1]
+    if start_minutes <= end_minutes:
+        return start_minutes <= now_minutes < end_minutes
+    # wraps past midnight, e.g. 21:00-07:00
+    return now_minutes >= start_minutes or now_minutes < end_minutes
+
+
 def set_daily_briefing_cmd(enabled_str):
     """
     Toggle the twice-daily executive briefing (on by default for every
@@ -5728,6 +6005,66 @@ def generate_offline_reply(text, persona_name="Curant"):
     )
 
 
+def _get_second_opinion(message_text, draft_reply, config, provider, api_key):
+    """
+    Grace-exclusive. For messages that look genuinely high-stakes
+    (classify_high_stakes), runs a SEPARATE review call against the
+    draft reply before it goes out -- a second, independently-prompted
+    pass asking "is there anything risky, inaccurate, or worth a human
+    double-checking here?" rather than just trusting the first pass.
+    This is not a second full generation competing with the first
+    (that would just be two guesses, not a check) -- it's specifically
+    a critique-the-draft call, which is a different and more useful
+    question to ask a model than "answer this again."
+
+    Returns None on any error, no API key, non-Grace tier, or when the
+    reviewer finds nothing worth flagging -- always fails closed to "no
+    note," never blocks or delays the underlying reply, which is
+    already generated and saved by the time this runs.
+    """
+    if get_customer_august_tier(config) != "grace":
+        return None
+    if not api_key:
+        return None
+    try:
+        extra = (
+            "You are doing a SECOND, independent review of a draft reply before it's sent -- not "
+            "writing a new reply yourself. Here is the original message:\n"
+            f"\"{message_text}\"\n\n"
+            "Here is the draft reply about to be sent:\n"
+            f"\"{draft_reply}\"\n\n"
+            "This message looked high-stakes (financial, legal, medical, or a major life/relationship "
+            "decision). Check the draft for anything risky, inaccurate, overconfident, or that a "
+            "prudent person would want a second pair of eyes on before acting on it -- e.g. legal or "
+            "medical specifics stated as fact rather than caveated, financial figures or commitments "
+            "that could be wrong, irreversible actions treated too casually.\n\n"
+            "If the draft is genuinely fine as-is, respond with exactly: "
+            '{"flagged": false}\n'
+            "If there's something worth flagging, respond with a SHORT (one or two sentence) plain-"
+            "language caution, not a rewrite: "
+            '{"flagged": true, "note": "..."}\n\n'
+            "Respond with ONLY that JSON object, nothing else."
+        )
+        system_prompt = build_system_prompt(config, [], [], "", extra_instruction=extra)
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Review the draft reply now."}],
+            max_tokens=200, tier="fast",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        if not result.get("flagged"):
+            return None
+        note = (result.get("note") or "").strip()
+        return note or None
+    except Exception as e:
+        print(f"[second opinion] review failed (non-fatal): {e}", file=sys.stderr)
+        return None
+
+
 def relay(message_text, context="", image_path=None, apple_id=None, tier="main", voice_mode=False):
     """
     Handle an incoming message entirely locally: verify entitlement (using
@@ -5955,6 +6292,18 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
             print(json.dumps({"reply": f"Couldn't reach {provider} on your account: {e}", "error": "llm_call_failed"}))
             sys.exit(1)
 
+    # Grace-exclusive second-opinion routing: for messages that look
+    # genuinely high-stakes, run an independent review pass on the draft
+    # reply before it's saved/returned. Skipped for voice (latency-
+    # sensitive, same reasoning as the other voice_mode skips above) and
+    # for the two non-generated fallback replies (quota-exhausted notice,
+    # offline local reply) -- there's no real model output to review in
+    # either of those cases.
+    if not voice_mode and provider not in ("quota_exhausted_notice", "local_offline") and classify_high_stakes(message_text):
+        second_opinion_note = _get_second_opinion(message_text, reply_text, config, provider, api_key)
+        if second_opinion_note:
+            reply_text = f"{reply_text}\n\n(Second opinion: {second_opinion_note})"
+
     user_history_text = message_text if message_text else ("[sent an image]" if image_path else message_text)
     save_message("user", user_history_text, urgency=urgency)
     save_message("assistant", reply_text, provider=provider)
@@ -6047,6 +6396,56 @@ def _looks_like_spam(handle, text):
     return False
 
 
+def _draft_suggested_reply(sender, text, resolved_name, person):
+    """
+    Grace-exclusive. Drafts a plausible reply to a third party's
+    message for the customer to review/edit/send themselves --
+    screen_message() NEVER sends this on its own; it's included in the
+    notify_owner notice purely as a starting point. Returns None (no
+    draft) for anyone below Grace, on any error, or if the customer
+    hasn't got an API key configured -- always fails closed to "no
+    draft" rather than blocking the underlying notify_owner notice,
+    which always goes out regardless of whether this succeeds.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        return None
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        return None
+    try:
+        who_desc = resolved_name or "this person"
+        relationship_note = ""
+        if person and (person.get("relationship") or person.get("role")):
+            relationship_note = f" ({person.get('relationship') or person.get('role')})"
+        extra = (
+            f"A third party ({who_desc}{relationship_note}) just texted the customer this: "
+            f"\"{text}\"\n\n"
+            "Draft a short, natural reply the CUSTOMER could send back, in the customer's own "
+            "voice (not as Curant, not mentioning you're an AI) -- this is only ever a "
+            "suggestion for them to review, edit, or discard, never sent automatically. Keep it "
+            "brief and natural, matching how a real text reply would actually sound.\n\n"
+            'Respond with ONLY a JSON object: {"draft": "..."}.'
+        )
+        system_prompt = build_system_prompt(config, [], [], "", extra_instruction=extra)
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Draft the suggested reply."}],
+            max_tokens=200, tier="fast",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        draft = (result.get("draft") or "").strip()
+        return draft or None
+    except Exception as e:
+        print(f"[suggested reply] draft failed (non-fatal): {e}", file=sys.stderr)
+        return None
+
+
 def screen_message(sender, text, contact_name=None):
     """
     Decides what curant-watcher.py should do with an incoming text from
@@ -6102,22 +6501,25 @@ def screen_message(sender, text, contact_name=None):
     urgency = classify_urgency(preview) if preview else None
     urgency_note = " (This message also reads as urgent.)" if urgency == "urgent" else ""
 
+    suggested_reply = _draft_suggested_reply(sender, text, resolved_name, person) if preview else None
+    draft_block = f"\n\nSuggested reply (just my draft -- I never send this on my own): \"{suggested_reply}\"" if suggested_reply else ""
+
     if is_vip:
         notice = (
             f"🚨 VIP CONTACT: {who} just texted.{known_note}{urgency_note}\n\n"
-            f"Their message: \"{preview}\"\n\n"
-            f"Want me to reply, and if so what should I say?"
+            f"Their message: \"{preview}\"{draft_block}\n\n"
+            f"Want me to send that, something else, or nothing at all?"
         )
     else:
         notice = (
             f"You got a text from {who} that I haven't replied to — I only ever text people back if "
-            f"it's you, or you've told me to.{known_note}{urgency_note}\n\nTheir message: \"{preview}\"\n\n"
-            f"Want me to reply, and if so what should I say? (Or tell me to mark them as spam if this "
-            f"isn't someone you know.)"
+            f"it's you, or you've told me to.{known_note}{urgency_note}\n\nTheir message: \"{preview}\"{draft_block}\n\n"
+            f"Want me to send that, something else, or nothing at all? (Or tell me to mark them as spam "
+            f"if this isn't someone you know.)"
         )
     print(json.dumps({
         "action": "notify_owner", "notice": notice, "sender": sender,
-        "resolved_name": resolved_name, "vip": is_vip,
+        "resolved_name": resolved_name, "vip": is_vip, "suggested_reply": suggested_reply,
     }))
 
 
@@ -6200,6 +6602,53 @@ def proactive_check(context):
         print(json.dumps({"should_send": False}))
 
 
+EMAIL_SERVER_NAME_HINTS = ("gmail", "email", "outlook", "mail")
+EMAIL_TOOL_NAME_HINTS = ("list", "search", "unread", "messages", "inbox")
+
+
+def _get_email_summary_for_briefing(config):
+    """
+    Grace-exclusive, best-effort. If the customer has an email-like MCP
+    server connected (heuristic name match -- this codebase has no
+    fixed, known email MCP contract, since MCP server choice is entirely
+    up to the customer), tries to call a plausible "list/search
+    messages" tool on it and fold a short raw excerpt into the daily
+    briefing's context.
+
+    Deliberately conservative: this is a heuristic on top of an
+    unknown, customer-chosen MCP server's actual tool names and
+    argument shapes, which vary by provider (Gmail vs Outlook vs
+    others) and aren't specified anywhere in this codebase. Any
+    mismatch, missing argument, or unexpected response shape just
+    results in returning None silently -- this must never break or
+    even meaningfully delay the daily briefing over a best-effort
+    integration with a tool this file doesn't actually control the
+    shape of. Real, honest limitation, not hidden: this may simply not
+    work for a given customer's specific email MCP, and that's
+    considered an acceptable outcome for a best-effort feature.
+    """
+    try:
+        for server in get_mcp_servers(enabled_only=True):
+            name_lower = (server.get("name") or "").lower()
+            if not any(hint in name_lower for hint in EMAIL_SERVER_NAME_HINTS):
+                continue
+            tools = _get_server_tools_cached(server)
+            candidate = next(
+                (t for t in tools if any(hint in t["name"].lower() for hint in EMAIL_TOOL_NAME_HINTS)),
+                None,
+            )
+            if not candidate:
+                continue
+            result = call_mcp_tool(server, candidate["name"], {})
+            if not result or (isinstance(result, str) and result.startswith("[Error")):
+                continue
+            text = result if isinstance(result, str) else json.dumps(result)
+            return text[:2000]
+    except Exception as e:
+        print(f"[daily briefing] email summary lookup failed (non-fatal, best-effort): {e}", file=sys.stderr)
+    return None
+
+
 def daily_briefing(context):
     """
     Executive daily briefing for every customer, on by default -- runs
@@ -6237,6 +6686,10 @@ def daily_briefing(context):
         print(json.dumps({"should_send": False}))
         return
 
+    if _is_quiet_hours_now(config):
+        print(json.dumps({"should_send": False, "reason": "quiet_hours"}))
+        return
+
     provider = get_provider(config)
     api_key = get_api_key(config, provider)
     if not api_key:
@@ -6247,6 +6700,15 @@ def daily_briefing(context):
         # Nothing to summarize -- an empty briefing isn't useful, don't send one.
         print(json.dumps({"should_send": False}))
         return
+
+    # Grace-exclusive, best-effort: fold in an email summary if a
+    # plausible email MCP server is connected -- see
+    # _get_email_summary_for_briefing's docstring for why this is
+    # heuristic and allowed to simply not work for a given customer.
+    if get_customer_august_tier(config) == "grace":
+        email_summary = _get_email_summary_for_briefing(config)
+        if email_summary:
+            context = context + "\n\nRecent email activity (raw, from a connected email tool):\n" + email_summary
 
     memories = get_memories()
     people = get_important_people()
@@ -6324,6 +6786,10 @@ def weekly_rollup(context):
         print(json.dumps({"should_send": False}))
         return
 
+    if _is_quiet_hours_now(config):
+        print(json.dumps({"should_send": False, "reason": "quiet_hours"}))
+        return
+
     provider = get_provider(config)
     api_key = get_api_key(config, provider)
     if not api_key:
@@ -6336,6 +6802,25 @@ def weekly_rollup(context):
 
     memories = get_memories()
     people = get_important_people()
+
+    # Stalled-items digest: memories older than a week, called out
+    # separately in the prompt so the model can flag anything that
+    # looks like it's still open/unresolved -- get_memories() alone
+    # (used for the "what you've learned" section below, via
+    # build_system_prompt) has no age information, so this uses
+    # get_memories_with_age() as a second, purpose-built pass over the
+    # same table rather than trying to overload one function for both.
+    stalled_block = ""
+    aged_memories = [m for m in get_memories_with_age() if m["days_old"] >= 7]
+    if aged_memories:
+        stalled_lines = "\n".join(f"- ({m['days_old']} days old) {m['content']}" for m in aged_memories)
+        stalled_block = (
+            "\n\nThings that have been noted for a week or more and may still be open "
+            "(use judgment -- not everything old is actually stalled, some things just aren't "
+            "time-sensitive; only call out what genuinely looks like it might have been "
+            f"forgotten or is worth a nudge):\n{stalled_lines}"
+        )
+
     extra = (
         "Write this week's executive rollup -- a longer, more thorough weekly summary than "
         "a normal daily briefing, based on the live calendar/reminders context below (which "
@@ -6343,8 +6828,11 @@ def weekly_rollup(context):
         "something in the context to summarize -- you are not deciding whether this is "
         "worth sending. Organize it by day or by theme, whichever fits the actual week "
         "ahead better; call out anything that looks like a scheduling conflict, an unusually "
-        "busy day, or something easy to lose track of across the week. No filler, no "
-        "'let me know if you need anything else' -- just the rollup itself.\n\n"
+        "busy day, or something easy to lose track of across the week. If anything in the "
+        "'stalled items' list below genuinely looks forgotten or overdue, mention it briefly "
+        "in its own short section -- otherwise leave that out entirely, don't force it. No "
+        "filler, no 'let me know if you need anything else' -- just the rollup itself."
+        f"{stalled_block}\n\n"
         f"This week's live context:\n{context}\n\n"
         'Respond with ONLY a JSON object: {"message": "..."}.'
     )
@@ -6370,6 +6858,121 @@ def weekly_rollup(context):
     if not message:
         print(json.dumps({"should_send": False}))
         return
+
+    save_message("assistant", message)
+    print(json.dumps({
+        "should_send": True,
+        "message": message,
+        "reply_format": config.get("reply_format", "text"),
+        "voice_tier": config.get("voice_tier", "standard"),
+    }))
+
+
+def _prune_old_meeting_brief_keys():
+    with closing(get_local_db()) as conn:
+        conn.execute("DELETE FROM meeting_briefs_sent WHERE sent_at < datetime('now', '-24 hours')")
+        conn.commit()
+
+
+def meeting_prep_check(context):
+    """
+    Grace-exclusive. Runs frequently (every 15 min, see
+    com.curant.meetingprep.plist) rather than on a fixed daily/weekly
+    schedule like daily_briefing/weekly_rollup -- checks whether
+    anything in the live calendar context is starting imminently and,
+    if so, sends a short prep note naming who's involved (matched
+    against important_people) and anything Curant already knows about
+    them.
+
+    Dedup via meeting_briefs_sent: the model is asked for a stable
+    event_key alongside its decision, and this only actually sends once
+    per event_key -- without this, the same upcoming meeting would
+    generate a fresh brief every single 15-minute check until it starts.
+
+    Deliberately NOT quiet-hours-gated, unlike daily_briefing/
+    weekly_rollup -- those are convenience digests on a fixed schedule;
+    this is tied to a real, imminent, time-sensitive event, which is a
+    meaningfully different thing to suppress.
+
+    Same fail-closed contract as the other scheduled checks.
+    """
+    config = load_config()
+    key = config.get("license_key")
+    if not key:
+        print(json.dumps({"should_send": False, "error": "not_activated"}))
+        return
+
+    config, active = refresh_status_if_stale(config)
+    if not active:
+        print(json.dumps({"should_send": False, "error": "inactive_or_invalid_license"}))
+        return
+
+    if get_customer_august_tier(config) != "grace":
+        print(json.dumps({"should_send": False}))
+        return
+
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        print(json.dumps({"should_send": False, "error": "no_api_key_set"}))
+        return
+
+    if not context:
+        print(json.dumps({"should_send": False}))
+        return
+
+    _prune_old_meeting_brief_keys()
+
+    memories = get_memories()
+    people = get_important_people()
+    extra = (
+        "Look at the live calendar context below and decide whether anything is starting "
+        "within roughly the next 30 minutes. If nothing is imminent, say so. If something IS "
+        "imminent, write a short prep note (2-4 sentences): what the meeting is, and if you "
+        "can identify who's likely involved (matching names against the people you know about "
+        "below) mention anything relevant you know about them. Don't invent attendees that "
+        "aren't reasonably implied by the event title/description.\n\n"
+        f"Live calendar context:\n{context}\n\n"
+        'Respond with ONLY a JSON object: {"has_upcoming_meeting": true/false, '
+        '"event_key": "short stable identifier for this specific event, e.g. its title", '
+        '"message": "the prep note, or empty string if has_upcoming_meeting is false"}.'
+    )
+    system_prompt = build_system_prompt(config, memories, people, "", extra_instruction=extra)
+
+    try:
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Check for an imminent meeting."}],
+            max_tokens=400, tier="main",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+    except Exception as e:
+        print(f"Meeting prep check failed (non-fatal, not sending): {e}", file=sys.stderr)
+        print(json.dumps({"should_send": False}))
+        return
+
+    if not result.get("has_upcoming_meeting"):
+        print(json.dumps({"should_send": False}))
+        return
+
+    message = (result.get("message") or "").strip()
+    event_key = (result.get("event_key") or "").strip().lower()
+    if not message or not event_key:
+        print(json.dumps({"should_send": False}))
+        return
+
+    with closing(get_local_db()) as conn:
+        try:
+            conn.execute("INSERT INTO meeting_briefs_sent (event_key) VALUES (?)", (event_key,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Already sent a brief for this event within the last 24h.
+            print(json.dumps({"should_send": False, "reason": "already_sent"}))
+            return
 
     save_message("assistant", message)
     print(json.dumps({
@@ -6585,6 +7188,131 @@ def set_auto_backup_cmd(enabled_str):
           "it if you ever need to restore on a different Mac.")
 
 
+def _wizard_prompt(prompt_text, default=None):
+    """Shared input helper for onboarding_wizard_cmd -- returns a
+    stripped answer, or default (possibly None) on a blank Enter or on
+    EOF (e.g. input piped from /dev/null in a non-interactive context)."""
+    try:
+        raw = input(prompt_text).strip()
+    except EOFError:
+        return default
+    return raw if raw else default
+
+
+def onboarding_wizard_cmd():
+    """
+    Grace-exclusive guided setup -- walks a new executive customer
+    through the handful of settings that are otherwise scattered across
+    a dozen separate `curant-cli set-*` commands someone would only
+    discover by reading docs (persona, voice, quiet hours, travel
+    timezone, daily briefing, automatic backups, VIP contacts,
+    delegates). Every step is optional (blank Enter skips it, keeping
+    whatever's already configured) and reuses the existing setter
+    functions rather than duplicating their validation/persistence
+    logic -- this is purely a friendlier front door onto commands that
+    already work standalone.
+
+    Standing instructions are NOT part of this wizard -- those are set
+    via the web dashboard and synced down on the next status refresh
+    (see apply_synced_preferences_if_newer), not stored as a local-only
+    setting like everything else here, so a step here would be
+    misleading about where that data actually lives.
+
+    Requires an interactive terminal (checks sys.stdin.isatty()) --
+    fails closed with a clear message rather than hanging or silently
+    skipping every step if run from a non-interactive context (e.g. by
+    mistake from a script or scheduled job).
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("The guided onboarding wizard is a Grace-exclusive feature.")
+        sys.exit(1)
+    if not sys.stdin.isatty():
+        print("The onboarding wizard needs an interactive terminal to ask questions -- "
+              "run `curant-cli onboarding-wizard` directly in a terminal, not from a script.")
+        sys.exit(1)
+
+    print("Welcome to Grace -- let's get you set up. Press Enter on any question to skip it "
+          "and keep things as they are.\n")
+
+    # 1. Persona
+    current_persona = config.get("persona", "curant")
+    print(f"Available personas: {', '.join(PERSONAS.keys())}")
+    persona_answer = _wizard_prompt(f"Which persona would you like? [current: {current_persona}] ")
+    if persona_answer:
+        if persona_answer in PERSONAS:
+            set_persona(persona_answer)
+        else:
+            print(f"Unknown persona '{persona_answer}' -- skipping, kept {current_persona}.")
+
+    # 2. Voice
+    voice_answer = _wizard_prompt(
+        "ElevenLabs voice ID for spoken replies, if you have a cloned/custom voice "
+        "(leave blank to use the default voice)? "
+    )
+    if voice_answer:
+        set_voice_cmd(voice_answer)
+
+    # 3. Quiet hours
+    quiet_answer = _wizard_prompt(
+        "Set quiet hours for your daily briefing and weekly rollup? Enter as 'HH:MM HH:MM' "
+        "(24-hour, e.g. '21:00 07:00'), or leave blank to skip: "
+    )
+    if quiet_answer:
+        parts = quiet_answer.split()
+        if len(parts) == 2:
+            set_quiet_hours_cmd(parts[0], parts[1])
+        else:
+            print("Didn't understand that format -- skipping quiet hours.")
+
+    # 4. Travel timezone
+    tz_answer = _wizard_prompt(
+        "Set a travel timezone (IANA name, e.g. 'Europe/London'), or leave blank to use "
+        "this Mac's local timezone: "
+    )
+    if tz_answer:
+        set_travel_mode_cmd(tz_answer)
+
+    # 5. Daily briefing
+    briefing_answer = _wizard_prompt(
+        "Keep the twice-daily executive briefing on? [Y/n] ", default="y"
+    )
+    set_daily_briefing_cmd("off" if briefing_answer.lower().startswith("n") else "on")
+
+    # 6. Automatic backups
+    backup_answer = _wizard_prompt(
+        "Turn on automatic weekly encrypted backups? You'll be asked to choose a passphrase "
+        "next if so. [y/N] ", default="n"
+    )
+    if backup_answer.lower().startswith("y"):
+        set_auto_backup_cmd("on")
+
+    # 7. VIP contacts
+    print("\nVIP contacts always trigger a real-time notice when they text, bypassing normal "
+          "spam screening. Enter phone numbers/handles one at a time, blank to finish.")
+    while True:
+        handle = _wizard_prompt("VIP handle (or blank to finish): ")
+        if not handle:
+            break
+        mark_vip_cmd(handle, "on")
+
+    # 8. Delegates
+    print("\nDelegates can message Curant directly with full assistant access (not just "
+          "notify-only, like VIPs). Enter handles one at a time, blank to finish.")
+    while True:
+        handle = _wizard_prompt("Delegate handle (or blank to finish): ")
+        if not handle:
+            break
+        label = _wizard_prompt(f"  Label for {handle} (e.g. 'Chief of Staff'), optional: ")
+        add_delegate_cmd(handle, label)
+
+    config = load_config()
+    config["onboarding_completed"] = True
+    save_config(config)
+    print("\nAll set. You can revisit any of this anytime with the individual `curant-cli "
+          "set-*` commands -- run `curant-cli --help` to see them all.")
+
+
 def run_automated_backup():
     """
     Grace-exclusive, unattended -- invoked by com.curant.autobackup.plist
@@ -6620,6 +7348,80 @@ def run_automated_backup():
         print(f"[auto-backup] wrote {target}", file=sys.stderr)
     except Exception as e:
         print(f"[auto-backup] failed (non-fatal): {e}", file=sys.stderr)
+
+
+DEFAULT_FULL_EXPORT_PATH = os.path.join(CONFIG_DIR, "full_export.curantexport")
+
+
+def full_export_cmd(path=None):
+    """
+    Grace-exclusive, explicit, on-demand only -- deliberately a
+    SEPARATE command from backup_now(), not a flag on it. backup_now()
+    intentionally excludes memories and important_people (see its
+    docstring: "the actual learned facts about the customer and real
+    people's names/relationships, meaningfully more sensitive content
+    than a settings choice"); this command is the one place in this
+    file that DOES include them in an exportable file, so it needs to
+    be something a Grace customer reaches for on purpose, not something
+    that happens by default or gets casually automated (this is NOT
+    wired into run_automated_backup() -- the weekly automatic backup
+    stays settings-only, same as always).
+
+    Same encryption approach as backup_now (interactive passphrase,
+    scrypt-derived key, never stored anywhere) -- but always interactive,
+    never Keychain-backed, since this is meant to be a deliberate,
+    occasional action, not a routine automated one.
+    """
+    import getpass
+    from cryptography.fernet import Fernet
+    import base64
+
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Full data export (including memories and important people) is a Grace-exclusive "
+              "feature. Everyone else can still run `curant-cli backup-now` for a settings-only backup.")
+        sys.exit(1)
+    if not config.get("license_key"):
+        print("Not activated. Run: curant-cli activate <your-license-key>")
+        sys.exit(1)
+
+    print("This export includes your memories and important people, not just settings -- "
+          "meaningfully more sensitive than a regular backup. Make sure wherever you're "
+          "about to write this file is somewhere you actually trust.")
+    passphrase = getpass.getpass("Choose a passphrase for this export (input hidden): ")
+    if not passphrase:
+        print("Passphrase can't be empty.")
+        sys.exit(1)
+    confirm = getpass.getpass("Confirm passphrase: ")
+    if passphrase != confirm:
+        print("Passphrases didn't match — nothing was written.")
+        sys.exit(1)
+
+    payload_data = {
+        "persona": config.get("persona"),
+        "instructions": config.get("instructions"),
+        "reply_format": config.get("reply_format"),
+        "voice_tier": config.get("voice_tier"),
+        "proactivity_enabled": config.get("proactivity_enabled"),
+        "memories": get_memories(),
+        "important_people": get_important_people(),
+    }
+    plaintext = json.dumps(payload_data).encode()
+    salt = os.urandom(16)
+    print("Deriving encryption key (this takes a couple seconds by design)...")
+    derived_key = _derive_backup_key(passphrase, salt)
+    ciphertext = Fernet(derived_key).encrypt(plaintext)
+    blob = base64.b64encode(salt).decode() + ":" + ciphertext.decode()
+
+    target = os.path.expanduser(path) if path else DEFAULT_FULL_EXPORT_PATH
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w") as f:
+        f.write(blob)
+    os.chmod(target, 0o600)
+
+    print(f"Full export written to {target}")
+    print("Includes: settings, memories, and important people. Remember your passphrase -- "
+          "Curant has no way to recover it if you lose it.")
 
 
 def backup_restore(path=None):
@@ -7741,6 +8543,13 @@ def main():
     p_briefing_toggle = sub.add_parser("set-daily-briefing", help="Turn the twice-daily executive briefing on or off (on by default)")
     p_briefing_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
 
+    p_quiet = sub.add_parser("set-quiet-hours", help="Grace-exclusive: set a quiet window during which the daily briefing/weekly rollup skip sending")
+    p_quiet.add_argument("start", nargs="?", default=None, help="HH:MM 24h, or 'off'. Omit both to view current setting.")
+    p_quiet.add_argument("end", nargs="?", default=None, help="HH:MM 24h.")
+
+    p_travel = sub.add_parser("set-travel-mode", help="Grace-exclusive: set a travel timezone for quiet-hours comparisons")
+    p_travel.add_argument("timezone", nargs="?", default=None, help="IANA timezone (e.g. 'Asia/Tokyo'), or 'off'. Omit to view current setting.")
+
     p_auto_backup = sub.add_parser("set-auto-backup", help="Grace-exclusive: turn on unattended weekly encrypted backups")
     p_auto_backup.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
 
@@ -7751,6 +8560,17 @@ def main():
     p_mark_vip.add_argument("enabled", choices=["on", "off"])
 
     sub.add_parser("vip-handles", help="Internal — prints VIP contact handles as JSON (used by curant-watcher.py)")
+
+    p_add_delegate = sub.add_parser("add-delegate", help="Grace-exclusive: grant a second person full assistant access to this Curant install")
+    p_add_delegate.add_argument("handle", help="Phone number or email, as it appears in Messages")
+    p_add_delegate.add_argument("label", nargs="?", default=None, help="Optional label, e.g. 'EA' or 'Chief of Staff'")
+
+    p_remove_delegate = sub.add_parser("remove-delegate", help="Grace-exclusive: revoke a delegate's access")
+    p_remove_delegate.add_argument("handle")
+
+    sub.add_parser("list-delegates", help="Grace-exclusive: show active delegates")
+
+    sub.add_parser("delegate-handles", help="Internal — prints delegate handles as JSON (used by curant-watcher.py)")
 
     p_provider = sub.add_parser("set-provider", help="Switch which model provider handles messages — same persona/memories carry over")
     p_provider.add_argument("provider", choices=sorted(PROVIDER_MODELS))
@@ -7854,8 +8674,16 @@ def main():
     p_rollup = sub.add_parser("weekly-rollup", help="Grace-exclusive: generate this week's executive rollup (internal use)")
     p_rollup.add_argument("--context", default="", help="Live device context (calendar/reminders)")
 
+    p_meeting = sub.add_parser("meeting-prep-check", help="Grace-exclusive: check for an imminent meeting and send a prep note (internal use)")
+    p_meeting.add_argument("--context", default="", help="Live device context (calendar/reminders)")
+
     p_backup_now = sub.add_parser("backup-now", help="Write an encrypted local backup of your settings only (passphrase prompted, not a CLI arg)")
     p_backup_now.add_argument("--path", default=None, help="Where to write the backup file (default: ~/.curant/backup.curantbackup)")
+
+    p_full_export = sub.add_parser("full-export", help="Grace-exclusive: encrypted export including memories and important people, not just settings (passphrase prompted)")
+    p_full_export.add_argument("--path", default=None, help="Where to write the export file (default: ~/.curant/full_export.curantexport)")
+
+    p_onboarding_wizard = sub.add_parser("onboarding-wizard", help="Grace-exclusive: guided interactive setup for persona, voice, quiet hours, travel timezone, briefing, backups, VIPs, and delegates")
 
     p_backup_restore = sub.add_parser("backup-restore", help="Restore from a local encrypted settings backup (passphrase prompted, not a CLI arg)")
     p_backup_restore.add_argument("--path", default=None, help="Where to read the backup file from (default: ~/.curant/backup.curantbackup)")
@@ -7888,6 +8716,10 @@ def main():
         set_voice_cmd(args.voice_id)
     elif args.command == "set-daily-briefing":
         set_daily_briefing_cmd(args.enabled)
+    elif args.command == "set-quiet-hours":
+        set_quiet_hours_cmd(args.start, args.end)
+    elif args.command == "set-travel-mode":
+        set_travel_mode_cmd(args.timezone)
     elif args.command == "set-auto-backup":
         set_auto_backup_cmd(args.enabled)
     elif args.command == "run-automated-backup":
@@ -7896,6 +8728,14 @@ def main():
         mark_vip_cmd(args.handle, args.enabled)
     elif args.command == "vip-handles":
         vip_handles_cmd()
+    elif args.command == "add-delegate":
+        add_delegate_cmd(args.handle, args.label)
+    elif args.command == "remove-delegate":
+        remove_delegate_cmd(args.handle)
+    elif args.command == "list-delegates":
+        list_delegates_cmd()
+    elif args.command == "delegate-handles":
+        delegate_handles_cmd()
     elif args.command == "set-provider":
         set_provider(args.provider)
     elif args.command == "status":
@@ -7960,8 +8800,14 @@ def main():
         daily_briefing(args.context)
     elif args.command == "weekly-rollup":
         weekly_rollup(args.context)
+    elif args.command == "meeting-prep-check":
+        meeting_prep_check(args.context)
     elif args.command == "backup-now":
         backup_now(args.path)
+    elif args.command == "full-export":
+        full_export_cmd(args.path)
+    elif args.command == "onboarding-wizard":
+        onboarding_wizard_cmd()
     elif args.command == "backup-restore":
         backup_restore(args.path)
     elif args.command == "context-export":

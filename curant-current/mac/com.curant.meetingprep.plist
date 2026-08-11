@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.meetingprep</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+        <string>--meeting-prep-check</string>
+    </array>
+
+    <!-- Unlike the other scheduled jobs (fixed daily/weekly clock
+         times), this needs to run frequently throughout the day to
+         catch a meeting starting soon -- StartInterval (every 900
+         seconds = 15 minutes) rather than StartCalendarInterval.
+         Grace-exclusive (curant-cli's meeting_prep_check() checks the
+         tier) and dedup'd per-event server-side, so running this often
+         doesn't mean repeat notifications for the same meeting. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-meetingprep.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-meetingprep-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.meetingprep.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.meetingprep.plist
+
+Grace-exclusive, gated in curant-cli's meeting_prep_check() function.
+Safe to load on every Mac regardless of tier -- it just always results
+in should_send=false for non-Grace customers.
+
+To test immediately, run curant-watcher.py with the
+--meeting-prep-check flag directly (see ProgramArguments above).
+
+Logs land at /tmp/curant-meetingprep.log and /tmp/curant-meetingprep-error.log.
+-->

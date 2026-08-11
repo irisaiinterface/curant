@@ -109,6 +109,29 @@ def _read_vip_handles():
 
 VIP_HANDLES = _read_vip_handles()
 
+
+def _read_delegate_handles():
+    """Grace-exclusive delegate access -- see get_delegate_handles/
+    add_delegate_cmd in curant-cli. Read once at module load, same
+    pattern as VIP_HANDLES above. A delegate's messages are let through
+    fetch_new_messages' allowlist filter in 'approved' mode AND routed
+    through the full relay path in handle_message (see its call site
+    below) rather than the notify-only screening path -- the real,
+    deliberate difference from VIP handling."""
+    try:
+        result = subprocess.run(
+            ["curant-cli", "delegate-handles"], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        print(f"Delegate handle lookup failed (non-fatal, no delegate access this run): {e}", file=sys.stderr)
+        return []
+
+
+DELEGATE_HANDLES = _read_delegate_handles()
+
 # Access mode: 'approved' (default, secure) answers only CUSTOMER_HANDLES;
 # 'open' answers ANY incoming text or iMessage, no allowlist at all. Set
 # WITHOUT editing this file, same pattern as the handles above:
@@ -186,8 +209,8 @@ def fetch_new_messages(since_rowid):
     common structure; verify column names against your OS version with
     `sqlite3 ~/Library/Messages/chat.db ".schema message"` if this breaks.
     """
-    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES:
-        return []  # no customer identity configured and no VIP contacts either — nothing to match
+    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES and not DELEGATE_HANDLES:
+        return []  # no customer identity, no VIP contacts, no delegates either — nothing to match
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     base_query = """
@@ -215,7 +238,8 @@ def fetch_new_messages(since_rowid):
         # auto-reply -- see its call site below) even though every OTHER
         # non-customer sender stays completely invisible to Curant in
         # this mode, same as before VIP escalation existed.
-        allowed_handles = CUSTOMER_HANDLES + [h for h in VIP_HANDLES if h not in CUSTOMER_HANDLES]
+        widened = VIP_HANDLES + DELEGATE_HANDLES
+        allowed_handles = CUSTOMER_HANDLES + [h for h in widened if h not in CUSTOMER_HANDLES]
         # placeholders is our own controlled "?,?" string — values stay parameterized.
         placeholders = ",".join("?" for _ in allowed_handles)
         cur = conn.execute(
@@ -761,6 +785,43 @@ def run_weekly_rollup():
         send_text_reply(CUSTOMER_APPLE_ID, message_text)
 
 
+def run_meeting_prep_check():
+    """
+    Grace-exclusive, runs every 15 minutes (see
+    com.curant.meetingprep.plist -- an interval job, not a fixed daily
+    time like the other scheduled jobs, since checking for an imminent
+    meeting only makes sense done frequently throughout the day).
+    curant-cli's meeting_prep_check() does the tier gate and the
+    dedup-per-event logic; this is safe to run unconditionally.
+    """
+    live_context = get_calendar_and_reminders_context()
+    result = subprocess.run(
+        ["curant-cli", "meeting-prep-check", "--context", live_context],
+        capture_output=True, text=True,
+    )
+    try:
+        decision = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        print(f"Unexpected meeting-prep-check output (length {len(result.stdout)})", file=sys.stderr)
+        return
+
+    if not decision.get("should_send"):
+        return
+
+    message_text = decision.get("message", "")
+    if not message_text:
+        return
+
+    if decision.get("reply_format") == "voice":
+        try:
+            audio_path = text_to_speech(message_text, decision.get("voice_tier", "standard"))
+            send_voice_reply(CUSTOMER_APPLE_ID, audio_path)
+        except Exception:
+            report_watcher_error("tts_failed")
+    else:
+        send_text_reply(CUSTOMER_APPLE_ID, message_text)
+
+
 _contact_name_cache = {}  # handle -> resolved name (or None), looked up once per handle per run
 
 
@@ -811,17 +872,28 @@ def resolve_contact_name(handle):
 
 
 def handle_message(msg):
-    # Non-customer sender screening: only reachable at all when
-    # CURANT_TEXT_ACCESS_MODE is "open" -- fetch_new_messages() already
-    # filters to CUSTOMER_HANDLES-only in "approved" mode, so a
-    # non-customer msg["sender"] literally can't appear there. This is
-    # the funnel that replaces the old (real incident, see the
-    # access-mode split above) behavior of directly relaying and
+    # Non-customer, non-delegate sender screening: only reachable when
+    # CURANT_TEXT_ACCESS_MODE is "open", OR the sender is a VIP contact
+    # in "approved" mode (see fetch_new_messages' allowlist) -- either
+    # way, this is the funnel that replaces the old (real incident, see
+    # the access-mode split above) behavior of directly relaying and
     # auto-replying to ANY sender: a third party is NEVER handed to
     # relay()/full reply generation here -- screen_with_curant() only
     # ever comes back with "silently ignore" (spam) or "tell the
     # customer and let them decide," never an auto-reply to the sender.
-    if msg["sender"] not in CUSTOMER_HANDLES:
+    #
+    # A DELEGATE (Grace-exclusive, see get_delegate_handles/
+    # add_delegate_cmd in curant-cli) is the one deliberate, explicit-
+    # opt-in exception: their messages skip this whole screening branch
+    # entirely and fall through to the exact same full relay path below
+    # as the primary customer's own messages -- real assistant
+    # capability, replying back to the delegate's own handle
+    # (send_text_reply always targets msg["sender"], never a hardcoded
+    # customer address), sharing the same persona/memories/important-
+    # people context. Not a loophole -- a delegate has to be explicitly
+    # added by the customer, on a tier where that's an advertised
+    # capability.
+    if msg["sender"] not in CUSTOMER_HANDLES and msg["sender"] not in DELEGATE_HANDLES:
         contact_name = resolve_contact_name(msg["sender"])
         text = msg["text"] or ("[sent an attachment]" if msg["has_attachment"] else "")
         who = f"{contact_name} ({msg['sender']})" if contact_name else f"unresolved handle {msg['sender']}"
@@ -1143,5 +1215,9 @@ if __name__ == "__main__":
         # Invoked once by com.curant.weeklyrollup.plist on a schedule —
         # same run-and-exit pattern as --proactive-check above.
         run_weekly_rollup()
+    elif "--meeting-prep-check" in sys.argv:
+        # Invoked every 15 minutes by com.curant.meetingprep.plist --
+        # same run-and-exit pattern as --proactive-check above.
+        run_meeting_prep_check()
     else:
         main()
