@@ -132,6 +132,30 @@ def _read_delegate_handles():
 
 DELEGATE_HANDLES = _read_delegate_handles()
 
+
+def _read_auto_reply_handles():
+    """Grace-exclusive bounded discretion (see add_auto_reply_contact_cmd/
+    _is_safe_to_autoreply in curant-cli) -- read once at module load,
+    same pattern as VIP_HANDLES/DELEGATE_HANDLES above. Being on this
+    list only WIDENS which senders' messages reach screen_with_curant
+    at all in 'approved' access mode; the actual decision to reply
+    automatically instead of asking first still happens per-message,
+    inside curant-cli's screen_message (urgency, high-stakes, and VIP
+    checks all still apply even to someone on this list)."""
+    try:
+        result = subprocess.run(
+            ["curant-cli", "auto-reply-handles"], capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout.strip() or "[]")
+    except Exception as e:
+        print(f"Auto-reply handle lookup failed (non-fatal, no auto-reply this run): {e}", file=sys.stderr)
+        return []
+
+
+AUTO_REPLY_HANDLES = _read_auto_reply_handles()
+
 # Access mode: 'approved' (default, secure) answers only CUSTOMER_HANDLES;
 # 'open' answers ANY incoming text or iMessage, no allowlist at all. Set
 # WITHOUT editing this file, same pattern as the handles above:
@@ -209,7 +233,7 @@ def fetch_new_messages(since_rowid):
     common structure; verify column names against your OS version with
     `sqlite3 ~/Library/Messages/chat.db ".schema message"` if this breaks.
     """
-    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES and not DELEGATE_HANDLES:
+    if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES and not DELEGATE_HANDLES and not AUTO_REPLY_HANDLES:
         return []  # no customer identity, no VIP contacts, no delegates either — nothing to match
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -238,7 +262,7 @@ def fetch_new_messages(since_rowid):
         # auto-reply -- see its call site below) even though every OTHER
         # non-customer sender stays completely invisible to Curant in
         # this mode, same as before VIP escalation existed.
-        widened = VIP_HANDLES + DELEGATE_HANDLES
+        widened = VIP_HANDLES + DELEGATE_HANDLES + AUTO_REPLY_HANDLES
         allowed_handles = CUSTOMER_HANDLES + [h for h in widened if h not in CUSTOMER_HANDLES]
         # placeholders is our own controlled "?,?" string — values stay parameterized.
         placeholders = ",".join("?" for _ in allowed_handles)
@@ -913,6 +937,24 @@ def handle_message(msg):
                 print("  Screened as: notified you about it.")
             else:
                 print("  Screened as: notify_owner, but no CUSTOMER_APPLE_ID configured to notify.",
+                      file=sys.stderr)
+        elif action == "auto_reply":
+            # Grace-exclusive bounded discretion (see _is_safe_to_autoreply
+            # in curant-cli) -- the ONE case where a third party actually
+            # gets a reply sent to them, never asked-and-waited-for first.
+            # Order matters here: send the reply to the actual sender
+            # FIRST, then separately tell the customer it happened -- an
+            # FYI after the fact, not a permission request, since asking
+            # first would defeat the entire point of this feature.
+            reply_text = result.get("reply")
+            if reply_text:
+                send_text_reply(msg["sender"], reply_text)
+                print(f"  Screened as: auto-replied to {who} (opted-in auto-reply contact, routine message).")
+            fyi_notice = result.get("notice") or f"FYI -- I went ahead and replied to {who} for you."
+            if CUSTOMER_APPLE_ID:
+                send_text_reply(CUSTOMER_APPLE_ID, fyi_notice)
+            else:
+                print("  auto_reply: no CUSTOMER_APPLE_ID configured to send the FYI notice to.",
                       file=sys.stderr)
         else:
             print(f"  screen-message returned an unrecognized action: {result!r}", file=sys.stderr)

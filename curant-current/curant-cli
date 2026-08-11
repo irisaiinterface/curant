@@ -367,7 +367,20 @@ PERSONAS = {
              "tracking (Expensify, QuickBooks, Ramp), and multi-time-zone travel coordination — and can "
              "speak to them specifically rather than generically. Concrete things you're good at: board "
              "meeting agendas, investor update drafts, KPI dashboard summaries, expense reconciliation "
-             "guidance, and protecting an executive's focus time across a chaotic calendar.",
+             "guidance, and protecting an executive's focus time across a chaotic calendar. "
+             "How you actually talk: like a real, extremely competent human EA who has worked with this "
+             "person for years, not like an AI assistant describing what it can do. Concretely: skip "
+             "hedges you don't mean ('I think,' 'it seems,' 'just to clarify') when you're actually "
+             "sure — state it plainly. Don't narrate your own process ('I'll go ahead and,' 'let me "
+             "just') — do the thing or say the answer. Don't recap what was asked before answering it. "
+             "Vary your sentence rhythm and length turn to turn the way a person naturally does — not "
+             "the same tidy paragraph shape every time. Default to shorter over longer; say the useful "
+             "part first and stop, don't pad toward completeness. Have an actual point of view when one "
+             "is warranted (a real EA tells you a plan sounds bad, doesn't just execute it) — reserve "
+             "hedged, noncommittal answers for when you're genuinely uncertain, not as a default posture. "
+             "No emoji, no exclamation points, and no corporate-assistant filler ('happy to help!', "
+             "'great question!', 'I hope this helps'). Skip the sign-off pleasantries most turns — a "
+             "person who's worked with you a while doesn't re-introduce warmth every single message.",
     "dean": "You are Dean, a builder's AI Secretary — fast, casual, technical. Talk like a sharp coworker, "
             "not staff. Personality basis: ISTP-leaning (Virtuoso) — practical, hands-on, allergic to "
             "over-explaining. Thinking-primed behavior in research trends toward consistent, logic-first "
@@ -655,6 +668,21 @@ def init_local_db():
             handle TEXT PRIMARY KEY,
             label TEXT,
             active INTEGER DEFAULT 1,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- Grace-exclusive bounded discretion (Step 2 of the "make Curant
+        -- more human" work): a narrow, explicit, customer-opted-in list of
+        -- specific known senders whose ROUTINE messages Curant may actually
+        -- reply to on its own, instead of only ever drafting a suggestion
+        -- and waiting to be asked (see screen_message/_draft_suggested_reply).
+        -- Membership here is necessary but not sufficient -- see
+        -- _is_safe_to_autoreply for the additional per-message checks
+        -- (not urgent, not high-stakes, sender not VIP) that still apply
+        -- even for someone on this list.
+        CREATE TABLE IF NOT EXISTS auto_reply_contacts (
+            handle TEXT PRIMARY KEY,
+            label TEXT,
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -1098,6 +1126,113 @@ def list_delegates_cmd():
     for r in rows:
         label_str = f" ({r['label']})" if r["label"] else ""
         print(f"{r['handle']}{label_str} -- added {r['added_at']}")
+
+
+def get_auto_reply_handles():
+    """Every handle the customer has explicitly opted in to routine
+    auto-reply -- see add_auto_reply_contact_cmd. Membership here is
+    necessary but not sufficient for screen_message to actually
+    auto-reply; see _is_safe_to_autoreply for the rest of the check."""
+    with closing(get_local_db()) as conn:
+        rows = conn.execute("SELECT handle FROM auto_reply_contacts").fetchall()
+        return [r["handle"] for r in rows]
+
+
+def auto_reply_handles_cmd():
+    """Internal -- prints auto-reply-contact handles as a JSON array."""
+    print(json.dumps(get_auto_reply_handles()))
+
+
+def add_auto_reply_contact_cmd(handle, label):
+    """Grace-exclusive. `curant-cli add-auto-reply-contact <handle> [label]`
+    -- opts a specific, known contact in to Curant actually SENDING
+    routine replies to them on the customer's behalf, instead of only
+    ever drafting a suggestion and asking first (see screen_message).
+    This is deliberately scoped narrower than delegate access: a
+    delegate can have a real two-way conversation with Curant; an
+    auto-reply contact just means Curant won't bother the customer for
+    permission on messages from this person that are ALSO judged
+    routine (not urgent, not high-stakes) message by message -- being
+    on this list never bypasses those per-message checks, and never
+    overrides VIP status (a VIP always gets a notify-first notice,
+    even if also on this list, since VIP specifically means "always
+    tell me")."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Auto-reply contacts are a Grace-exclusive feature.")
+        sys.exit(1)
+    if not handle:
+        print("Usage: curant-cli add-auto-reply-contact <handle> [label]")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        conn.execute(
+            "INSERT INTO auto_reply_contacts (handle, label) VALUES (?, ?) "
+            "ON CONFLICT(handle) DO UPDATE SET label = excluded.label",
+            (handle, label or ""),
+        )
+        conn.commit()
+    print(f"{handle} added as an auto-reply contact{f' ({label})' if label else ''}. Curant may now "
+          f"send routine replies to them directly (never anything urgent or high-stakes) instead of "
+          f"asking you first each time -- you'll still get an FYI notice after it happens.")
+
+
+def remove_auto_reply_contact_cmd(handle):
+    """Grace-exclusive. `curant-cli remove-auto-reply-contact <handle>`."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Auto-reply contacts are a Grace-exclusive feature.")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        conn.execute("DELETE FROM auto_reply_contacts WHERE handle = ?", (handle,))
+        conn.commit()
+    print(f"{handle} removed from auto-reply contacts -- back to drafting suggestions and asking first.")
+
+
+def list_auto_reply_contacts_cmd():
+    """Grace-exclusive. Shows current auto-reply contacts."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Auto-reply contacts are a Grace-exclusive feature.")
+        sys.exit(1)
+    with closing(get_local_db()) as conn:
+        rows = conn.execute("SELECT handle, label, added_at FROM auto_reply_contacts").fetchall()
+    if not rows:
+        print("No auto-reply contacts set -- every third-party message still gets a draft-and-ask notice.")
+        return
+    for r in rows:
+        label_str = f" ({r['label']})" if r["label"] else ""
+        print(f"{r['handle']}{label_str} -- added {r['added_at']}")
+
+
+def _is_safe_to_autoreply(sender, text, is_vip):
+    """
+    The actual gate for whether screen_message may send a reply on its
+    own instead of asking first. ALL of the following must hold:
+      1. Sender is an explicitly opted-in auto-reply contact (see
+         add_auto_reply_contact_cmd) -- never inferred, always a
+         deliberate customer choice about a specific known person.
+      2. Sender is NOT flagged VIP -- VIP status specifically means
+         "always tell me when they text," which is a stronger,
+         explicit signal than routine-auto-reply eligibility; VIP wins.
+      3. The message doesn't read as urgent (classify_urgency).
+      4. The message doesn't read as high-stakes (classify_high_stakes)
+         -- financial, legal, medical, or another consequential topic.
+    Fails closed (False) on any doubt -- this only ever WIDENS from
+    "ask first" to "act and report," never the reverse, so a false
+    negative here just means one more ordinary confirmation message,
+    while a false positive means Curant said something to a real
+    person without being asked. That asymmetry is exactly why every
+    condition here is conservative.
+    """
+    if is_vip:
+        return False
+    if sender not in get_auto_reply_handles():
+        return False
+    if classify_urgency(text) == "urgent":
+        return False
+    if classify_high_stakes(text):
+        return False
+    return True
 
 
 def mark_vip_cmd(handle, enabled_str):
@@ -5699,12 +5834,154 @@ def build_image_message_content(provider, image_path, text):
         return text or "[Image attached — this provider doesn't have image support wired up]"
 
 
+RELATIONSHIP_STATE_MAX_AGE_HOURS = 24
+
+
+def get_relationship_state(config, provider=None, api_key=None):
+    """
+    Grace-exclusive (Step 3 of the "make Curant more human" work). The
+    existing memory system stores FACTS ("their dog's name is Bodhi").
+    This derives something different from those same facts plus recent
+    conversation history: a small profile of HOW this specific customer
+    prefers to be talked to -- formality, brevity, warmth, and any
+    topics worth extra care around -- so memory can shape TONE turn to
+    turn, not just supply reference material the model recites.
+
+    Deliberately cached and refreshed at most once every
+    RELATIONSHIP_STATE_MAX_AGE_HOURS, not recomputed on every message --
+    this is a real extra LLM call, and a customer's communication
+    preferences don't meaningfully shift message to message the way
+    "what did they just say" does. Cached in config.json under
+    "relationship_state" / "relationship_state_computed_at".
+
+    Returns None (never blocks the reply) if: not Grace tier, no
+    provider/api_key available, fewer than 3 memories logged yet (not
+    enough signal to infer anything real from), or the derivation call
+    itself fails for any reason -- in all of these cases the customer
+    just gets today's non-personalized tone, exactly like before this
+    existed, not a broken reply.
+    """
+    if get_customer_august_tier(config) != "grace":
+        return None
+
+    cached = config.get("relationship_state")
+    computed_at = config.get("relationship_state_computed_at")
+    if cached and computed_at:
+        try:
+            age_hours = (datetime.now() - datetime.fromisoformat(computed_at)).total_seconds() / 3600
+            if age_hours < RELATIONSHIP_STATE_MAX_AGE_HOURS:
+                return cached
+        except Exception:
+            pass  # malformed timestamp -- fall through and recompute
+
+    if not provider or not api_key:
+        return cached  # can't recompute right now; stale cache beats nothing
+
+    memories = get_memories()
+    if len(memories) < 3:
+        return cached
+
+    try:
+        history = get_history(limit=20)
+        history_lines = []
+        for h in history:
+            content = h.get("content")
+            if isinstance(content, str):
+                history_lines.append(f"{h.get('role')}: {content}")
+        extra = (
+            "Based on what you know about this customer (their stored memories) and recent "
+            "conversation history, infer their actual communication preferences -- not facts about "
+            "their life, but HOW they like to be talked to.\n\n"
+            "Memories:\n" + "\n".join(f"- {m}" for m in memories) + "\n\n"
+            "Recent conversation:\n" + "\n".join(history_lines[-20:]) + "\n\n"
+            'Respond with ONLY a JSON object: {"formality": "casual" or "formal", '
+            '"brevity": "brief" or "detailed", "warmth": "warm" or "reserved", '
+            '"handle_with_care": ["topic1", ...] (empty list if none), '
+            '"note": "one short sentence of anything else genuinely useful about their communication '
+            'style, or empty string"}. Base this only on real signal in the conversation -- if there '
+            "isn't enough to tell, use reasonable moderate defaults rather than guessing at extremes."
+        )
+        system_prompt = build_system_prompt(config, [], [], "", extra_instruction=extra)
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Infer the communication-style profile now."}],
+            max_tokens=300, tier="fast",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        state = json.loads(raw)
+        config["relationship_state"] = state
+        config["relationship_state_computed_at"] = datetime.now().isoformat()
+        save_config(config)
+        return state
+    except Exception as e:
+        print(f"[relationship state] derivation failed (non-fatal): {e}", file=sys.stderr)
+        return cached
+
+
+def relationship_state_cmd():
+    """Customer-facing transparency command: `curant-cli relationship-state`
+    -- shows what Curant has currently inferred about how you like to be
+    talked to, in plain language. Grace-exclusive, same as the feature
+    itself."""
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Relationship-aware tone is a Grace-exclusive feature.")
+        sys.exit(1)
+    state = config.get("relationship_state")
+    if not state:
+        print("Nothing inferred yet -- this builds up after a handful of conversations and memories.")
+        return
+    computed_at = config.get("relationship_state_computed_at", "unknown time")
+    print(f"As of {computed_at}, here's what I've picked up about how you like to be talked to:")
+    print(f"  Formality: {state.get('formality', 'unknown')}")
+    print(f"  Reply length: {state.get('brevity', 'unknown')}")
+    print(f"  Warmth: {state.get('warmth', 'unknown')}")
+    care = state.get("handle_with_care") or []
+    if care:
+        print(f"  Topics I'm handling with extra care: {', '.join(care)}")
+    if state.get("note"):
+        print(f"  Note: {state['note']}")
+
+
 def build_system_prompt(config, memories, people, live_context, extra_instruction=None,
-                        active_provider=None, is_first_message=False, urgency=None):
+                        active_provider=None, is_first_message=False, urgency=None,
+                        relationship_state=None):
     persona_prompt = PERSONAS.get(config.get("persona", "curant"), PERSONAS["curant"])
     addons = config.get("unlocked_addons", [])
 
     system_parts = [persona_prompt]
+    if relationship_state:
+        # Grace-exclusive (see get_relationship_state) -- this is what makes
+        # memory shape HOW you talk to this specific customer, not just WHAT
+        # you know about them. Placed early, right after the persona itself,
+        # since it should color the whole reply, not read as one fact among many.
+        bits = []
+        formality = relationship_state.get("formality")
+        if formality:
+            bits.append(f"they read as {formality} in how they communicate -- match that, don't default to formal")
+        brevity = relationship_state.get("brevity")
+        if brevity == "brief":
+            bits.append("they respond well to short, to-the-point replies -- don't pad this one out")
+        elif brevity == "detailed":
+            bits.append("they tend to want real detail, not just the headline")
+        warmth = relationship_state.get("warmth")
+        if warmth:
+            bits.append(f"their tone with you reads as {warmth} -- meet that rather than overriding it")
+        care = relationship_state.get("handle_with_care") or []
+        if care:
+            bits.append(f"handle these topics with extra care based on past conversations: {', '.join(care)}")
+        note = relationship_state.get("note")
+        if note:
+            bits.append(note)
+        if bits:
+            system_parts.append(
+                "How this specific customer prefers to be talked to, learned from your actual history "
+                "with them (this should shape tone and delivery, not what's technically true): "
+                + "; ".join(bits) + "."
+            )
     if config.get("instructions"):
         system_parts.append(f"Standing instructions from this customer: {config['instructions']}")
     if memories:
@@ -5793,6 +6070,25 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
             f"This specific reply is being generated via {active_provider}. If the customer asks which AI "
             "is answering, or which model is currently handling their messages, answer honestly using this — "
             "don't guess or deflect."
+        )
+    if get_customer_august_tier(config) == "grace":
+        system_parts.append(
+            "One more reminder on tone, since this matters more than any single feature: reply the way "
+            "a sharp, trusted human EA would text back, not the way an AI assistant would. If your draft "
+            "reply sounds like it's explaining itself, apologizing pre-emptively, or padding out to "
+            "sound thorough, cut that and keep only the actual answer."
+        )
+        system_parts.append(
+            "You're allowed to disagree, and you're allowed to not know something — a real EA does both "
+            "regularly, and always deferring or always sounding certain reads as fake, not helpful. This "
+            "is separate from the high-stakes decision-handoff rule above (that's about who SHOULD "
+            "decide); this is about ordinary conversation. If a plan sounds like a bad idea, say so "
+            "directly and briefly, then let them decide what to do with that -- don't just execute it "
+            "quietly and don't soften it into mush either. If you're actually not sure about something "
+            "factual, say 'I don't know' or 'I'm not sure' plainly instead of guessing with false "
+            "confidence or padding around the gap with hedging. Reserve actual agreement for when you "
+            "mean it -- don't open with validation ('great question', 'that makes sense') as a reflex "
+            "before getting to the substance."
         )
     if extra_instruction:
         system_parts.append(extra_instruction)
@@ -6200,9 +6496,19 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
         "fast; you can always say more if they ask a follow-up. If you'd normally write a list, say the "
         "items as a spoken sentence instead (\"a few options: X, Y, or Z\")."
     ) if voice_mode else None
+
+    # Grace-exclusive relationship-state tone shaping (Step 3 of the
+    # "make Curant more human" work) -- skipped in voice_mode, same
+    # latency reasoning as decide_provider above: this can trigger a
+    # real extra LLM call (only when the cache is stale, see
+    # RELATIONSHIP_STATE_MAX_AGE_HOURS), and a live caller shouldn't
+    # wait on that. Text replies aren't time-critical the same way.
+    relationship_state = None if voice_mode else get_relationship_state(config, provider, api_key)
+
     system_prompt = build_system_prompt(
         config, memories, people, context, extra_instruction=voice_instruction,
         active_provider=provider, is_first_message=is_first_message, urgency=urgency,
+        relationship_state=relationship_state,
     )
 
     # Local front-door layer, step 2: PII redaction. Applied ONLY to what
@@ -6463,6 +6769,7 @@ def screen_message(sender, text, contact_name=None):
     Always prints exactly one JSON object to stdout:
       {"action": "ignore", "reason": "..."}
       {"action": "notify_owner", "notice": "...", "sender": "...", "resolved_name": "..." or null, "vip": true/false}
+      {"action": "auto_reply", "reply": "...", "notice": "...", "sender": "...", "resolved_name": "..." or null}
 
     VIP escalation (Grace-exclusive -- see get_vip_handles/mark_vip_cmd):
     a VIP sender's message is NEVER auto-ignored as spam, even if it
@@ -6474,6 +6781,18 @@ def screen_message(sender, text, contact_name=None):
     'approved' access mode (curant-watcher.py's fetch_new_messages,
     gated on get_vip_handles which is only ever non-empty for Grace
     customers in practice, since mark_vip_cmd refuses to set it otherwise).
+
+    Bounded discretion (Grace-exclusive, opt-in -- see
+    add_auto_reply_contact_cmd/_is_safe_to_autoreply): for a specific,
+    customer-approved contact, a message that is ALSO judged routine
+    (not urgent, not high-stakes, sender not VIP) gets ACTUALLY replied
+    to on the customer's behalf, rather than only ever drafted and held
+    for permission -- curant-watcher.py sends the reply and separately
+    tells the customer it happened, after the fact, never before. This
+    is the one deliberate exception to this function's historical
+    "never actually replies to a third party" behavior, and it only
+    ever applies to senders the customer explicitly opted in one at a
+    time -- see _is_safe_to_autoreply for the full, conservative gate.
     """
     init_local_db()
 
@@ -6502,6 +6821,19 @@ def screen_message(sender, text, contact_name=None):
     urgency_note = " (This message also reads as urgent.)" if urgency == "urgent" else ""
 
     suggested_reply = _draft_suggested_reply(sender, text, resolved_name, person) if preview else None
+
+    if suggested_reply and _is_safe_to_autoreply(sender, preview, is_vip):
+        fyi_notice = (
+            f"FYI -- {who} texted \"{preview}\" and I went ahead and replied for them since that's "
+            f"routine and you've told me it's fine to just handle their messages: \"{suggested_reply}\"\n\n"
+            f"Say the word if you'd rather I hadn't, or if you want to take auto-reply off for them."
+        )
+        print(json.dumps({
+            "action": "auto_reply", "reply": suggested_reply, "notice": fyi_notice,
+            "sender": sender, "resolved_name": resolved_name,
+        }))
+        return
+
     draft_block = f"\n\nSuggested reply (just my draft -- I never send this on my own): \"{suggested_reply}\"" if suggested_reply else ""
 
     if is_vip:
@@ -8572,6 +8904,19 @@ def main():
 
     sub.add_parser("delegate-handles", help="Internal — prints delegate handles as JSON (used by curant-watcher.py)")
 
+    p_add_autoreply = sub.add_parser("add-auto-reply-contact", help="Grace-exclusive: let Curant send routine replies to this contact without asking first")
+    p_add_autoreply.add_argument("handle", help="Phone number or email, as it appears in Messages")
+    p_add_autoreply.add_argument("label", nargs="?", default=None, help="Optional label, e.g. 'assistant' or 'spouse'")
+
+    p_remove_autoreply = sub.add_parser("remove-auto-reply-contact", help="Grace-exclusive: go back to draft-and-ask for this contact")
+    p_remove_autoreply.add_argument("handle")
+
+    sub.add_parser("list-auto-reply-contacts", help="Grace-exclusive: show current auto-reply contacts")
+
+    sub.add_parser("auto-reply-handles", help="Internal — prints auto-reply contact handles as JSON (used by curant-watcher.py)")
+
+    sub.add_parser("relationship-state", help="Grace-exclusive: show what Curant has inferred about how you like to be talked to")
+
     p_provider = sub.add_parser("set-provider", help="Switch which model provider handles messages — same persona/memories carry over")
     p_provider.add_argument("provider", choices=sorted(PROVIDER_MODELS))
 
@@ -8736,6 +9081,16 @@ def main():
         list_delegates_cmd()
     elif args.command == "delegate-handles":
         delegate_handles_cmd()
+    elif args.command == "add-auto-reply-contact":
+        add_auto_reply_contact_cmd(args.handle, args.label)
+    elif args.command == "remove-auto-reply-contact":
+        remove_auto_reply_contact_cmd(args.handle)
+    elif args.command == "list-auto-reply-contacts":
+        list_auto_reply_contacts_cmd()
+    elif args.command == "auto-reply-handles":
+        auto_reply_handles_cmd()
+    elif args.command == "relationship-state":
+        relationship_state_cmd()
     elif args.command == "set-provider":
         set_provider(args.provider)
     elif args.command == "status":
