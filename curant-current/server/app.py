@@ -308,6 +308,14 @@ ADDON_CATALOG = {
                         "or payment/checkout flow, regardless of confirmation.",
         "stripe_payment_link": None,
     },
+    "grace": {
+        "label": "Grace (flagship)",
+        "description": "The most advanced tier of Curant, with everything included: August's "
+                        "full creative generation suite (images and video) with NO monthly cap "
+                        "on covered generation, browser automation, and priority handling on "
+                        "feature requests. Price TBD.",
+        "stripe_payment_link": None,
+    },
 }
 
 # --- August tier -> covered-generation-budget config ---
@@ -329,6 +337,16 @@ AUGUST_TIER_CONFIG = {
     "august_standard": {"monthly_cap_usd": 2.0, "video_allowed": False},
     "august_pro": {"monthly_cap_usd": 5.0, "video_allowed": True},
     "august_max": {"monthly_cap_usd": 10.0, "video_allowed": True},
+    # Grace: the flagship tier, explicitly confirmed with the owner to
+    # have NO monthly $ cap on covered generation (monthly_cap_usd=None,
+    # same "None means uncapped" convention curant-cli already uses for
+    # its own local spend cap). Real cost exposure here is bounded only
+    # by the shared per-license-key rate limit in _august_proxy_precheck
+    # (30 req/min as of this writing) -- there is deliberately no dollar
+    # ceiling. Flagged here in case that combination ever needs
+    # revisiting: a sustained abusive burst at the rate limit is a real,
+    # if unlikely, unbounded cost, not just a theoretical one.
+    "grace": {"monthly_cap_usd": None, "video_allowed": True},
 }
 
 # Server's own FLUX/Ideogram keys -- these are what actually get spent
@@ -365,7 +383,16 @@ def get_customer_august_tier(customer):
     tiers = [a for a in unlocked if a in AUGUST_TIER_CONFIG]
     if not tiers:
         return None
-    return max(tiers, key=lambda t: AUGUST_TIER_CONFIG[t]["monthly_cap_usd"])
+    # None (uncapped, i.e. Grace) must sort as the highest possible tier,
+    # not crash trying to compare None > a float or get treated as the
+    # lowest -- float("inf") makes it win over every real $ cap.
+    return max(
+        tiers,
+        key=lambda t: (
+            float("inf") if AUGUST_TIER_CONFIG[t]["monthly_cap_usd"] is None
+            else AUGUST_TIER_CONFIG[t]["monthly_cap_usd"]
+        ),
+    )
 
 
 def get_server_monthly_spend(license_key):
@@ -401,20 +428,26 @@ def check_and_log_server_generation_cost(license_key, tier, service, cost):
     with closing(get_db()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            row = conn.execute(
-                "SELECT SUM(estimated_cost_usd) as total FROM server_generation_costs "
-                "WHERE license_key = ? AND created_at >= date('now', 'start of month')",
-                (license_key,),
-            ).fetchone()
-            current = row["total"] or 0.0
-            projected = current + cost
-            if projected > cap:
-                conn.execute("ROLLBACK")
-                return False, None, (
-                    f"This would put this month's covered generation spend at an estimated "
-                    f"${projected:.2f}, over your ${cap:.2f}/mo included budget. Nothing was "
-                    f"generated. For more this month: {GENERATION_SALES_CONTACT}."
-                )
+            # cap is None for Grace (uncapped by design -- see
+            # AUGUST_TIER_CONFIG's comment on that tier) -- there's no
+            # dollar ceiling to check against, so this still records the
+            # cost for spend-tracking/reporting purposes, just never
+            # blocks on it. Every other tier keeps the real comparison.
+            if cap is not None:
+                row = conn.execute(
+                    "SELECT SUM(estimated_cost_usd) as total FROM server_generation_costs "
+                    "WHERE license_key = ? AND created_at >= date('now', 'start of month')",
+                    (license_key,),
+                ).fetchone()
+                current = row["total"] or 0.0
+                projected = current + cost
+                if projected > cap:
+                    conn.execute("ROLLBACK")
+                    return False, None, (
+                        f"This would put this month's covered generation spend at an estimated "
+                        f"${projected:.2f}, over your ${cap:.2f}/mo included budget. Nothing was "
+                        f"generated. For more this month: {GENERATION_SALES_CONTACT}."
+                    )
             cursor = conn.execute(
                 "INSERT INTO server_generation_costs (license_key, service, estimated_cost_usd) VALUES (?, ?, ?)",
                 (license_key, service, cost),
@@ -761,17 +794,26 @@ def list_feature_requests_for(license_key):
 
 
 def list_all_feature_requests():
-    """Owner-facing: every customer's requests, newest first, joined with
-    the customer's name so you don't have to cross-reference a license key
-    by hand."""
+    """Owner-facing: every customer's requests, Grace customers' requests
+    first (priority handling is one of Grace's advertised benefits),
+    newest-first within each group, joined with the customer's name so
+    you don't have to cross-reference a license key by hand.
+
+    unlocked_addons is a JSON array stored as text (e.g. '["grace",
+    "browser_automation"]') -- LIKE '%grace%' is a deliberately simple
+    substring match rather than a real JSON containment check, which is
+    fine here since "grace" isn't a substring of any other addon id in
+    ADDON_CATALOG/AUGUST_TIER_CONFIG today. Revisit with json_each if
+    that ever stops being true."""
     with closing(get_db()) as conn:
         rows = conn.execute(
             """SELECT feature_requests.id, feature_requests.license_key, feature_requests.message,
                       feature_requests.status, feature_requests.created_at,
-                      customers.customer_name
+                      customers.customer_name,
+                      (customers.unlocked_addons LIKE '%grace%') AS is_priority
                FROM feature_requests
                JOIN customers ON customers.license_key = feature_requests.license_key
-               ORDER BY feature_requests.created_at DESC"""
+               ORDER BY is_priority DESC, feature_requests.created_at DESC"""
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -1700,7 +1742,7 @@ def owner_dashboard():
             <tr><th>Customer</th><th>Request</th><th>Status</th><th>Submitted</th><th></th></tr>
             {% for r in feature_requests %}
             <tr>
-              <td>{{ r.customer_name }}</td>
+              <td>{{ r.customer_name }}{% if r.is_priority %} <span title="Grace customer -- priority">&#9733;</span>{% endif %}</td>
               <td>{{ r.message }}</td>
               <td>{{ r.status }}</td>
               <td>{{ r.created_at }}</td>

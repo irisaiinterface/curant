@@ -2541,14 +2541,17 @@ AUGUST_COVERED_GENERATION_TIERS = ("august_standard", "august_pro", "august_max"
 
 def get_customer_august_tier(config):
     """Returns the customer's active August tier ('august_standard' /
-    'august_pro' / 'august_max') if they have one unlocked, else None.
-    Used to decide whether generate_image/generate_image_with_text
+    'august_pro' / 'august_max' / 'grace') if they have one unlocked,
+    else None. Used to decide whether generate_image/generate_image_with_text
     should go through Curant's server proxy (business-covered, real
     key never touches this Mac) or fall back to the customer's own BYOK
     key. If more than one tier is somehow present, the highest one wins
-    -- mirrors the server's own get_customer_august_tier in app.py."""
+    -- mirrors the server's own get_customer_august_tier in app.py.
+    Grace is the flagship tier (uncapped covered generation server-side)
+    so it's checked first, same as august_max being checked before the
+    lower August tiers."""
     addons = config.get("unlocked_addons", []) or []
-    for tier in ("august_max", "august_pro", "august_standard"):
+    for tier in ("grace", "august_max", "august_pro", "august_standard"):
         if tier in addons:
             return tier
     return None
