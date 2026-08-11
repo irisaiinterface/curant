@@ -527,18 +527,51 @@ def bind_device(license_key, device_id):
 # still provisions successfully (falls back to plan="base", no addons)
 # rather than silently failing the whole checkout, but gets flagged in
 # the server log so it doesn't go unnoticed.
-PRICE_PLAN_MAP = {
-    # Real August tier prices, created live in Stripe on 2026-08-11
-    # (product+price created together via the Stripe API -- see each
-    # price's product_data.name in the dashboard for "August Standard"/
-    # "August Pro"/"August Max"). Each is a $/mo recurring subscription
-    # price; the addon key here must exactly match AUGUST_TIER_CONFIG's
-    # keys above, since that's what actually enforces the monthly
-    # covered-generation cap once a customer's unlocked_addons includes it.
+# STRIPE_MODE controls which price map is active. Defaults to "test" on
+# purpose -- a fresh checkout of this server should never accidentally
+# be able to charge a real card just because an env var wasn't set.
+# Stripe account KYC/identity verification (the "Verify your personal
+# details" flow) hasn't been completed yet as of 2026-08-11, so live
+# payments can't actually settle right now regardless of this switch --
+# but the switch exists so the code is ready the moment that's done,
+# without another round of edits here.
+#
+# Set STRIPE_MODE=live once: (a) KYC/identity verification is complete
+# in the Stripe dashboard, (b) the real STRIPE_SECRET_KEY / webhook
+# secret env vars are the live ones, not test ones, and (c) you're
+# actually ready for real customers to be charged.
+STRIPE_MODE = os.environ.get("STRIPE_MODE", "test")
+
+# Fill these in once you've flipped the Stripe dashboard to test mode
+# (toggle top-right of the dashboard) and created the same three August
+# tier prices there (Product catalog > + Add product, same names/amounts
+# as the live ones below). Test mode price ids look identical in shape
+# to live ones (price_...) but only work with test-mode API keys/cards
+# (4242 4242 4242 4242, any future expiry, any CVC) -- nothing here can
+# charge a real card even by mistake.
+PRICE_PLAN_MAP_TEST = {
+    # "price_test_XXXXXXXXXXXXXX": {"plan": "base", "addons": ["august_standard"]},
+    # "price_test_YYYYYYYYYYYYYY": {"plan": "base", "addons": ["august_pro"]},
+    # "price_test_ZZZZZZZZZZZZZZ": {"plan": "base", "addons": ["august_max"]},
+}
+
+# Real August tier prices, created live in Stripe on 2026-08-11
+# (product+price created together via the Stripe API -- see each
+# price's product_data.name in the dashboard for "August Standard"/
+# "August Pro"/"August Max"). Each is a $/mo recurring subscription
+# price; the addon key here must exactly match AUGUST_TIER_CONFIG's
+# keys above, since that's what actually enforces the monthly
+# covered-generation cap once a customer's unlocked_addons includes it.
+# NOT active by default -- see STRIPE_MODE above; Stripe account
+# verification isn't complete yet, so these can't take real payments
+# regardless of whether this map is selected.
+PRICE_PLAN_MAP_LIVE = {
     "price_1U38kJDXZA7eiWhwjo73xuj0": {"plan": "base", "addons": ["august_standard"]},  # $4.99/mo
     "price_1U38kMDXZA7eiWhwoVZD2YRX": {"plan": "base", "addons": ["august_pro"]},       # $10.99/mo
     "price_1U38kQDXZA7eiWhwGqbpU8ay": {"plan": "base", "addons": ["august_max"]},       # $20.99/mo
 }
+
+PRICE_PLAN_MAP = PRICE_PLAN_MAP_TEST if STRIPE_MODE == "test" else PRICE_PLAN_MAP_LIVE
 
 
 def set_customer_addons(license_key, addons):
