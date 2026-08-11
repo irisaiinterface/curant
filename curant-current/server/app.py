@@ -224,7 +224,64 @@ def init_db():
             estimated_cost_usd REAL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- Replaces the old customers.device_id single-column 1:1 binding
+        -- for enforcement purposes (that column is left in place for
+        -- backward compat / informational display, but bind_device below
+        -- no longer writes meaningful enforcement data there). Most
+        -- customers still get exactly one device (device_limit_for -- see
+        -- get_device_limit_for_customer), but Grace customers can bind
+        -- more than one device to the same license. A device can still
+        -- only ever belong to ONE license (UNIQUE on device_id) --
+        -- multi-device is about a license having several devices, never
+        -- about a device serving several licenses.
+        CREATE TABLE IF NOT EXISTS licensed_devices (
+            license_key TEXT NOT NULL,
+            device_id TEXT NOT NULL UNIQUE,
+            bound_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (license_key, device_id)
+        );
+
+        -- Owner-facing queue of capability gaps a Grace customer hit that
+        -- Curant has drafted a CODE proposal for (see /v1/propose-code-fix
+        -- and the "Curant drafts, owner approves" design -- nothing here
+        -- is ever auto-merged or auto-deployed; a human has to read and
+        -- explicitly approve every row before any code changes).
+        CREATE TABLE IF NOT EXISTS code_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            gap_description TEXT,     -- what the customer asked for that Curant couldn't do
+            proposed_diff TEXT,       -- Curant's drafted patch, as unified diff text -- NEVER executed automatically
+            status TEXT DEFAULT 'pending_review',  -- 'pending_review' | 'approved' | 'rejected'
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TEXT
+        );
+
+        -- Grace-only: capability gaps that skip the "call for a custom
+        -- quote" phone-number wall and instead land here directly,
+        -- flagged urgent, separate from the regular feature_requests
+        -- queue (which is customer-initiated suggestions, not "I hit a
+        -- wall right now" gaps).
+        CREATE TABLE IF NOT EXISTS urgent_capability_gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'open',  -- 'open' | 'resolved'
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """)
+        conn.commit()
+
+    # Backfill: any pre-existing single-device bindings (from before
+    # licensed_devices existed) get carried over so an already-activated
+    # customer doesn't appear to have zero bound devices after this
+    # upgrade.
+    with closing(get_db()) as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO licensed_devices (license_key, device_id)
+               SELECT license_key, device_id FROM customers
+               WHERE device_id IS NOT NULL AND device_id != ''"""
+        )
         conn.commit()
 
     # Lightweight migration: installs that created customers before the
@@ -516,41 +573,93 @@ def provision_customer(customer_name, email=None, phone_number=None, plan="base"
     return license_key
 
 
+# Most customers get exactly one device per license, same as always.
+# Grace is the one tier that gets more (home + office + laptop is a
+# realistic real-world need for an "executive" customer) -- see
+# get_device_limit_for_customer.
+MAX_DEVICES_DEFAULT = 1
+MAX_DEVICES_GRACE = 3
+
+
+def get_device_limit_for_customer(customer):
+    """How many devices this customer's license may be bound to at once.
+    Reads the same unlocked_addons/AUGUST_TIER_CONFIG machinery as the
+    generation-cap logic, since Grace is defined the same way there."""
+    if get_customer_august_tier(customer) == "grace":
+        return MAX_DEVICES_GRACE
+    return MAX_DEVICES_DEFAULT
+
+
 def bind_device(license_key, device_id):
     """
-    Enforce a strict 1:1 relationship between a license and a device:
-      - A license can only ever be bound to one device.
-      - A device can only ever be bound to one license.
+    Enforces:
+      - A device can only ever be bound to ONE license (UNIQUE on
+        licensed_devices.device_id) -- this is never relaxed, for anyone.
+      - A license can be bound to up to get_device_limit_for_customer(...)
+        devices -- 1 for everyone except Grace (3), rather than the old
+        hard 1:1 rule for all customers.
     Returns (ok: bool, error_code: str | None).
     """
     with closing(get_db()) as conn:
         customer = conn.execute(
-            "SELECT device_id FROM customers WHERE license_key = ?", (license_key,)
+            "SELECT * FROM customers WHERE license_key = ?", (license_key,)
         ).fetchone()
         if customer is None:
             return False, "invalid_license"
 
-        current_device = customer["device_id"]
-        if current_device is not None:
-            if current_device == device_id:
-                return True, None  # already bound to this same device — fine
-            return False, "license_already_bound_to_another_device"
+        already_bound_to_this_license = conn.execute(
+            "SELECT 1 FROM licensed_devices WHERE license_key = ? AND device_id = ?",
+            (license_key, device_id),
+        ).fetchone()
+        if already_bound_to_this_license:
+            return True, None  # re-activating an already-bound device -- fine, idempotent
 
-        # This license has no device yet — check the device isn't already
-        # bound to a DIFFERENT license before claiming it.
         other = conn.execute(
-            "SELECT license_key FROM customers WHERE device_id = ? AND license_key != ?",
-            (device_id, license_key),
+            "SELECT license_key FROM licensed_devices WHERE device_id = ?", (device_id,)
         ).fetchone()
         if other is not None:
             return False, "device_already_bound_to_another_license"
 
+        limit = get_device_limit_for_customer(customer)
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM licensed_devices WHERE license_key = ?", (license_key,)
+        ).fetchone()
+        if count_row["c"] >= limit:
+            return False, "device_limit_reached"
+
         conn.execute(
-            "UPDATE customers SET device_id = ? WHERE license_key = ?",
-            (device_id, license_key),
+            "INSERT INTO licensed_devices (license_key, device_id) VALUES (?, ?)",
+            (license_key, device_id),
         )
+        # customers.device_id kept in sync for backward-compat display
+        # only (e.g. anywhere still reading it directly) -- it's a single
+        # column so it can only ever reflect ONE of a Grace customer's
+        # several bound devices; licensed_devices is the real source of
+        # truth for enforcement everywhere in this file.
+        if not customer["device_id"]:
+            conn.execute(
+                "UPDATE customers SET device_id = ? WHERE license_key = ?",
+                (device_id, license_key),
+            )
         conn.commit()
         return True, None
+
+
+def is_device_bound_to_license(license_key, device_id):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM licensed_devices WHERE license_key = ? AND device_id = ?",
+            (license_key, device_id),
+        ).fetchone()
+        return row is not None
+
+
+def count_bound_devices(license_key):
+    with closing(get_db()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM licensed_devices WHERE license_key = ?", (license_key,)
+        ).fetchone()
+        return row["c"]
 
 
 # --- Stripe checkout -> plan/addon mapping ---
@@ -728,6 +837,16 @@ def send_license_email(customer_name, email, license_key):
         return False, str(e)
 
 
+# Sanity bound on custom instructions length, not a hard product limit --
+# just guards against a pathological form submission bloating the DB
+# indefinitely. Grace gets a much higher ceiling (confirmed explicitly
+# with the owner as one of Grace's differentiators) for genuinely more
+# detailed executive context -- recurring meeting patterns, org chart,
+# communication preferences, etc. -- that wouldn't fit in 4000 characters.
+INSTRUCTIONS_MAX_CHARS_DEFAULT = 4000
+INSTRUCTIONS_MAX_CHARS_GRACE = 20000
+
+
 def update_customer_preferences(license_key, persona, instructions, voice_tier):
     """
     Applies a customer's own explicit persona/instructions/voice-tier
@@ -743,9 +862,13 @@ def update_customer_preferences(license_key, persona, instructions, voice_tier):
         return False, "invalid_persona"
     if voice_tier not in VOICE_TIER_CHOICES:
         return False, "invalid_voice_tier"
-    if len(instructions) > 4000:
-        # Sanity bound, not a hard product limit -- just guards against a
-        # pathological form submission bloating the DB indefinitely.
+    customer = get_customer(license_key)
+    max_chars = (
+        INSTRUCTIONS_MAX_CHARS_GRACE
+        if customer and get_customer_august_tier(customer) == "grace"
+        else INSTRUCTIONS_MAX_CHARS_DEFAULT
+    )
+    if len(instructions) > max_chars:
         return False, "instructions_too_long"
     with closing(get_db()) as conn:
         conn.execute(
@@ -1050,7 +1173,14 @@ def status():
     if not customer:
         return jsonify({"active": False}), 404
 
-    if customer["device_id"] and device_id and customer["device_id"] != device_id:
+    # Multi-device aware: a mismatch is now "this device isn't one of the
+    # license's bound devices" rather than "doesn't match the one device
+    # on file" -- correct for both a normal 1-device customer and a
+    # Grace customer with several bound devices. Only flagged as a
+    # mismatch if the license actually HAS at least one bound device and
+    # this one isn't among them (an unbound license with no devices yet
+    # isn't a mismatch, just not-yet-activated).
+    if device_id and count_bound_devices(license_key) > 0 and not is_device_bound_to_license(license_key, device_id):
         return jsonify({"active": False, "error": "device_mismatch"}), 409
 
     return jsonify({
@@ -1270,6 +1400,145 @@ def create_release_request(license_key):
     return {"ok": True, "status": "pending", "request_id": request_id}
 
 
+def create_urgent_capability_gap(license_key, description):
+    """
+    Grace-exclusive: when a Grace customer's Curant hits something it
+    can't do, this skips the normal "call for a custom quote" phone-
+    number wall entirely and lands the gap directly in your owner
+    dashboard, flagged urgent -- separate from the regular
+    feature_requests queue, which is customer-initiated suggestions, not
+    "I hit a wall just now" gaps. You still build it yourself (this
+    never auto-writes or auto-deploys code -- see code_proposals for the
+    separate, human-gated code-drafting feature); this only removes the
+    phone-call step for Grace customers specifically.
+
+    Silently no-ops (returns False) for a non-Grace license or an
+    invalid one, rather than erroring -- curant-cli calls this best-
+    effort and shouldn't surface a network/auth failure to the customer
+    over something that already has a local fallback (the .xlsx export
+    + local text notice still happen either way).
+    """
+    customer = get_customer(license_key)
+    if not customer or not customer["active"]:
+        return False
+    if get_customer_august_tier(customer) != "grace":
+        return False
+    description = (description or "").strip()
+    if not description:
+        return False
+    if len(description) > 2000:
+        description = description[:2000]
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO urgent_capability_gaps (license_key, description) VALUES (?, ?)",
+            (license_key, description),
+        )
+        conn.commit()
+    return True
+
+
+def list_urgent_capability_gaps():
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """SELECT urgent_capability_gaps.id, urgent_capability_gaps.license_key,
+                      urgent_capability_gaps.description, urgent_capability_gaps.status,
+                      urgent_capability_gaps.created_at, customers.customer_name
+               FROM urgent_capability_gaps
+               JOIN customers ON customers.license_key = urgent_capability_gaps.license_key
+               ORDER BY urgent_capability_gaps.status ASC, urgent_capability_gaps.created_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def create_code_proposal(license_key, gap_description, proposed_diff):
+    """
+    Grace-exclusive. Stores a model-DRAFTED proposed implementation for
+    manual owner review -- see propose_code_fix_for_gap's docstring in
+    curant-cli for the full safety design. This function only ever
+    writes a row to code_proposals with status='pending_review'; nothing
+    here (or anywhere else in this file) reads proposed_diff and
+    executes, applies, or merges it. The only thing that ever happens to
+    that text is a human reading it on /owner/dashboard and deciding
+    what to do about it themselves, entirely outside this system.
+    """
+    customer = get_customer(license_key)
+    if not customer or not customer["active"]:
+        return False
+    if get_customer_august_tier(customer) != "grace":
+        return False
+    gap_description = (gap_description or "").strip()[:2000]
+    proposed_diff = (proposed_diff or "").strip()[:8000]
+    if not gap_description or not proposed_diff:
+        return False
+    with closing(get_db()) as conn:
+        conn.execute(
+            "INSERT INTO code_proposals (license_key, gap_description, proposed_diff) VALUES (?, ?, ?)",
+            (license_key, gap_description, proposed_diff),
+        )
+        conn.commit()
+    return True
+
+
+def list_code_proposals():
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """SELECT code_proposals.id, code_proposals.license_key, code_proposals.gap_description,
+                      code_proposals.proposed_diff, code_proposals.status, code_proposals.created_at,
+                      customers.customer_name
+               FROM code_proposals
+               JOIN customers ON customers.license_key = code_proposals.license_key
+               ORDER BY (code_proposals.status = 'pending_review') DESC, code_proposals.created_at DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+@app.route("/v1/propose-code-fix", methods=["POST"])
+def submit_code_proposal():
+    """
+    Grace-exclusive endpoint -- accepts a model-drafted proposal and
+    stores it, inert, for manual review. See create_code_proposal's
+    docstring: nothing here ever executes or applies proposed_diff.
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(f"code-proposal:{license_key or 'unknown'}"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    data = request.get_json(force=True)
+    created = create_code_proposal(license_key, data.get("gap_description", ""), data.get("proposed_diff", ""))
+    if not created:
+        return jsonify({"ok": False}), 403
+    return jsonify({"ok": True})
+
+
+@app.route("/v1/urgent-capability-gap", methods=["POST"])
+def submit_urgent_capability_gap():
+    """
+    Grace-exclusive endpoint -- called by curant-cli's log_capability_gap
+    instead of (in addition to, really -- the local logging still always
+    happens) telling the customer to call for a quote. Auth is the same
+    Bearer-license-key pattern as every other customer-facing endpoint.
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(f"urgent-gap:{license_key or 'unknown'}"):
+        return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+    data = request.get_json(force=True)
+    description = data.get("description", "")
+
+    created = create_urgent_capability_gap(license_key, description)
+    if not created:
+        # Deliberately vague (invalid license vs. wrong tier vs. empty
+        # description all collapse to the same response) -- this is an
+        # internal best-effort call from curant-cli, not something a
+        # customer directly sees the raw error from.
+        return jsonify({"ok": False}), 403
+    return jsonify({"ok": True})
+
+
 @app.route("/v1/release-request", methods=["POST"])
 def submit_release_request():
     """
@@ -1324,6 +1593,15 @@ def approve_release_request(request_id):
         if req["status"] != "pending":
             return False, f"request_already_{req['status']}"
 
+        # Releases ALL of this license's bound devices, not just one --
+        # for a normal 1-device customer this is identical to the old
+        # behavior; for a Grace customer with several devices bound, a
+        # release request clears the whole set and they re-activate
+        # whichever ones they want, up to their limit again. Approving a
+        # release is already a manual, reviewed action (see this
+        # function's docstring) so clearing everything rather than
+        # guessing which one device was meant is the safer default.
+        conn.execute("DELETE FROM licensed_devices WHERE license_key = ?", (req["license_key"],))
         conn.execute(
             "UPDATE customers SET device_id = NULL WHERE license_key = ?",
             (req["license_key"],),
@@ -1681,6 +1959,8 @@ def owner_dashboard():
         c["addons_display"] = ", ".join(json.loads(c["unlocked_addons"] or "[]")) or "—"
 
     feature_requests = list_all_feature_requests()
+    urgent_gaps = list_urgent_capability_gaps()
+    code_proposals = list_code_proposals()
 
     return render_template_string(
         BASE_STYLE + """
@@ -1732,6 +2012,64 @@ def owner_dashboard():
           </table>
           {% else %}
           <p class="muted">None right now.</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Pending code proposals (Grace)</h2>
+          <p class="muted">Model-drafted proposals for capability gaps Grace customers hit. These
+          are DRAFTS ONLY -- nothing here is ever automatically merged, applied, or deployed.
+          "Approve" just marks it reviewed and worth building; you still implement and ship it
+          yourself, the normal way.</p>
+          {% if code_proposals %}
+          {% for p in code_proposals %}
+          <div style="border:1px solid var(--border); border-radius:6px; padding:0.75rem; margin-bottom:0.75rem;">
+            <p><strong>{{ p.customer_name }}</strong> asked for: {{ p.gap_description }}</p>
+            <pre style="white-space:pre-wrap; font-size:0.85rem; background:var(--bg-subtle); padding:0.5rem; border-radius:4px; max-height:300px; overflow:auto;">{{ p.proposed_diff }}</pre>
+            <p class="muted">Status: {{ p.status }} — {{ p.created_at }}</p>
+            {% if p.status == "pending_review" %}
+            <form class="inline" method="post" action="/owner/code-proposal/{{ p.id }}/approved">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit">Mark reviewed / worth building</button>
+            </form>
+            <form class="inline" method="post" action="/owner/code-proposal/{{ p.id }}/rejected">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button type="submit">Reject</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endfor %}
+          {% else %}
+          <p class="muted">None yet.</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h2 style="font-size:1.1rem;">Urgent (Grace)</h2>
+          <p class="muted">Capability gaps from Grace customers -- these skip the "call for a
+          quote" step and land here directly.</p>
+          {% if urgent_gaps %}
+          <table>
+            <tr><th>Customer</th><th>What they needed</th><th>Status</th><th>Hit</th><th></th></tr>
+            {% for g in urgent_gaps %}
+            <tr>
+              <td>{{ g.customer_name }}</td>
+              <td>{{ g.description }}</td>
+              <td>{{ g.status }}</td>
+              <td>{{ g.created_at }}</td>
+              <td>
+                {% if g.status != "resolved" %}
+                <form class="inline" method="post" action="/owner/urgent-gap/{{ g.id }}/resolve">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <button type="submit">Mark resolved</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </table>
+          {% else %}
+          <p class="muted">None yet.</p>
           {% endif %}
         </div>
 
@@ -1790,7 +2128,7 @@ def owner_dashboard():
 
         <p><a href="/owner/logout">Log out</a></p>
         """,
-        pending=pending, customers=customers, feature_requests=feature_requests, csrf_token=get_csrf_token(),
+        pending=pending, customers=customers, feature_requests=feature_requests, urgent_gaps=urgent_gaps, code_proposals=code_proposals, csrf_token=get_csrf_token(),
         create_message=request.args.get("create_message"),
     )
 
@@ -1838,6 +2176,42 @@ def owner_set_feature_request_status(request_id, status):
     if not validate_csrf():
         return redirect(url_for("owner_dashboard"))
     set_feature_request_status(request_id, status)
+    return redirect(url_for("owner_dashboard"))
+
+
+@app.route("/owner/urgent-gap/<int:gap_id>/resolve", methods=["POST"])
+@require_admin
+def owner_resolve_urgent_gap(gap_id):
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard"))
+    with closing(get_db()) as conn:
+        conn.execute("UPDATE urgent_capability_gaps SET status = 'resolved' WHERE id = ?", (gap_id,))
+        conn.commit()
+    return redirect(url_for("owner_dashboard"))
+
+
+@app.route("/owner/code-proposal/<int:proposal_id>/<status>", methods=["POST"])
+@require_admin
+def owner_set_code_proposal_status(proposal_id, status):
+    """
+    status is either 'approved' or 'rejected' -- IMPORTANT: this ONLY
+    updates a status column for display/tracking on this dashboard. It
+    does not merge, apply, deploy, or execute proposed_diff anywhere,
+    under any circumstance. Actually building an approved proposal is a
+    separate, entirely manual action you take yourself (read the draft,
+    write real code, test it, commit it) -- exactly like every other
+    feature in this codebase has been built throughout this project.
+    """
+    if status not in ("approved", "rejected"):
+        return redirect(url_for("owner_dashboard"))
+    if not validate_csrf():
+        return redirect(url_for("owner_dashboard"))
+    with closing(get_db()) as conn:
+        conn.execute(
+            "UPDATE code_proposals SET status = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, proposal_id),
+        )
+        conn.commit()
     return redirect(url_for("owner_dashboard"))
 
 

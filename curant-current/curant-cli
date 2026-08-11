@@ -1836,11 +1836,23 @@ def get_all_available_tools(config):
     })
 
     # August's specialist tools — only when actively talking to August AND
-    # the customer has the addon unlocked. Any other persona, or August
-    # without the addon, can still think through a creative project; these
-    # tools are specifically what's gated, matching the "talk vs. produce"
-    # split from the persona design.
-    if config.get("persona") == "august" and "august" in config.get("unlocked_addons", []):
+    # the customer has an August-family tier unlocked. Any other persona, or
+    # August without a tier, can still think through a creative project;
+    # these tools are specifically what's gated, matching the "talk vs.
+    # produce" split from the persona design.
+    #
+    # BUG FIX (found while building Grace): this used to check literally
+    # `"august" in config.get("unlocked_addons", [])`, which was the addon
+    # key BEFORE the move to three real tiers (august_standard/pro/max)
+    # plus Grace. That literal string "august" never appears in
+    # unlocked_addons anymore for any real customer -- meaning every
+    # paying August-tier customer had zero access to generate_image,
+    # generate_image_with_text, generate_voice, generate_video, edit_media,
+    # and get_spending_summary, silently, since the tier pivot. Fixed to
+    # use get_customer_august_tier, the same tier-resolution helper the
+    # server-proxy dispatch already uses -- also correctly recognizes
+    # Grace (uncapped) as qualifying, same as every other August-family tier.
+    if config.get("persona") == "august" and get_customer_august_tier(config) is not None:
         tools.append({
             "qualified_name": "generate_image",
             "description": (
@@ -2321,14 +2333,36 @@ def decrypt_generated_file(encrypted_path):
         return fernet.decrypt(f.read())
 
 
+GENERATED_FILE_MAX_AGE_HOURS_GRACE = 72  # Grace gets 3 days instead of 1 --
+# more breathing room to notice/re-request a delivery before the local
+# copy is cleaned up, since Grace customers may be juggling more at once
+# (multi-device, uncapped generation).
+
+
+def _generated_file_max_age_hours():
+    """Grace gets a longer local-retention window than everyone else --
+    see GENERATED_FILE_MAX_AGE_HOURS_GRACE above. Reads config fresh
+    rather than taking it as a param since prune_generated_files() is
+    called opportunistically from several places that don't all already
+    have a config value in hand."""
+    try:
+        if get_customer_august_tier(load_config()) == "grace":
+            return GENERATED_FILE_MAX_AGE_HOURS_GRACE
+    except Exception:
+        pass  # never let a tier lookup failure block the prune itself
+    return GENERATED_FILE_MAX_AGE_HOURS
+
+
 def prune_generated_files():
-    """Deletes generated files older than GENERATED_FILE_MAX_AGE_HOURS.
-    Called opportunistically (on each new generation, and at the start
-    of relay()) rather than needing a separate scheduled job — cheap
-    enough that this doesn't need its own infrastructure."""
+    """Deletes generated files older than _generated_file_max_age_hours()
+    (GENERATED_FILE_MAX_AGE_HOURS for most customers, longer for Grace --
+    see GENERATED_FILE_MAX_AGE_HOURS_GRACE). Called opportunistically (on
+    each new generation, and at the start of relay()) rather than needing
+    a separate scheduled job — cheap enough that this doesn't need its
+    own infrastructure."""
     if not os.path.isdir(GENERATION_OUTPUT_DIR):
         return
-    cutoff = time.time() - (GENERATED_FILE_MAX_AGE_HOURS * 3600)
+    cutoff = time.time() - (_generated_file_max_age_hours() * 3600)
     for filename in os.listdir(GENERATION_OUTPUT_DIR):
         path = os.path.join(GENERATION_OUTPUT_DIR, filename)
         try:
@@ -2619,7 +2653,32 @@ def generate_image_ideogram_server(prompt, config):
     return _handle_server_generation_response(resp)
 
 
-def generate_voice_elevenlabs(text, config, voice_id="21m00Tcm4TlvDq8ikWAM"):
+DEFAULT_ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
+
+
+def generate_voice_elevenlabs(text, config, voice_id=None):
+    """
+    ElevenLabs is pure BYOK (the customer's own key, the customer's own
+    bill -- see check_spend_cap's docstring on why it's excluded from the
+    generation cap) regardless of tier, so a custom voice doesn't touch
+    money or business cost at all -- it's purely "does this customer get
+    to pick which voice." Grace-exclusive: everyone else always gets the
+    same fixed default voice (DEFAULT_ELEVENLABS_VOICE_ID) regardless of
+    whether they've set elevenlabs_voice_id in config, so a non-Grace
+    customer poking at config.json directly can't grant themselves this
+    for free -- the tier check happens here, not just in whatever set the
+    config value.
+
+    voice_id passed explicitly (e.g. by a future caller) always wins;
+    otherwise Grace customers get their own configured voice if they've
+    set one, everyone else gets the fixed default no matter what's in
+    their config.
+    """
+    if voice_id is None:
+        if get_customer_august_tier(config) == "grace" and config.get("elevenlabs_voice_id"):
+            voice_id = config["elevenlabs_voice_id"]
+        else:
+            voice_id = DEFAULT_ELEVENLABS_VOICE_ID
     import requests
     api_key = get_api_key(config, "elevenlabs")
     if not api_key:
@@ -3620,6 +3679,24 @@ BROWSER_SYNC_WAIT_SECONDS = 8  # most form submissions are fast (a few seconds) 
                                 # trying to answer in the same turn rather than always
                                 # going through the two-message "started... done" pattern
                                 # Veo needs, since Veo is *always* slow and forms usually aren't
+BROWSER_SYNC_WAIT_SECONDS_GRACE = 20  # Grace gets a longer same-turn window before
+                                       # falling back to the async "I'll let you know"
+                                       # handoff -- fewer form submissions need the
+                                       # two-message pattern at all for these customers.
+
+
+def _browser_sync_wait_seconds(config=None):
+    """Grace gets a longer synchronous wait before falling back to the
+    async delivery path -- see BROWSER_SYNC_WAIT_SECONDS_GRACE above.
+    Accepts an optional already-loaded config (some call sites have one
+    on hand already); loads fresh otherwise."""
+    try:
+        cfg = config if config is not None else load_config()
+        if get_customer_august_tier(cfg) == "grace":
+            return BROWSER_SYNC_WAIT_SECONDS_GRACE
+    except Exception:
+        pass
+    return BROWSER_SYNC_WAIT_SECONDS
 
 
 def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id, confirmed=False):
@@ -3666,7 +3743,7 @@ def fill_and_submit_form_hybrid(url, field_values, submit_selector, apple_id, co
         _update_background_job(job_id, "failed", error=f"Could not start: {e}")
         return f"Couldn't fill out that form: {e}"
 
-    deadline = time.time() + BROWSER_SYNC_WAIT_SECONDS
+    deadline = time.time() + _browser_sync_wait_seconds()
     while time.time() < deadline:
         time.sleep(0.5)
         job = _get_background_job(job_id)
@@ -4535,6 +4612,11 @@ def activate(license_key):
         elif error == "device_already_bound_to_another_license":
             print("This Mac is already activated with a different license key. "
                   "A Mac can only run one Curant license at a time.")
+        elif error == "device_limit_reached":
+            print("This license has already reached its device limit. If you've upgraded "
+                  "or retired one of your other Macs, run `curant-cli request-release` to free "
+                  "up a slot (a person reviews the request first), or call support directly "
+                  "at curant.app/support.")
         else:
             print("That license key isn't valid or isn't active. Check your account at curant.app/billing.")
         sys.exit(1)
@@ -4597,6 +4679,63 @@ def set_api_key(api_key, provider=None):
     config["api_keys"][provider] = api_key
     save_config(config)
     print(f"API key saved locally for {provider}. It will never be sent to Curant's server.")
+
+
+def set_persona(persona):
+    """
+    Switch which persona (tone/system prompt) Curant uses going forward.
+    Previously the ONLY way to change this locally was indirectly, via
+    the web dashboard's preferences form (see apply_synced_preferences_if_newer) --
+    there was no actual CLI command to do it, despite that function's own
+    docstring referring to "curant-cli set-persona" as if it existed. This
+    is that missing command.
+
+    No addon/tier gate here on WHICH persona can be selected -- switching
+    to "august" or "aaron" has always been unrestricted; what's actually
+    gated is the specialist TOOLS behind august specifically (see
+    get_all_available_tools), which correctly check for an unlocked
+    August-family tier (including Grace) regardless of how the persona
+    got selected. Same/instructions/memories/important-people all carry
+    over unchanged, matching set_provider's behavior.
+
+    Note: "grace" is a valid persona name here (the executive-toned
+    general-purpose persona) AND, separately, "grace" is also the name of
+    the flagship BILLING TIER (in unlocked_addons) -- these are two
+    different config fields (persona vs. unlocked_addons) and don't
+    conflict, but worth knowing they share a name on purpose (the tier
+    was named after the existing persona).
+    """
+    if persona not in PERSONAS:
+        print(f"Unknown persona '{persona}'. Available: {', '.join(PERSONAS.keys())}")
+        sys.exit(1)
+    config = load_config()
+    config["persona"] = persona
+    save_config(config)
+    print(f"Persona set to {persona}. Your instructions, memories, and important people carry over unchanged.")
+
+
+def set_voice_cmd(voice_id):
+    """
+    Grace-exclusive: sets a custom ElevenLabs voice_id (including a
+    customer's own cloned voice, if they've set one up on their own
+    ElevenLabs account) to use instead of the fixed default everyone else
+    gets. Purely a config value + a tier check at generation time (see
+    generate_voice_elevenlabs) -- no cost implication either way since
+    ElevenLabs is BYOK regardless of tier.
+    """
+    config = load_config()
+    if get_customer_august_tier(config) != "grace":
+        print("Custom voice selection is a Grace-exclusive feature. Everyone else uses "
+              "Curant's default ElevenLabs voice.")
+        sys.exit(1)
+    if voice_id is None:
+        current = config.get("elevenlabs_voice_id") or f"{DEFAULT_ELEVENLABS_VOICE_ID} (default)"
+        print(f"Current voice id: {current}")
+        return
+    config["elevenlabs_voice_id"] = voice_id
+    save_config(config)
+    print(f"Voice set to {voice_id}. This applies to your own ElevenLabs account/key -- make sure "
+          f"that voice id actually exists there (a cloned voice or one of ElevenLabs' own presets).")
 
 
 def set_provider(provider):
@@ -4922,6 +5061,84 @@ def request_release():
               "Call support if you want to speed this along or confirm it was received.")
 
 
+def propose_code_fix_for_gap(description, config):
+    """
+    Grace-exclusive. Asks the model to draft a PROPOSED implementation
+    (as plain-text pseudo-diff/description, never a real applied patch)
+    for a capability gap the customer just hit, and submits that draft
+    to the server's code_proposals review queue -- it is NEVER written
+    to disk here, never applied to this Mac's own curant-cli, never
+    executed, and never auto-merged anywhere. It only becomes real code
+    if a human (Abhy) reads it on the owner dashboard and manually
+    implements/merges it themselves -- the "approve" button on that
+    dashboard only flips a status column, it doesn't deploy anything.
+
+    This is a deliberately conservative design, chosen explicitly over a
+    fully-autonomous alternative: this codebase has hard-coded safety
+    rails elsewhere (e.g. click_page_element refusing login/payment
+    flows in code, not just by instruction) that a cleverly-worded
+    capability-gap request could otherwise try to route around if the
+    model's own draft were ever trusted to run unsupervised. Keeping a
+    human in the loop for every single proposal, no exceptions, is what
+    keeps that risk contained.
+
+    Best-effort: any failure here (LLM call, network) is caught by the
+    caller (log_capability_gap) and never blocks the customer-facing
+    reply or the local capability-gap logging, which always happens
+    regardless of whether this succeeds.
+    """
+    key = config.get("license_key")
+    if not key:
+        return
+
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        return
+
+    draft_instruction = (
+        "A Curant customer just asked for something Curant's current tools genuinely can't "
+        "do:\n\n"
+        f"\"{description}\"\n\n"
+        "Draft a PROPOSED implementation for a developer (Abhy, Curant's owner) to review -- "
+        "NOT code that will run automatically, just a clear draft for a human to read, edit, "
+        "and manually decide whether to build. Curant is a Python CLI (curant-cli) where tools "
+        "are Python functions registered in get_all_available_tools() and dispatched in "
+        "execute_tool_call() by a qualified_name/tool_name match; most generation-style tools "
+        "return a (result, error) tuple. Structure your answer as: (1) a one-paragraph summary "
+        "of what the new tool would do and why, (2) a plausible Python function signature and "
+        "docstring for it, (3) a short pseudocode/description of the implementation approach, "
+        "and (4) anything that would need a new API key, new addon/tier gate, or new server "
+        "endpoint. Keep it concise -- this is a starting point for a human developer, not a "
+        "finished PR."
+    )
+    system_prompt = build_system_prompt(config, [], [], "", extra_instruction=draft_instruction)
+
+    try:
+        draft = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Draft the proposed implementation now."}],
+            max_tokens=1200, tier="main",
+        ).strip()
+    except Exception as e:
+        print(f"[code proposal] LLM draft failed (non-fatal): {e}", file=sys.stderr)
+        return
+
+    if not draft:
+        return
+
+    try:
+        import requests
+        requests.post(
+            f"{SERVER_BASE}/v1/propose-code-fix",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            json={"gap_description": description, "proposed_diff": draft},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[code proposal] submit failed (non-fatal): {e}", file=sys.stderr)
+
+
 QUOTE_PHONE_NUMBER = "REPLACE_WITH_REAL_PHONE_NUMBER"  # the actual business line to call for
                                                           # custom development quotes — fill in
                                                           # once there's a real number to give out
@@ -4977,22 +5194,65 @@ def log_capability_gap(description):
     print(f"[capability gap] \"{description}\" -- logged"
           + (f", spreadsheet updated at {xlsx_path}" if xlsx_path else ""), file=sys.stderr)
 
+    config = load_config()
+    is_grace = get_customer_august_tier(config) == "grace"
+
+    # Grace-exclusive: skip the "call for a custom quote" wall entirely --
+    # the gap gets flagged directly on Abhy's owner dashboard, urgent,
+    # best-effort (a failure here never blocks the local log/xlsx/text
+    # path below, which always happens regardless of tier).
+    forwarded_to_owner_directly = False
+    if is_grace:
+        try:
+            import requests
+            key = config.get("license_key")
+            if key:
+                resp = requests.post(
+                    f"{SERVER_BASE}/v1/urgent-capability-gap",
+                    headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+                    json={"description": description},
+                    timeout=15,
+                )
+                forwarded_to_owner_directly = resp.status_code == 200 and resp.json().get("ok")
+        except Exception as e:
+            print(f"[urgent capability gap] forward failed (non-fatal, falling back to normal "
+                  f"logging): {e}", file=sys.stderr)
+
+        # Also draft a proposed code fix and submit it for the owner's
+        # manual review -- this NEVER applies, merges, or executes
+        # anything on its own. See draft_code_proposal_for_gap's
+        # docstring for the full safety reasoning; this is strictly
+        # "write a draft, hand it to a human" -- the actual approve
+        # action on the server dashboard only changes a status column,
+        # it does not deploy code either.
+        try:
+            propose_code_fix_for_gap(description, config)
+        except Exception as e:
+            print(f"[code proposal] drafting failed (non-fatal): {e}", file=sys.stderr)
+
     try:
-        config = load_config()
         owner = config.get("customer_apple_id")
         if owner:
             send_imessage(
                 owner,
                 f"(Capability gap logged) Just hit something I can't do yet: \"{description}\". "
                 f"Full list is at {CAPABILITY_GAPS_XLSX_PATH} on this Mac (kept in sync automatically) "
-                f"— let me know if you want to prioritize building it, or if it's worth a custom quote "
-                f"(call {QUOTE_PHONE_NUMBER})."
+                + (
+                    "— flagged directly to Abhy as a priority build request, no need to call anyone."
+                    if forwarded_to_owner_directly else
+                    f"— let me know if you want to prioritize building it, or if it's worth a custom "
+                    f"quote (call {QUOTE_PHONE_NUMBER})."
+                )
             )
         else:
             print("[capability gap] no customer_apple_id configured -- couldn't text a notice, "
                   "but it's saved in feature_requests and the .xlsx above.", file=sys.stderr)
     except Exception as e:
         print(f"[capability-gap notice] failed to send (non-fatal): {e}", file=sys.stderr)
+
+    if forwarded_to_owner_directly:
+        return ("Logged and flagged directly to Abhy as a priority build request — "
+                "no need to call anyone.")
     return (f"Logged. For custom work like this, they'd need to call {QUOTE_PHONE_NUMBER} "
             f"for a quote — Curant doesn't build one-off custom features for free.")
 
@@ -5789,6 +6049,99 @@ def proactive_check(context):
         }))
     else:
         print(json.dumps({"should_send": False}))
+
+
+def daily_briefing(context):
+    """
+    Grace-exclusive executive daily briefing -- deliberately a different
+    behavior from proactive_check above, not a duplicate of it.
+    proactive_check asks the model to DECIDE whether anything warrants a
+    heads-up, and is conservative on purpose ("most days should conclude
+    nothing is worth sending"). This instead ALWAYS produces a real
+    structured morning digest (today's agenda + open reminders) when
+    there's anything to report, every morning, without needing something
+    to feel "urgent" first -- that's the actual point of an executive
+    assistant's daily briefing, and it's Grace-only specifically because
+    it's a materially different (more proactive, more frequent) kind of
+    outreach than what every other tier gets.
+
+    Same fail-closed contract as proactive_check: any error, missing
+    license, wrong tier, or no API key just results in should_send=false,
+    never a broken/partial message.
+    """
+    config = load_config()
+    key = config.get("license_key")
+    if not key:
+        print(json.dumps({"should_send": False, "error": "not_activated"}))
+        return
+
+    config, active = refresh_status_if_stale(config)
+    if not active:
+        print(json.dumps({"should_send": False, "error": "inactive_or_invalid_license"}))
+        return
+
+    if get_customer_august_tier(config) != "grace":
+        # Silent, not an error -- this lets the same scheduled job run on
+        # every Mac regardless of tier, same pattern as proactive-check's
+        # own plist comment ("harmless even for customers who haven't
+        # turned proactivity on").
+        print(json.dumps({"should_send": False}))
+        return
+
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        print(json.dumps({"should_send": False, "error": "no_api_key_set"}))
+        return
+
+    if not context:
+        # Nothing to summarize -- an empty briefing isn't useful, don't send one.
+        print(json.dumps({"should_send": False}))
+        return
+
+    memories = get_memories()
+    people = get_important_people()
+    extra = (
+        "Write today's executive daily briefing -- a concise, well-organized morning "
+        "digest of the day ahead, based on the live calendar/reminders context below. "
+        "Unlike a normal proactive check-in, you are NOT deciding whether this is worth "
+        "sending -- always produce a real briefing as long as there's something in the "
+        "context to summarize. Keep it tight and scannable: today's agenda first, then "
+        "anything open/overdue worth flagging. No filler, no 'let me know if you need "
+        "anything else' -- just the briefing itself.\n\n"
+        f"Today's live context:\n{context}\n\n"
+        'Respond with ONLY a JSON object: {"message": "..."}.'
+    )
+    system_prompt = build_system_prompt(config, memories, people, "", extra_instruction=extra)
+
+    try:
+        raw = call_llm(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": "Write this morning's executive briefing."}],
+            max_tokens=600, tier="main",
+        ).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        message = (result.get("message") or "").strip()
+    except Exception as e:
+        print(f"Daily briefing failed (non-fatal, not sending): {e}", file=sys.stderr)
+        print(json.dumps({"should_send": False}))
+        return
+
+    if not message:
+        print(json.dumps({"should_send": False}))
+        return
+
+    save_message("assistant", message)
+    print(json.dumps({
+        "should_send": True,
+        "message": message,
+        "reply_format": config.get("reply_format", "text"),
+        "voice_tier": config.get("voice_tier", "standard"),
+    }))
 
 
 # --- Local backup (encrypted with a customer-chosen passphrase; entirely local, no server involvement) ---
@@ -7012,6 +7365,12 @@ def main():
     p_key.add_argument("api_key")
     p_key.add_argument("--provider", default=None, choices=sorted(PROVIDER_MODELS) + sorted(GENERATION_SERVICES), help="Which provider or specialist service this key is for (default: your currently configured LLM provider)")
 
+    p_persona = sub.add_parser("set-persona", help="Switch which persona (tone/system prompt) Curant uses — same instructions/memories carry over")
+    p_persona.add_argument("persona", choices=list(PERSONAS.keys()), help="Persona name, e.g. curant, grace, dean, august, aaron")
+
+    p_voice = sub.add_parser("set-voice", help="Grace-exclusive: set a custom ElevenLabs voice id (e.g. your own cloned voice) instead of the default")
+    p_voice.add_argument("voice_id", nargs="?", default=None, help="ElevenLabs voice id. Omit to view the current setting.")
+
     p_provider = sub.add_parser("set-provider", help="Switch which model provider handles messages — same persona/memories carry over")
     p_provider.add_argument("provider", choices=sorted(PROVIDER_MODELS))
 
@@ -7136,6 +7495,10 @@ def main():
         activate(args.license_key)
     elif args.command == "set-api-key":
         set_api_key(args.api_key, provider=args.provider)
+    elif args.command == "set-persona":
+        set_persona(args.persona)
+    elif args.command == "set-voice":
+        set_voice_cmd(args.voice_id)
     elif args.command == "set-provider":
         set_provider(args.provider)
     elif args.command == "status":
@@ -7196,6 +7559,8 @@ def main():
         mark_job_delivered_cmd(args.job_id)
     elif args.command == "proactive-check":
         proactive_check(args.context)
+    elif args.command == "daily-briefing":
+        daily_briefing(args.context)
     elif args.command == "backup-now":
         backup_now(args.path)
     elif args.command == "backup-restore":

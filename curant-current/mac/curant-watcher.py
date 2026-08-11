@@ -646,6 +646,46 @@ def run_proactive_check():
         send_text_reply(CUSTOMER_APPLE_ID, message_text)
 
 
+def run_daily_briefing():
+    """
+    Grace-exclusive executive daily briefing -- scheduled separately from
+    run_proactive_check above (see com.curant.dailybriefing.plist), and
+    deliberately NOT the same job: proactive-check conservatively DECIDES
+    whether anything warrants a heads-up; daily-briefing always sends a
+    real digest when there's something to summarize. curant-cli's
+    daily_briefing() does the actual Grace-tier gating -- this function
+    runs unconditionally on every Mac's schedule (harmless no-op for
+    non-Grace customers, same "safe to always run" pattern as
+    run_proactive_check).
+    """
+    live_context = get_calendar_and_reminders_context()
+    result = subprocess.run(
+        ["curant-cli", "daily-briefing", "--context", live_context],
+        capture_output=True, text=True,
+    )
+    try:
+        decision = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        print(f"Unexpected daily-briefing output (length {len(result.stdout)})", file=sys.stderr)
+        return
+
+    if not decision.get("should_send"):
+        return
+
+    message_text = decision.get("message", "")
+    if not message_text:
+        return
+
+    if decision.get("reply_format") == "voice":
+        try:
+            audio_path = text_to_speech(message_text, decision.get("voice_tier", "standard"))
+            send_voice_reply(CUSTOMER_APPLE_ID, audio_path)
+        except Exception:
+            report_watcher_error("tts_failed")
+    else:
+        send_text_reply(CUSTOMER_APPLE_ID, message_text)
+
+
 _contact_name_cache = {}  # handle -> resolved name (or None), looked up once per handle per run
 
 
@@ -1020,5 +1060,9 @@ if __name__ == "__main__":
         # Invoked once by com.curant.proactive.plist on a schedule — runs
         # and exits, rather than looping like the main polling watcher.
         run_proactive_check()
+    elif "--daily-briefing" in sys.argv:
+        # Invoked once by com.curant.dailybriefing.plist on a schedule —
+        # same run-and-exit pattern as --proactive-check above.
+        run_daily_briefing()
     else:
         main()
