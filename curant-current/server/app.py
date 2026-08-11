@@ -528,8 +528,16 @@ def bind_device(license_key, device_id):
 # rather than silently failing the whole checkout, but gets flagged in
 # the server log so it doesn't go unnoticed.
 PRICE_PLAN_MAP = {
-    # "price_XXXXXXXXXXXXXX": {"plan": "base", "addons": []},
-    # "price_YYYYYYYYYYYYYY": {"plan": "pro", "addons": ["august"]},
+    # Real August tier prices, created live in Stripe on 2026-08-11
+    # (product+price created together via the Stripe API -- see each
+    # price's product_data.name in the dashboard for "August Standard"/
+    # "August Pro"/"August Max"). Each is a $/mo recurring subscription
+    # price; the addon key here must exactly match AUGUST_TIER_CONFIG's
+    # keys above, since that's what actually enforces the monthly
+    # covered-generation cap once a customer's unlocked_addons includes it.
+    "price_1U38kJDXZA7eiWhwjo73xuj0": {"plan": "base", "addons": ["august_standard"]},  # $4.99/mo
+    "price_1U38kMDXZA7eiWhwoVZD2YRX": {"plan": "base", "addons": ["august_pro"]},       # $10.99/mo
+    "price_1U38kQDXZA7eiWhwGqbpU8ay": {"plan": "base", "addons": ["august_max"]},       # $20.99/mo
 }
 
 
