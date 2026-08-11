@@ -648,15 +648,16 @@ def run_proactive_check():
 
 def run_daily_briefing():
     """
-    Grace-exclusive executive daily briefing -- scheduled separately from
-    run_proactive_check above (see com.curant.dailybriefing.plist), and
+    Executive daily briefing, on by default for every customer --
+    scheduled separately from run_proactive_check above (see
+    com.curant.dailybriefing.plist, twice a day: 9am and 5pm), and
     deliberately NOT the same job: proactive-check conservatively DECIDES
     whether anything warrants a heads-up; daily-briefing always sends a
     real digest when there's something to summarize. curant-cli's
-    daily_briefing() does the actual Grace-tier gating -- this function
-    runs unconditionally on every Mac's schedule (harmless no-op for
-    non-Grace customers, same "safe to always run" pattern as
-    run_proactive_check).
+    daily_briefing() checks config["daily_briefing_enabled"] (default
+    True) -- this function runs unconditionally on every Mac's schedule,
+    same "safe to always run, gating happens inside curant-cli" pattern
+    as run_proactive_check.
     """
     live_context = get_calendar_and_reminders_context()
     result = subprocess.run(

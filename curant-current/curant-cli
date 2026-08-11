@@ -4738,6 +4738,25 @@ def set_voice_cmd(voice_id):
           f"that voice id actually exists there (a cloned voice or one of ElevenLabs' own presets).")
 
 
+def set_daily_briefing_cmd(enabled_str):
+    """
+    Toggle the twice-daily executive briefing (on by default for every
+    customer -- see daily_briefing's docstring). Accepts 'on'/'off' (or
+    omit to just view the current setting).
+    """
+    config = load_config()
+    if enabled_str is None:
+        current = config.get("daily_briefing_enabled", True)
+        print(f"Daily briefing is currently {'on' if current else 'off'} (runs 9am and 5pm).")
+        return
+    if enabled_str.lower() not in ("on", "off"):
+        print("Usage: curant-cli set-daily-briefing <on|off>")
+        sys.exit(1)
+    config["daily_briefing_enabled"] = enabled_str.lower() == "on"
+    save_config(config)
+    print(f"Daily briefing turned {enabled_str.lower()}.")
+
+
 def set_provider(provider):
     """Switch which model provider handles messages going forward. Same
     persona/instructions/memories/important-people drive it either way —
@@ -6053,21 +6072,25 @@ def proactive_check(context):
 
 def daily_briefing(context):
     """
-    Grace-exclusive executive daily briefing -- deliberately a different
-    behavior from proactive_check above, not a duplicate of it.
-    proactive_check asks the model to DECIDE whether anything warrants a
-    heads-up, and is conservative on purpose ("most days should conclude
-    nothing is worth sending"). This instead ALWAYS produces a real
-    structured morning digest (today's agenda + open reminders) when
-    there's anything to report, every morning, without needing something
-    to feel "urgent" first -- that's the actual point of an executive
-    assistant's daily briefing, and it's Grace-only specifically because
-    it's a materially different (more proactive, more frequent) kind of
-    outreach than what every other tier gets.
+    Executive daily briefing for every customer, on by default -- runs
+    twice a day (9am and 5pm, see com.curant.dailybriefing.plist),
+    deliberately a different behavior from proactive_check above, not a
+    duplicate of it. proactive_check asks the model to DECIDE whether
+    anything warrants a heads-up, and is conservative on purpose ("most
+    days should conclude nothing is worth sending"). This instead ALWAYS
+    produces a real structured digest (today's agenda + open reminders)
+    when there's anything to report, on a fixed schedule, without
+    needing something to feel "urgent" first.
+
+    Originally built Grace-exclusive; opened up to every customer by
+    default per the owner's direction. config["daily_briefing_enabled"]
+    (default True) is the one opt-out lever -- a customer who doesn't
+    want it can turn it off locally; there's no server-side tier check
+    left gating this anymore.
 
     Same fail-closed contract as proactive_check: any error, missing
-    license, wrong tier, or no API key just results in should_send=false,
-    never a broken/partial message.
+    license, or no API key just results in should_send=false, never a
+    broken/partial message.
     """
     config = load_config()
     key = config.get("license_key")
@@ -6080,11 +6103,7 @@ def daily_briefing(context):
         print(json.dumps({"should_send": False, "error": "inactive_or_invalid_license"}))
         return
 
-    if get_customer_august_tier(config) != "grace":
-        # Silent, not an error -- this lets the same scheduled job run on
-        # every Mac regardless of tier, same pattern as proactive-check's
-        # own plist comment ("harmless even for customers who haven't
-        # turned proactivity on").
+    if not config.get("daily_briefing_enabled", True):
         print(json.dumps({"should_send": False}))
         return
 
@@ -7371,6 +7390,9 @@ def main():
     p_voice = sub.add_parser("set-voice", help="Grace-exclusive: set a custom ElevenLabs voice id (e.g. your own cloned voice) instead of the default")
     p_voice.add_argument("voice_id", nargs="?", default=None, help="ElevenLabs voice id. Omit to view the current setting.")
 
+    p_briefing_toggle = sub.add_parser("set-daily-briefing", help="Turn the twice-daily executive briefing on or off (on by default)")
+    p_briefing_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
+
     p_provider = sub.add_parser("set-provider", help="Switch which model provider handles messages — same persona/memories carry over")
     p_provider.add_argument("provider", choices=sorted(PROVIDER_MODELS))
 
@@ -7499,6 +7521,8 @@ def main():
         set_persona(args.persona)
     elif args.command == "set-voice":
         set_voice_cmd(args.voice_id)
+    elif args.command == "set-daily-briefing":
+        set_daily_briefing_cmd(args.enabled)
     elif args.command == "set-provider":
         set_provider(args.provider)
     elif args.command == "status":

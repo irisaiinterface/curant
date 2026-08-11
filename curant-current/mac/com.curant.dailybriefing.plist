@@ -12,17 +12,27 @@
         <string>--daily-briefing</string>
     </array>
 
-    <!-- Runs once a day at 7:00am, ahead of com.curant.proactive.plist's
-         8:00am slot -- these are two separate, deliberately different
-         jobs (see run_daily_briefing's docstring in curant-watcher.py for
-         why this isn't just a duplicate of the proactive-check job). -->
+    <!-- Runs twice a day, 9:00am and 5:00pm, for every customer by
+         default (see daily_briefing()'s docstring in curant-cli --
+         originally Grace-exclusive at a single 7am slot, opened up to
+         everyone and moved to this cadence per the owner's direction).
+         StartCalendarInterval accepts an array for multiple fire times
+         -- this is one job that runs twice daily, not two separate jobs. -->
     <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>7</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>17</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
 
     <key>RunAtLoad</key>
     <false/>
@@ -39,14 +49,15 @@ Install with:
   cp com.curant.dailybriefing.plist ~/Library/LaunchAgents/
   launchctl load ~/Library/LaunchAgents/com.curant.dailybriefing.plist
 
-This is Grace-exclusive, gated in curant-cli's daily_briefing() function
-(checks get_customer_august_tier(config) == "grace") -- loading this job
-on a non-Grace customer's Mac is harmless, it just always results in
-should_send=false, same "safe to always run" pattern as
-com.curant.proactive.plist.
+On by default for every customer (config["daily_briefing_enabled"]
+defaults to True in curant-cli's daily_briefing() -- a customer can turn
+it off with `curant-cli set-daily-briefing off`). This should be
+installed as part of standard setup going forward, same as
+com.curant.proactive.plist and com.curant.watcher.plist.
 
-To test immediately rather than waiting for 7am, run curant-watcher.py
-with the --daily-briefing flag directly (see ProgramArguments above).
+To test immediately rather than waiting for 9am/5pm, run
+curant-watcher.py with the --daily-briefing flag directly (see
+ProgramArguments above).
 
 Logs land at /tmp/curant-dailybriefing.log and /tmp/curant-dailybriefing-error.log.
 -->
