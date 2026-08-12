@@ -366,11 +366,22 @@ ADDON_CATALOG = {
         "stripe_payment_link": None,
     },
     "grace": {
-        "label": "Grace (flagship)",
-        "description": "The most advanced tier of Curant, with everything included: August's "
-                        "full creative generation suite (images and video) with NO monthly cap "
-                        "on covered generation, browser automation, and priority handling on "
-                        "feature requests. Price TBD.",
+        "label": "Grace ($50.99/mo, flagship)",
+        "description": "The most advanced tier of Curant, and a genuinely different tier, not "
+                        "just August Max plus extras. Everything in August Max (full creative "
+                        "generation suite, images and video) with NO monthly cap on covered "
+                        "generation, plus: browser automation, every persona unlocked, a custom "
+                        "cloned voice, multi-device support, no cap on standing instructions "
+                        "length, priority handling with capability gaps skipping the custom-quote "
+                        "wall and going straight to a human-reviewed code proposal, weekly "
+                        "executive rollups with a stalled-items digest, meeting-prep briefs, "
+                        "VIP contact escalation, delegate access (a second person can use the "
+                        "same install), bounded auto-reply for specific approved contacts, a "
+                        "second-opinion review pass on high-stakes replies, full encrypted data "
+                        "export, automatic weekly backups, and email-aware order-status lookups. "
+                        "It also just talks differently -- cut of the usual AI-assistant tells, "
+                        "permission to disagree or say it doesn't know something, and a "
+                        "relationship-aware tone that adjusts to how you actually communicate.",
         "stripe_payment_link": None,
     },
 }
