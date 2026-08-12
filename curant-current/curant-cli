@@ -6737,6 +6737,131 @@ def _get_second_opinion(message_text, draft_reply, config, provider, api_key):
         return None
 
 
+# ── Personalization phase ────────────────────────────────────────────────────
+# A short, scripted onboarding Q&A that kicks in when the customer
+# explicitly asks Curant to get to know them. Deliberately NOT an LLM
+# call at any point -- trigger detection is a plain keyword/regex match,
+# questions are canned text, and every answer is saved straight into
+# the local `memories` table via save_memory(), exactly the same as
+# anything else Curant learns in normal conversation (so it's
+# immediately visible in memories.md and immediately part of future
+# system prompts -- see the memories.md feature). Session progress
+# lives in config.json under "personalization", the same place
+# quiet_hours/travel_mode/etc. already live -- a single small
+# in-progress-or-not blob, not something that needs its own table.
+
+PERSONALIZATION_TRIGGER_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"\blearn (more )?about me\b",
+        r"\bget to know me\b",
+        r"\bknow (more )?about me\b",
+        r"\blearn who i am\b",
+        r"\bknow who i am\b",
+        r"\bget to know who i am\b",
+        r"\bpersonalize (yourself|you|this|curant)\b",
+        r"\bpersonalization\b",
+    ]
+]
+
+# Ordered on purpose: name first (so later questions/replies can eventually
+# use it), then the lower-stakes factual ones, ending on the open-ended one
+# that benefits from whatever rapport the earlier answers built.
+PERSONALIZATION_QUESTIONS = [
+    {
+        "question": "I'd love to get to know you better. First — what should I call you?",
+        "memory_template": "Prefers to be called {answer}.",
+    },
+    {
+        "question": "How old are you (or whatever you're comfortable sharing — a decade works fine too)?",
+        "memory_template": "Age / life stage: {answer}.",
+    },
+    {
+        "question": "What do you do for work?",
+        "memory_template": "Occupation: {answer}.",
+    },
+    {
+        "question": "Where are you based — city and/or timezone helps most?",
+        "memory_template": "Based in: {answer}.",
+    },
+    {
+        "question": "Last one — anything about your day-to-day worth knowing? Family, hobbies, what "
+                     "a typical week looks like, anything like that.",
+        "memory_template": "{answer}",
+    },
+]
+
+_PERSONALIZATION_SKIP_WORDS = {
+    "skip", "pass", "n/a", "na", "no", "nah", "prefer not to say",
+    "rather not say", "rather not", "next", "none",
+}
+
+_PERSONALIZATION_CANCEL_PATTERN = re.compile(
+    r"\b(stop|cancel|nevermind|never mind|quit)\b", re.IGNORECASE
+)
+
+
+def _is_personalization_trigger(message_text):
+    if not message_text:
+        return False
+    return any(p.search(message_text) for p in PERSONALIZATION_TRIGGER_PATTERNS)
+
+
+def _is_personalization_skip(answer_text):
+    return (answer_text or "").strip().lower().rstrip(".!") in _PERSONALIZATION_SKIP_WORDS
+
+
+def start_personalization_session(config):
+    """
+    Begins the scripted Q&A and persists progress into config.json so it
+    survives across relay() calls -- each incoming text is its own
+    process, so state has to live on disk, not in memory. Returns the
+    first question to send back as the reply.
+    """
+    config["personalization"] = {"active": True, "question_index": 0}
+    save_config(config)
+    return PERSONALIZATION_QUESTIONS[0]["question"]
+
+
+def continue_personalization_session(config, message_text):
+    """
+    Called when a personalization session is already active and a new
+    message just arrived -- treats it as the answer to the current
+    question (unless it looks like a skip or a cancel), saves it as a
+    real memory, and either asks the next question or wraps up.
+    Returns the reply text to send back.
+    """
+    state = config.get("personalization") or {}
+    idx = state.get("question_index", 0)
+
+    if _PERSONALIZATION_CANCEL_PATTERN.search(message_text or ""):
+        config["personalization"] = {"active": False, "question_index": 0}
+        save_config(config)
+        return "No problem — we can pick this back up anytime, just say \"learn about me\"."
+
+    if idx >= len(PERSONALIZATION_QUESTIONS):
+        # Shouldn't normally happen (the session should already have ended),
+        # but fail safe instead of indexing out of range.
+        config["personalization"] = {"active": False, "question_index": 0}
+        save_config(config)
+        return "All set — thanks for sharing that."
+
+    if not _is_personalization_skip(message_text):
+        template = PERSONALIZATION_QUESTIONS[idx]["memory_template"]
+        save_memory(template.format(answer=message_text.strip()))
+
+    next_idx = idx + 1
+    if next_idx >= len(PERSONALIZATION_QUESTIONS):
+        config["personalization"] = {"active": False, "question_index": 0}
+        save_config(config)
+        return ("That's everything — thanks for sharing. I'll keep this in mind going forward. "
+                "You can see everything I've saved anytime with `curant-cli memories`, or just "
+                "tell me more whenever something comes to mind.")
+
+    config["personalization"] = {"active": True, "question_index": next_idx}
+    save_config(config)
+    return PERSONALIZATION_QUESTIONS[next_idx]["question"]
+
+
 def relay(message_text, context="", image_path=None, apple_id=None, tier="main", voice_mode=False):
     """
     Handle an incoming message entirely locally: verify entitlement (using
@@ -6798,6 +6923,38 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
         report_error("inactive_or_invalid_license", "curant-cli")
         print(json.dumps({"reply": None, "error": "inactive_or_invalid_license"}))
         sys.exit(1)
+
+    # Personalization phase -- checked before the triviality short-circuit
+    # below, since "learn about me" would otherwise get handed to the tiny
+    # local model as if it were ordinary small talk, with no session/memory
+    # logic at all. Skipped entirely in voice_mode -- a live caller getting
+    # walked through five sequential questions read aloud one at a time
+    # isn't a good phone experience; personalization is a text-only flow.
+    # See start_personalization_session / continue_personalization_session.
+    if not voice_mode:
+        personalization_state = config.get("personalization") or {}
+        if personalization_state.get("active"):
+            reply_text = continue_personalization_session(config, message_text)
+            save_message("user", message_text, urgency="normal")
+            save_message("assistant", reply_text, provider="local")
+            print(json.dumps({
+                "reply": reply_text,
+                "reply_format": config.get("reply_format", "text"),
+                "voice_tier": config.get("voice_tier", "standard"),
+                "attachment_path": None,
+            }))
+            return
+        elif not image_path and _is_personalization_trigger(message_text):
+            reply_text = start_personalization_session(config)
+            save_message("user", message_text, urgency="normal")
+            save_message("assistant", reply_text, provider="local")
+            print(json.dumps({
+                "reply": reply_text,
+                "reply_format": config.get("reply_format", "text"),
+                "voice_tier": config.get("voice_tier", "standard"),
+                "attachment_path": None,
+            }))
+            return
 
     # Local front-door layer, step 1: triviality short-circuit. Only
     # attempted for plain text (an image always deserves real reasoning

@@ -651,6 +651,26 @@ Editing is a plain diff against what's already stored (by exact
 content), so touching one line doesn't disturb any other memory's
 age/timestamp.
 
+## Personalization phase — a scripted "get to know me" Q&A
+
+Texting Curant something like *"learn about me"*, *"get to know me"*, or
+*"personalize yourself to me"* starts a short, five-question local Q&A
+(name, age/life stage, occupation, location, and an open-ended
+day-to-day question) — one question per reply, answered over as many
+texts as it takes. Each answer is saved straight into `memories` (and
+so immediately shows up in `memories.md`, see above) the moment it
+comes in, not batched at the end. Say "skip"/"pass"/"n/a" to leave any
+one question out, or "stop"/"cancel" to abort the whole thing — either
+way nothing already answered is lost. Deliberately not an LLM call at
+any point (trigger detection is a keyword/regex match, the questions
+are fixed text) — same reasoning as the triviality short-circuit:
+scripted and instant beats a network round trip for something this
+simple, and it means the flow works even if the model/API key isn't
+configured yet. See `PERSONALIZATION_QUESTIONS` /
+`continue_personalization_session` in `curant-cli`. Text-only — skipped
+during FaceTime calls, since five sequential questions read aloud one
+at a time isn't a good live-call experience.
+
 ## Onboarding, capability discovery, and urgency handling
 
 **Onboarding:** `relay()` detects when a message is the very first one a
