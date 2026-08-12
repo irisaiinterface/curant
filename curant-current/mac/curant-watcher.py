@@ -156,6 +156,50 @@ def _read_auto_reply_handles():
 
 AUTO_REPLY_HANDLES = _read_auto_reply_handles()
 
+
+def _read_self_message_mode():
+    """
+    Dev/testing convenience, NOT a real production scenario -- explained
+    in full below since it's easy to misread as a security hole otherwise.
+
+    In real production use, the Mac running curant-watcher.py is a
+    dedicated business machine with its own Apple ID, and actual
+    customers text it from their OWN separate phone/Apple ID -- that's
+    the whole reason is_from_me=0 plus a handle allowlist works as the
+    "is this really the customer" check throughout this file.
+
+    But testing Curant on your OWN personal Mac, signed into your OWN
+    personal Apple ID, breaks that assumption: iMessage syncs your own
+    sent messages across every device on the same Apple ID, so anything
+    you send from your phone shows up in THIS Mac's own chat.db as
+    is_from_me=1 (outgoing), never is_from_me=0 (incoming) -- there is
+    no way to generate a "real" incoming message from yourself to
+    yourself under one shared identity. Confirmed live: every message
+    sent this way showed is_from_me=1 in chat.db, exactly as expected.
+
+    When explicitly enabled (self_message_mode=true in config, opt-in,
+    default off), fetch_new_messages additionally treats messages YOU
+    send (is_from_me=1) addressed specifically to CUSTOMER_APPLE_ID
+    (e.g. a second address linked to your own Apple ID, used purely as
+    a "text this to talk to Curant" thread) as if they were a real
+    incoming customer message. This never widens who Curant will listen
+    to beyond your own already-configured identity -- it only changes
+    which DIRECTION of message counts, and only for the one specific
+    address already trusted as CUSTOMER_APPLE_ID.
+    """
+    cfg = {}
+    _cfg_path = os.path.expanduser("~/.curant/config.json")
+    if os.path.exists(_cfg_path):
+        try:
+            with open(_cfg_path) as _f:
+                cfg = json.load(_f)
+        except Exception:
+            cfg = {}
+    return bool(cfg.get("self_message_mode", False))
+
+
+SELF_MESSAGE_MODE = _read_self_message_mode()
+
 # Access mode: 'approved' (default, secure) answers only CUSTOMER_HANDLES;
 # 'open' answers ANY incoming text or iMessage, no allowlist at all. Set
 # WITHOUT editing this file, same pattern as the handles above:
@@ -232,12 +276,22 @@ def fetch_new_messages(since_rowid):
     chat.db schema varies slightly by macOS version — this targets the
     common structure; verify column names against your OS version with
     `sqlite3 ~/Library/Messages/chat.db ".schema message"` if this breaks.
+
+    SELF_MESSAGE_MODE (see _read_self_message_mode's docstring) adds one
+    narrow exception to the normal is_from_me=0 requirement: a message
+    YOU send (is_from_me=1) addressed to CUSTOMER_APPLE_ID specifically
+    also counts. In Apple's chat.db schema, handle.id (via
+    message.handle_id) identifies "the other party in a 1-on-1
+    conversation" regardless of direction -- for an outgoing message
+    that's the recipient, which is exactly what lets this check "was
+    this sent TO my own designated Curant thread" without any extra
+    joins through the chat/chat_handle_join tables.
     """
     if ACCESS_MODE != "open" and not CUSTOMER_HANDLES and not VIP_HANDLES and not DELEGATE_HANDLES and not AUTO_REPLY_HANDLES:
         return []  # no customer identity, no VIP contacts, no delegates either — nothing to match
     conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    base_query = """
+    base_select = """
         SELECT message.ROWID as rowid,
                message.text as text,
                message.is_from_me as is_from_me,
@@ -246,13 +300,22 @@ def fetch_new_messages(since_rowid):
         FROM message
         JOIN handle ON message.handle_id = handle.ROWID
         WHERE message.ROWID > ?
-          AND message.is_from_me = 0
     """
+    self_msg_clause = ""
+    self_msg_params = []
+    if SELF_MESSAGE_MODE and CUSTOMER_APPLE_ID:
+        self_msg_clause = " OR (message.is_from_me = 1 AND handle.id = ?)"
+        self_msg_params = [CUSTOMER_APPLE_ID]
+
     if ACCESS_MODE == "open":
         # No allowlist at all — answers whoever texts in. Loudly flagged at
         # startup in main(); this is the one place that filter is actually
         # skipped.
-        cur = conn.execute(base_query + " ORDER BY message.ROWID ASC", (since_rowid,))
+        direction_clause = f"(message.is_from_me = 0{self_msg_clause})"
+        cur = conn.execute(
+            base_select + f" AND {direction_clause} ORDER BY message.ROWID ASC",
+            (since_rowid, *self_msg_params),
+        )
     else:
         # Allowlist is the customer's own handles PLUS any Grace-exclusive
         # VIP handles (VIP_HANDLES, read once at startup -- see
@@ -266,9 +329,10 @@ def fetch_new_messages(since_rowid):
         allowed_handles = CUSTOMER_HANDLES + [h for h in widened if h not in CUSTOMER_HANDLES]
         # placeholders is our own controlled "?,?" string — values stay parameterized.
         placeholders = ",".join("?" for _ in allowed_handles)
+        direction_clause = f"(message.is_from_me = 0 AND handle.id IN ({placeholders})){self_msg_clause}"
         cur = conn.execute(
-            base_query + f" AND handle.id IN ({placeholders}) ORDER BY message.ROWID ASC",
-            (since_rowid, *allowed_handles),
+            base_select + f" AND {direction_clause} ORDER BY message.ROWID ASC",
+            (since_rowid, *allowed_handles, *self_msg_params),
         )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
