@@ -4733,24 +4733,44 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
 
 def _sanitize_schema_for_gemini(schema):
     """
-    Recursively strips vendor-extension keys (anything starting with 'x-')
-    from a JSON Schema before handing it to Gemini's FunctionDeclaration.
+    Recursively reshapes a JSON Schema into the narrower dialect Gemini's
+    genai_types.FunctionDeclaration accepts, before handing it over. Gemini's
+    Schema type is proto-backed and validated client-side by strict pydantic
+    models -- unlike Anthropic/OpenAI, which pass schema dicts through as
+    opaque JSON, ANY shape Gemini doesn't recognize crashes the ENTIRE reply
+    (not just calls to that one tool), for every tool in the list, as soon as
+    one misbehaving MCP server's tools are included. Three real, confirmed
+    incompatibilities handled here:
 
-    Real bug this fixes: some MCP servers embed non-standard keys like
-    'x-mcp-header' on a property to mark it as an HTTP header rather than
-    part of the request body -- a real, legitimate MCP convention, but
-    Gemini's genai_types.FunctionDeclaration validates parameters with
-    strict pydantic models that reject any key they don't recognize,
-    raising a validation error that killed EVERY reply (not just calls
-    to that one tool) as soon as that server's tools were in the list --
-    confirmed live against a real customer's connected 'github' MCP
-    server. Standard JSON Schema keywords are untouched; this only
-    drops the vendor-extension ones Gemini can't parse. Recurses into
-    nested "properties", "items", and "definitions"/"$defs" since a
-    stray x- key could show up at any level, not just the top.
+    1. Vendor-extension keys (anything starting with 'x-'), e.g. the
+       'x-mcp-header' key some MCP servers use to mark a param as an HTTP
+       header rather than a body field -- a legitimate MCP convention, but
+       an unrecognized key to Gemini. (confirmed live: github MCP server)
+    2. `enum` lists containing non-string values (e.g. actual booleans
+       [true, false] instead of type: boolean) -- Gemini's enum field is
+       string-only regardless of the declared `type`. Coerced to strings.
+    3. `type` declared as a list (JSON Schema union types, e.g.
+       ["string", "number", "boolean"]) -- Gemini's `type` is a single
+       enum value, not a union. Reduced to the first non-"null" entry;
+       "null" in the union is translated to Gemini's own `nullable: true`
+       flag instead of being dropped silently.
+       (2 and 3 confirmed live: a Jira/issue-tracker-style MCP server)
+
+    Standard JSON Schema keywords are otherwise left untouched. Recurses
+    into nested "properties", "items", and "definitions"/"$defs" since any
+    of these three issues can show up at any level, not just the top.
     """
     if isinstance(schema, dict):
         cleaned = {k: _sanitize_schema_for_gemini(v) for k, v in schema.items() if not k.startswith("x-")}
+        if "enum" in cleaned and isinstance(cleaned["enum"], list):
+            cleaned["enum"] = [v if isinstance(v, str) else json.dumps(v) if isinstance(v, (dict, list)) else str(v) for v in cleaned["enum"]]
+        if isinstance(cleaned.get("type"), list):
+            types = cleaned["type"]
+            has_null = "null" in types
+            remaining = [t for t in types if t != "null"]
+            cleaned["type"] = remaining[0] if remaining else "string"
+            if has_null:
+                cleaned["nullable"] = True
         return cleaned
     if isinstance(schema, list):
         return [_sanitize_schema_for_gemini(v) for v in schema]
