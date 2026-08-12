@@ -4668,7 +4668,7 @@ def _call_anthropic_with_tools(api_key, system_prompt, messages, max_tokens, mod
     client = anthropic.Anthropic(api_key=api_key)
     anthropic_tools = [
         {"name": t["qualified_name"], "description": t["description"],
-         "input_schema": _sanitize_schema_for_gemini(t["input_schema"]) or {"type": "object", "properties": {}}}
+         "input_schema": _strip_vendor_extension_keys(t["input_schema"]) or {"type": "object", "properties": {}}}
         for t in tools
     ]
     conversation = list(messages)
@@ -4698,7 +4698,7 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
     openai_tools = [
         {"type": "function", "function": {
             "name": t["qualified_name"], "description": t["description"],
-            "parameters": _sanitize_schema_for_gemini(t["input_schema"]) or {"type": "object", "properties": {}},
+            "parameters": _strip_vendor_extension_keys(t["input_schema"]) or {"type": "object", "properties": {}},
         }}
         for t in tools
     ]
@@ -4731,49 +4731,162 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
     return "(I tried a few tool calls but couldn't reach a final answer — something may need a closer look.)"
 
 
-def _sanitize_schema_for_gemini(schema):
+def _strip_vendor_extension_keys(schema):
     """
-    Recursively reshapes a JSON Schema into the narrower dialect Gemini's
-    genai_types.FunctionDeclaration accepts, before handing it over. Gemini's
-    Schema type is proto-backed and validated client-side by strict pydantic
-    models -- unlike Anthropic/OpenAI, which pass schema dicts through as
-    opaque JSON, ANY shape Gemini doesn't recognize crashes the ENTIRE reply
-    (not just calls to that one tool), for every tool in the list, as soon as
-    one misbehaving MCP server's tools are included. Three real, confirmed
-    incompatibilities handled here:
+    Recursively strips vendor-extension keys (anything starting with 'x-')
+    from a JSON Schema. This is the light-touch sanitizer used for the
+    Anthropic and OpenAI paths, which otherwise accept standard JSON Schema
+    as-is and pass it through to their APIs as opaque JSON.
 
-    1. Vendor-extension keys (anything starting with 'x-'), e.g. the
-       'x-mcp-header' key some MCP servers use to mark a param as an HTTP
-       header rather than a body field -- a legitimate MCP convention, but
-       an unrecognized key to Gemini. (confirmed live: github MCP server)
-    2. `enum` lists containing non-string values (e.g. actual booleans
-       [true, false] instead of type: boolean) -- Gemini's enum field is
-       string-only regardless of the declared `type`. Coerced to strings.
-    3. `type` declared as a list (JSON Schema union types, e.g.
-       ["string", "number", "boolean"]) -- Gemini's `type` is a single
-       enum value, not a union. Reduced to the first non-"null" entry;
-       "null" in the union is translated to Gemini's own `nullable: true`
-       flag instead of being dropped silently.
-       (2 and 3 confirmed live: a Jira/issue-tracker-style MCP server)
-
-    Standard JSON Schema keywords are otherwise left untouched. Recurses
-    into nested "properties", "items", and "definitions"/"$defs" since any
-    of these three issues can show up at any level, not just the top.
+    Real bug this fixes: some MCP servers embed non-standard keys like
+    'x-mcp-header' on a property to mark it as an HTTP header rather than
+    part of the request body -- a legitimate MCP convention, but not
+    something every provider tolerates. Cheap to strip, and it's never
+    meaningful to the model, so we drop it everywhere rather than only
+    where it's been confirmed to break.
     """
     if isinstance(schema, dict):
-        cleaned = {k: _sanitize_schema_for_gemini(v) for k, v in schema.items() if not k.startswith("x-")}
-        if "enum" in cleaned and isinstance(cleaned["enum"], list):
-            cleaned["enum"] = [v if isinstance(v, str) else json.dumps(v) if isinstance(v, (dict, list)) else str(v) for v in cleaned["enum"]]
+        out = {}
+        for k, v in schema.items():
+            if k.startswith("x-"):
+                continue
+            if k == "properties" and isinstance(v, dict):
+                # `properties` is a name->schema MAP -- its keys are user-chosen
+                # field names, so a param legitimately named "x-foo" must not be
+                # mistaken for a vendor-extension key and dropped.
+                out[k] = {pk: _strip_vendor_extension_keys(pv) for pk, pv in v.items()}
+            else:
+                out[k] = _strip_vendor_extension_keys(v)
+        return out
+    if isinstance(schema, list):
+        return [_strip_vendor_extension_keys(v) for v in schema]
+    return schema
+
+
+# The complete set of fields Gemini's Schema proto actually has, in both the
+# camelCase (JSON Schema) and snake_case (python SDK) spellings the google-genai
+# client accepts. Anything outside this set is rejected -- sometimes client-side
+# by pydantic, sometimes only by the API with a 400 "Cannot find field" -- so
+# the Gemini path allowlists rather than blacklisting. See
+# _sanitize_schema_for_gemini for why.
+_GEMINI_SCHEMA_FIELDS = {
+    "type", "format", "title", "description", "nullable", "default", "example",
+    "enum", "properties", "required", "items", "anyOf", "any_of",
+    "propertyOrdering", "property_ordering",
+    "minimum", "maximum", "pattern",
+    "minItems", "min_items", "maxItems", "max_items",
+    "minLength", "min_length", "maxLength", "max_length",
+    "minProperties", "min_properties", "maxProperties", "max_properties",
+}
+
+
+def _sanitize_schema_for_gemini(schema, _defs=None):
+    """
+    Reshapes a JSON Schema into the narrower dialect Gemini accepts.
+
+    Gemini's Schema type is proto-backed with a fixed, closed field set --
+    unlike Anthropic/OpenAI, which pass schema dicts through as opaque JSON,
+    ANY shape Gemini doesn't recognize crashes the ENTIRE reply (not just
+    calls to the one offending tool), for every tool in the list, as soon as
+    one MCP server's tools are included. Worse, the rejection happens at two
+    different layers: some bad shapes are caught client-side by the SDK's
+    strict pydantic models, others sail through the client and are only
+    rejected by the API with a 400 INVALID_ARGUMENT / "Cannot find field".
+
+    We hit three of these in a row in live testing (x-mcp-header from the
+    github server; non-string enum entries and JSON Schema union types from
+    an issue-tracker server; then additionalProperties from another), each
+    one a separate outage-per-customer. Rather than keep blacklisting the
+    next unsupported keyword one incident at a time, this allowlists the
+    fields Gemini's proto actually defines (_GEMINI_SCHEMA_FIELDS) and drops
+    everything else. Standard-but-unsupported JSON Schema keywords
+    (additionalProperties, allOf, oneOf, not, const, multipleOf,
+    exclusiveMinimum/Maximum, patternProperties, $schema, ...) are all
+    dropped as constraints -- the model loses a little validation detail it
+    was never strictly bound by anyway, which is a far better failure mode
+    than every reply erroring out.
+
+    Beyond the allowlist, three shapes need active conversion rather than
+    dropping:
+      1. `enum` entries must be strings even when the field's declared type
+         is boolean/number -- coerced via str()/json.dumps().
+      2. `type` must be a single value, not a JSON Schema union list --
+         collapsed to the first non-"null" member, with a "null" member
+         translated into Gemini's own `nullable: true` rather than lost.
+      3. `$ref`/`$defs` (emitted routinely by any MCP server that builds
+         schemas from pydantic/zod models) aren't supported, but silently
+         dropping a `$ref` would leave a meaningless empty schema -- so
+         refs into the local `$defs`/`definitions` table are inlined
+         instead. Recursive/self-referential models can't be inlined
+         finitely; those degrade to a bare {"type": "object"} rather than
+         recursing forever.
+    """
+    if _defs is None:
+        _defs = {}
+
+    if isinstance(schema, dict):
+        # Collect any definition tables on the way down so nested $refs can
+        # still resolve after the table itself is dropped by the allowlist.
+        merged_defs = _defs
+        local_defs = {**schema.get("$defs", {}), **schema.get("definitions", {})}
+        if local_defs:
+            merged_defs = {**_defs, **local_defs}
+
+        ref = schema.get("$ref")
+        if isinstance(ref, str):
+            # Only local refs ("#/$defs/Foo", "#/definitions/Foo") are
+            # resolvable; anything remote we can't fetch, so fall back to a
+            # permissive object.
+            name = ref.rsplit("/", 1)[-1] if ref.startswith("#/") else None
+            target = merged_defs.get(name) if name else None
+            if target is None:
+                return {"type": "object"}
+            # Drop this ref's own name from the table before recursing, so a
+            # self-referential model terminates instead of looping forever.
+            remaining = {k: v for k, v in merged_defs.items() if k != name}
+            resolved = _sanitize_schema_for_gemini(target, remaining)
+            # Sibling keys alongside $ref (description, etc.) still apply.
+            siblings = {k: v for k, v in schema.items() if k not in ("$ref", "$defs", "definitions")}
+            if siblings:
+                resolved = {**resolved, **_sanitize_schema_for_gemini(siblings, merged_defs)}
+            return resolved
+
+        cleaned = {}
+        for k, v in schema.items():
+            if k not in _GEMINI_SCHEMA_FIELDS:
+                continue
+            if k == "properties" and isinstance(v, dict):
+                # `properties` is a name->schema MAP, not a schema: its keys are
+                # user-chosen field names (a param legitimately named "owner" or
+                # "default" must survive), so recurse into the values only and
+                # never filter the keys against the allowlist.
+                cleaned[k] = {pk: _sanitize_schema_for_gemini(pv, merged_defs) for pk, pv in v.items()}
+            elif k in ("required", "enum", "propertyOrdering", "property_ordering"):
+                # Lists of plain strings/values, not nested schemas -- leave the
+                # contents alone here (enum gets its own coercion pass below).
+                cleaned[k] = v
+            else:
+                cleaned[k] = _sanitize_schema_for_gemini(v, merged_defs)
+
+        if isinstance(cleaned.get("enum"), list):
+            cleaned["enum"] = [
+                v if isinstance(v, str)
+                else json.dumps(v) if isinstance(v, (dict, list))
+                else str(v)
+                for v in cleaned["enum"]
+            ]
+
         if isinstance(cleaned.get("type"), list):
             types = cleaned["type"]
-            has_null = "null" in types
-            remaining = [t for t in types if t != "null"]
-            cleaned["type"] = remaining[0] if remaining else "string"
-            if has_null:
+            remaining_types = [t for t in types if t != "null"]
+            cleaned["type"] = remaining_types[0] if remaining_types else "string"
+            if "null" in types:
                 cleaned["nullable"] = True
+
         return cleaned
+
     if isinstance(schema, list):
-        return [_sanitize_schema_for_gemini(v) for v in schema]
+        return [_sanitize_schema_for_gemini(v, _defs) for v in schema]
     return schema
 
 
