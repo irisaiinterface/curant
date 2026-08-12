@@ -4668,7 +4668,7 @@ def _call_anthropic_with_tools(api_key, system_prompt, messages, max_tokens, mod
     client = anthropic.Anthropic(api_key=api_key)
     anthropic_tools = [
         {"name": t["qualified_name"], "description": t["description"],
-         "input_schema": t["input_schema"] or {"type": "object", "properties": {}}}
+         "input_schema": _sanitize_schema_for_gemini(t["input_schema"]) or {"type": "object", "properties": {}}}
         for t in tools
     ]
     conversation = list(messages)
@@ -4698,7 +4698,7 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
     openai_tools = [
         {"type": "function", "function": {
             "name": t["qualified_name"], "description": t["description"],
-            "parameters": t["input_schema"] or {"type": "object", "properties": {}},
+            "parameters": _sanitize_schema_for_gemini(t["input_schema"]) or {"type": "object", "properties": {}},
         }}
         for t in tools
     ]
@@ -4731,6 +4731,32 @@ def _call_openai_with_tools(api_key, system_prompt, messages, max_tokens, model,
     return "(I tried a few tool calls but couldn't reach a final answer — something may need a closer look.)"
 
 
+def _sanitize_schema_for_gemini(schema):
+    """
+    Recursively strips vendor-extension keys (anything starting with 'x-')
+    from a JSON Schema before handing it to Gemini's FunctionDeclaration.
+
+    Real bug this fixes: some MCP servers embed non-standard keys like
+    'x-mcp-header' on a property to mark it as an HTTP header rather than
+    part of the request body -- a real, legitimate MCP convention, but
+    Gemini's genai_types.FunctionDeclaration validates parameters with
+    strict pydantic models that reject any key they don't recognize,
+    raising a validation error that killed EVERY reply (not just calls
+    to that one tool) as soon as that server's tools were in the list --
+    confirmed live against a real customer's connected 'github' MCP
+    server. Standard JSON Schema keywords are untouched; this only
+    drops the vendor-extension ones Gemini can't parse. Recurses into
+    nested "properties", "items", and "definitions"/"$defs" since a
+    stray x- key could show up at any level, not just the top.
+    """
+    if isinstance(schema, dict):
+        cleaned = {k: _sanitize_schema_for_gemini(v) for k, v in schema.items() if not k.startswith("x-")}
+        return cleaned
+    if isinstance(schema, list):
+        return [_sanitize_schema_for_gemini(v) for v in schema]
+    return schema
+
+
 def _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model, tools, available_tools):
     """
     Gemini 3 models require a 'thought_signature' to be echoed back on every
@@ -4756,7 +4782,7 @@ def _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model,
         genai_types.FunctionDeclaration(
             name=t["qualified_name"],
             description=t["description"],
-            parameters=t["input_schema"] or {"type": "object", "properties": {}},
+            parameters=_sanitize_schema_for_gemini(t["input_schema"]) or {"type": "object", "properties": {}},
         )
         for t in tools
     ])]
