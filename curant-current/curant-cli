@@ -903,12 +903,178 @@ def save_memory(content):
     with closing(get_local_db()) as conn:
         conn.execute("INSERT INTO memories (content) VALUES (?)", (content,))
         conn.commit()
+    export_memories_file()
 
 
 def delete_memory_by_content(content):
     with closing(get_local_db()) as conn:
         conn.execute("DELETE FROM memories WHERE content = ?", (content,))
         conn.commit()
+    export_memories_file()
+
+
+MEMORIES_FILE_PATH = os.path.join(CONFIG_DIR, "memories.md")
+
+
+def export_memories_file():
+    """
+    Mirrors the memories table out to a plain, directly-editable text file
+    at a fixed local path (~/.curant/memories.md) -- same convention as
+    export_capability_gaps_xlsx: chmod 0600, not encrypted (nothing here
+    is a secret; it's the exact same free-text content Curant would
+    otherwise just say back to the owner in a reply), overwritten in full
+    on every call rather than appended, so it never drifts stale.
+
+    This file is local-only by construction, same as everything else
+    memory-related in this codebase (see README's architecture section:
+    Curant's server never sees a memory, persona, or message). It is
+    NOT written into context-export/full-export's encrypted output, NOT
+    read or written by anything network-facing, and nothing in this file
+    ever transmits its contents anywhere -- it exists purely so the
+    owner can open it in a normal text editor and see, in plain words,
+    exactly what Curant has stored about them.
+
+    Called automatically after every save_memory/delete_memory_by_content
+    (including the automatic memory extraction that runs after every
+    exchange -- see update_memories_from_exchange) so it's always
+    current, with no separate manual export step required. Also exposed
+    as `curant-cli memories` for an on-demand refresh + print, and read
+    back by sync_memories_file_to_db() -- the write-back half of this --
+    when the owner edits the file directly.
+    """
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    rows = get_memories_with_age()
+    lines = [
+        "# Curant memories",
+        "#",
+        "# Everything Curant has learned about you, in your own words. This file",
+        "# lives only on this Mac -- it is never sent to Curant's server (which",
+        "# never sees memories at all) and never leaves this machine any other way.",
+        "#",
+        "# Edit freely: add a new '- ' line to teach Curant something, delete a",
+        "# line to make it forget it, or rewrite a line to correct it. Lines that",
+        "# don't start with '- ', and lines starting with '#', are ignored.",
+        "#",
+        "# After editing, run `curant-cli sync-memories` to apply your changes --",
+        "# or use `curant-cli edit-memories`, which opens this file and syncs it",
+        "# back automatically when you're done.",
+        "",
+    ]
+    for r in rows:
+        age = r["days_old"]
+        age_note = " (today)" if age == 0 else f" ({age}d ago)"
+        lines.append(f"- {r['content']}{age_note}")
+    if not rows:
+        lines.append("# (nothing remembered yet)")
+    content = "\n".join(lines) + "\n"
+    with open(MEMORIES_FILE_PATH, "w") as f:
+        f.write(content)
+    os.chmod(MEMORIES_FILE_PATH, 0o600)  # owner-only, same standard as local.db
+    return MEMORIES_FILE_PATH
+
+
+def _parse_memories_file():
+    """
+    Reads memories.md back into a flat list of content strings -- the
+    inverse of export_memories_file(). Only lines starting with '- '
+    count as a memory; everything else (comments, blank lines, the
+    "(nothing remembered yet)" placeholder) is ignored. The trailing
+    "(Nd ago)" age annotation export_memories_file() appends is stripped
+    back off here, since it's display-only and was never part of the
+    actual stored content -- without stripping it, every synced-and-
+    reexported memory would pick up a second, stale age suffix baked
+    permanently into its content on the next sync.
+    """
+    if not os.path.exists(MEMORIES_FILE_PATH):
+        return []
+    memories = []
+    age_suffix = re.compile(r"\s*\((?:today|\d+d ago)\)\s*$")
+    with open(MEMORIES_FILE_PATH) as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped.startswith("- "):
+                continue
+            content = stripped[2:].strip()
+            content = age_suffix.sub("", content).strip()
+            if content:
+                memories.append(content)
+    return memories
+
+
+def sync_memories_file_to_db():
+    """
+    Reconciles the memories table to match whatever's currently in
+    memories.md -- the write-back half of export_memories_file(), for
+    when the owner has edited the file directly rather than going
+    through a conversation. Diffs by exact content string, the same
+    trivial-dedup approach update_memories_from_exchange already uses
+    elsewhere in this file: any bullet line in the file not already in
+    the DB gets inserted as a new memory, any DB row whose content no
+    longer appears anywhere in the file gets deleted. A line left
+    untouched in the file is left untouched in the DB too, so editing
+    one memory doesn't reset every other memory's created_at/age.
+
+    Re-exports the file afterward so formatting (age annotations,
+    ordering) is normalized back to canonical form post-sync. Returns
+    (added_count, removed_count).
+    """
+    file_memories = _parse_memories_file()
+    existing = get_memories()
+    file_set = set(file_memories)
+    existing_set = set(existing)
+
+    added = 0
+    for content in file_memories:
+        if content not in existing_set:
+            with closing(get_local_db()) as conn:
+                conn.execute("INSERT INTO memories (content) VALUES (?)", (content,))
+                conn.commit()
+            added += 1
+
+    removed = 0
+    for content in existing:
+        if content not in file_set:
+            with closing(get_local_db()) as conn:
+                conn.execute("DELETE FROM memories WHERE content = ?", (content,))
+                conn.commit()
+            removed += 1
+
+    export_memories_file()
+    return added, removed
+
+
+def memories_cmd():
+    path = export_memories_file()
+    memories = get_memories()
+    if not memories:
+        print(f"Nothing remembered yet. File (empty): {path}")
+        return
+    print(f"{len(memories)} memories — also written to {path}:\n")
+    for m in memories:
+        print(f"  - {m}")
+
+
+def edit_memories_cmd():
+    path = export_memories_file()
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "nano"
+    print(f"Opening {path} in '{editor}' (set $EDITOR to use something else)...")
+    try:
+        subprocess.run([editor, path], check=True)
+    except FileNotFoundError:
+        print(f"Couldn't launch '{editor}'. Edit {path} directly in any text editor, then run "
+              f"`curant-cli sync-memories` to apply your changes.", file=sys.stderr)
+        return
+    except subprocess.CalledProcessError:
+        print("Editor exited with an error — no changes applied. Once you're done editing, run "
+              "`curant-cli sync-memories`.", file=sys.stderr)
+        return
+    added, removed = sync_memories_file_to_db()
+    print(f"Synced: {added} added, {removed} removed.")
+
+
+def sync_memories_cmd():
+    added, removed = sync_memories_file_to_db()
+    print(f"Synced {MEMORIES_FILE_PATH}: {added} added, {removed} removed.")
 
 
 def get_important_people():
@@ -9266,6 +9432,9 @@ def main():
     sub.add_parser("grading-assignments", help="Show Aaron's grading calibration assignments and example counts")
 
     sub.add_parser("dashboard", help="Open a local, this-Mac-only web view of what Curant remembers about you")
+    sub.add_parser("memories", help="Show every memory Curant has stored about you (also refreshes ~/.curant/memories.md)")
+    sub.add_parser("edit-memories", help="Open ~/.curant/memories.md in $EDITOR, then apply your edits")
+    sub.add_parser("sync-memories", help="Apply edits already made to ~/.curant/memories.md (use after editing it in some other program)")
 
     sub.add_parser("request-release", help="Request that your device binding be released (e.g. for a new Mac) — reviewed by a person, not automatic")
 
@@ -9424,6 +9593,12 @@ def main():
         grading_assignments_cmd()
     elif args.command == "dashboard":
         run_local_dashboard()
+    elif args.command == "memories":
+        memories_cmd()
+    elif args.command == "edit-memories":
+        edit_memories_cmd()
+    elif args.command == "sync-memories":
+        sync_memories_cmd()
     elif args.command == "request-release":
         request_release()
     elif args.command == "relay":

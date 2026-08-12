@@ -561,7 +561,8 @@ periodic status check), and a cached status-check timestamp.
 
 **Locally, in `~/.curant/local.db`** (file permissions `600`, owner-only):
 `important_people`, `memories` (no expiry — the intentional long-term
-store), `messages` (raw recent history, capped at 20 / expires after 48h,
+store, also mirrored to a plain-text file for viewing/editing — see
+below), `messages` (raw recent history, capped at 20 / expires after 48h,
 now also tags each assistant reply with which provider answered it),
 `routing_rules` (standing category -> provider preferences, e.g.
 "coding -> openai" — no expiry, customer-editable via `curant-cli
@@ -623,6 +624,32 @@ plain-language gloss (`PERSONA_STYLE_SUMMARY`) written specifically so
 this export can't be used to extract Curant's real prompt engineering.
 It also, obviously, contains no license key or API key — nothing in it
 grants access to anything.
+
+**Locally, in `~/.curant/memories.md`** (file permissions `600`,
+owner-only, plain text, never encrypted): a directly human-readable
+mirror of the `memories` table — one line per memory, in the customer's
+own words, kept current automatically every time a memory is added or
+removed (including the automatic extraction that runs after every
+exchange). This is the answer to "what does Curant actually know about
+me" for anyone who'd rather read a file than run a command or open the
+local dashboard. Local-only in the same sense as everything else
+memory-related: never sent to Curant's server, never part of
+context-export/full-export's encrypted output, nothing in the code path
+that writes or reads it touches the network. Three ways to interact
+with it:
+- `curant-cli memories` — print everything Curant remembers, refreshing
+  the file at the same time.
+- `curant-cli edit-memories` — opens the file in `$EDITOR` (or `nano` if
+  unset), then applies whatever you changed the moment you close it:
+  add a `- ` line to teach Curant something new, delete a line to make
+  it forget, rewrite a line to correct it.
+- `curant-cli sync-memories` — same apply step, for when you edited the
+  file some other way (Finder, another editor, synced it from an iPad,
+  etc.) and just need the changes picked up.
+
+Editing is a plain diff against what's already stored (by exact
+content), so touching one line doesn't disturb any other memory's
+age/timestamp.
 
 ## Onboarding, capability discovery, and urgency handling
 
