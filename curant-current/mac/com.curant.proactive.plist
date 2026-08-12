@@ -7,7 +7,15 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <!-- Homebrew python3.12, NOT /usr/bin/python3 (Apple's system
+             Python), same reasoning as com.curant.watcher.plist and
+             com.curant.facetime.plist: this run sends its result via
+             osascript/Messages.app when there is something to report,
+             and macOS ties Automation/AppleEvents permission to the
+             exact requesting binary. Apple's system python3 was never
+             granted that permission; the Homebrew one already was. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
         <string>/usr/local/bin/curant-watcher.py</string>
         <string>--proactive-check</string>
     </array>
@@ -25,6 +33,26 @@
 
     <key>RunAtLoad</key>
     <false/>
+
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin) is not found on the
+         default PATH. Without this, this script's own internal
+         subprocess.run(["curant-cli", ...]) calls fail outright with
+         "No such file or directory", same bug already confirmed live
+         and fixed in com.curant.watcher.plist and com.curant.facetime.plist. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching com.curant.watcher.plist.
+             Remove once a real license is activated via curant-cli
+             activate. Without it every relay()/status check fails
+             closed with not_activated on a Mac with no manual shell
+             export backing it. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/tmp/curant-proactive.log</string>

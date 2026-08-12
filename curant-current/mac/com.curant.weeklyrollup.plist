@@ -7,12 +7,20 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <!-- Homebrew python3.12, NOT /usr/bin/python3 (Apple's system
+             Python), same reasoning as com.curant.watcher.plist and
+             com.curant.facetime.plist: this run sends its result via
+             osascript/Messages.app when there is something to report,
+             and macOS ties Automation/AppleEvents permission to the
+             exact requesting binary. Apple's system python3 was never
+             granted that permission; the Homebrew one already was. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
         <string>/usr/local/bin/curant-watcher.py</string>
         <string>--weekly-rollup</string>
     </array>
 
-    <!-- Runs once a week, Sunday 6:00pm -- ahead of the new work week,
+    <!-- Runs once a week, Sunday 6:00pm , ahead of the new work week,
          a longer-form summary on top of the twice-daily briefing
          everyone gets. Grace-exclusive (curant-cli's weekly_rollup()
          checks the tier); safe to load on every Mac regardless of
@@ -31,6 +39,26 @@
     <key>RunAtLoad</key>
     <false/>
 
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin) is not found on the
+         default PATH. Without this, this script's own internal
+         subprocess.run(["curant-cli", ...]) calls fail outright with
+         "No such file or directory", same bug already confirmed live
+         and fixed in com.curant.watcher.plist and com.curant.facetime.plist. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching com.curant.watcher.plist.
+             Remove once a real license is activated via curant-cli
+             activate. Without it every relay()/status check fails
+             closed with not_activated on a Mac with no manual shell
+             export backing it. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/tmp/curant-weeklyrollup.log</string>
 
@@ -44,14 +72,13 @@ Install with:
   launchctl load ~/Library/LaunchAgents/com.curant.weeklyrollup.plist
 
 Grace-exclusive, gated in curant-cli's weekly_rollup() function (checks
-get_customer_august_tier(config) == "grace") -- loading this job on a
+get_customer_august_tier(config) == "grace") , loading this job on a
 non-Grace customer's Mac is harmless, it just always results in
 should_send=false, same "safe to always run" pattern as the other
 scheduled jobs.
 
 To test immediately rather than waiting for Sunday evening, run
-curant-watcher.py with the --weekly-rollup flag directly (see
-ProgramArguments above).
+curant-watcher.py directly with the flag shown in ProgramArguments above.
 
 Logs land at /tmp/curant-weeklyrollup.log and /tmp/curant-weeklyrollup-error.log.
 -->

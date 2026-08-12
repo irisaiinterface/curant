@@ -7,17 +7,25 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
+        <!-- Homebrew python3.12, NOT /usr/bin/python3 (Apple's system
+             Python), same reasoning as com.curant.watcher.plist and
+             com.curant.facetime.plist: this run sends its result via
+             osascript/Messages.app when there is something to report,
+             and macOS ties Automation/AppleEvents permission to the
+             exact requesting binary. Apple's system python3 was never
+             granted that permission; the Homebrew one already was. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
         <string>/usr/local/bin/curant-watcher.py</string>
         <string>--daily-briefing</string>
     </array>
 
     <!-- Runs twice a day, 9:00am and 5:00pm, for every customer by
-         default (see daily_briefing()'s docstring in curant-cli --
+         default (see daily_briefing()'s docstring in curant-cli ,
          originally Grace-exclusive at a single 7am slot, opened up to
          everyone and moved to this cadence per the owner's direction).
          StartCalendarInterval accepts an array for multiple fire times
-         -- this is one job that runs twice daily, not two separate jobs. -->
+         , this is one job that runs twice daily, not two separate jobs. -->
     <key>StartCalendarInterval</key>
     <array>
         <dict>
@@ -37,6 +45,26 @@
     <key>RunAtLoad</key>
     <false/>
 
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin) is not found on the
+         default PATH. Without this, this script's own internal
+         subprocess.run(["curant-cli", ...]) calls fail outright with
+         "No such file or directory", same bug already confirmed live
+         and fixed in com.curant.watcher.plist and com.curant.facetime.plist. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching com.curant.watcher.plist.
+             Remove once a real license is activated via curant-cli
+             activate. Without it every relay()/status check fails
+             closed with not_activated on a Mac with no manual shell
+             export backing it. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/tmp/curant-dailybriefing.log</string>
 
@@ -50,14 +78,13 @@ Install with:
   launchctl load ~/Library/LaunchAgents/com.curant.dailybriefing.plist
 
 On by default for every customer (config["daily_briefing_enabled"]
-defaults to True in curant-cli's daily_briefing() -- a customer can turn
+defaults to True in curant-cli's daily_briefing() , a customer can turn
 it off with `curant-cli set-daily-briefing off`). This should be
 installed as part of standard setup going forward, same as
 com.curant.proactive.plist and com.curant.watcher.plist.
 
 To test immediately rather than waiting for 9am/5pm, run
-curant-watcher.py with the --daily-briefing flag directly (see
-ProgramArguments above).
+curant-watcher.py directly with the flag shown in ProgramArguments above.
 
 Logs land at /tmp/curant-dailybriefing.log and /tmp/curant-dailybriefing-error.log.
 -->

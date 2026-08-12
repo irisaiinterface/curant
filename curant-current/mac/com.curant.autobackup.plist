@@ -12,7 +12,7 @@
     </array>
 
     <!-- Runs once a week, Sunday 3:00am. Grace-exclusive and opt-in
-         (curant-cli set-auto-backup on) -- safe to load on every Mac
+         (curant-cli set-auto-backup on) , safe to load on every Mac
          regardless of tier/setup, same "safe to always run" pattern as
          the other scheduled jobs; run_automated_backup() itself no-ops
          for anyone who isn't Grace or hasn't turned this on. -->
@@ -43,7 +43,7 @@ Install with:
 
 Turn the feature itself on with:
   curant-cli set-auto-backup on
-(Grace-exclusive -- this will refuse for any other tier, and prompts
+(Grace-exclusive , this will refuse for any other tier, and prompts
 once for a passphrase which is stored in macOS Keychain, not any
 Curant config file. See run_automated_backup()'s docstring in
 curant-cli for the full design.)
