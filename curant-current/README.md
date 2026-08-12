@@ -92,6 +92,30 @@ This means:
 6. **Edit `curant-watcher.py`** — set `CUSTOMER_APPLE_ID` to the Apple ID
    this Mac's Curant should listen to.
 
+   **Two supported ways to set this up, depending on your hardware:**
+
+   - **Dedicated Mac/Apple ID (recommended if you have the hardware).**
+     Curant runs on its own machine, signed into its own Apple ID,
+     separate from your personal phone. Real messages you send it from
+     your phone are always a genuinely different Apple ID, so they land
+     as normal incoming messages — no extra config needed. Set
+     `CUSTOMER_APPLE_ID` to your own personal Apple ID (the one Curant
+     should reply to).
+
+   - **One Mac, same Apple ID as your phone.** If you're running Curant
+     on your everyday Mac instead of a second machine, add a second
+     address in **Messages > Settings > iMessage > "You can be reached
+     by iMessage at"** (a free email alias on the same Apple ID works
+     fine) dedicated purely to texting Curant. Set `CUSTOMER_APPLE_ID`
+     to *that dedicated address*, not your primary one, and set
+     `"self_message_mode": true` in `~/.curant/config.json`. Without
+     this, messages you send from your phone to that address sync to
+     the Mac as *outgoing* (iMessage syncs your own sent messages
+     across every device on one Apple ID) and Curant will never see
+     them as something to reply to — `self_message_mode` is what makes
+     that setup work correctly. See `_read_self_message_mode()` in
+     `mac/curant-watcher.py` for the full explanation.
+
 7. **Install Whisper for voice memo transcription** (optional):
    ```
    brew install ffmpeg

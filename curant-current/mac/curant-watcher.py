@@ -159,33 +159,44 @@ AUTO_REPLY_HANDLES = _read_auto_reply_handles()
 
 def _read_self_message_mode():
     """
-    Dev/testing convenience, NOT a real production scenario -- explained
-    in full below since it's easy to misread as a security hole otherwise.
+    Supports a second, equally real deployment shape: running Curant on
+    your OWN Mac, signed into your OWN everyday Apple ID (the one your
+    phone also uses), rather than provisioning a separate dedicated
+    machine/Apple ID just for Curant. Plenty of people running this
+    solo don't want a second device -- this makes that setup work
+    correctly instead of silently failing.
 
-    In real production use, the Mac running curant-watcher.py is a
-    dedicated business machine with its own Apple ID, and actual
-    customers text it from their OWN separate phone/Apple ID -- that's
-    the whole reason is_from_me=0 plus a handle allowlist works as the
-    "is this really the customer" check throughout this file.
+    The setup: in Messages > Settings > iMessage on the Mac, add a
+    second "You can be reached by iMessage at" address (an email alias
+    on the same Apple ID costs nothing and takes a minute) dedicated
+    purely to Curant, and set CUSTOMER_APPLE_ID to that dedicated
+    address rather than your primary one. Text THAT address (from your
+    phone, same Apple ID) whenever you want to talk to Curant, and
+    leave your primary address for normal personal messages.
 
-    But testing Curant on your OWN personal Mac, signed into your OWN
-    personal Apple ID, breaks that assumption: iMessage syncs your own
-    sent messages across every device on the same Apple ID, so anything
-    you send from your phone shows up in THIS Mac's own chat.db as
-    is_from_me=1 (outgoing), never is_from_me=0 (incoming) -- there is
-    no way to generate a "real" incoming message from yourself to
-    yourself under one shared identity. Confirmed live: every message
-    sent this way showed is_from_me=1 in chat.db, exactly as expected.
+    Why this needs a code path at all, rather than "just works": iMessage
+    syncs every message YOU send across every device signed into the
+    same Apple ID, including ones sent to your own dedicated Curant
+    address. So a message to that address, sent from your phone, still
+    lands in this Mac's own chat.db as is_from_me=1 (outgoing), never
+    is_from_me=0 (incoming) -- there is no way to generate a "real"
+    incoming message to yourself under one shared identity, confirmed
+    live (every message sent this way showed is_from_me=1 in chat.db).
+    A genuinely separate dedicated business Mac/Apple ID doesn't hit
+    this, since real customers texting it are a different Apple ID
+    entirely and land as is_from_me=0 normally -- no special handling
+    needed there, this mode is specifically for the shared-identity case.
 
-    When explicitly enabled (self_message_mode=true in config, opt-in,
-    default off), fetch_new_messages additionally treats messages YOU
-    send (is_from_me=1) addressed specifically to CUSTOMER_APPLE_ID
-    (e.g. a second address linked to your own Apple ID, used purely as
-    a "text this to talk to Curant" thread) as if they were a real
-    incoming customer message. This never widens who Curant will listen
-    to beyond your own already-configured identity -- it only changes
-    which DIRECTION of message counts, and only for the one specific
-    address already trusted as CUSTOMER_APPLE_ID.
+    When enabled (self_message_mode=true in config, opt-in, default
+    off), fetch_new_messages additionally treats messages YOU send
+    (is_from_me=1) addressed specifically to CUSTOMER_APPLE_ID as if
+    they were a real incoming message. This never widens who Curant
+    will listen to beyond the one address already configured as
+    CUSTOMER_APPLE_ID -- it only changes which DIRECTION of message to
+    that address counts, so set CUSTOMER_APPLE_ID to the dedicated
+    alias (not your primary address) or this will also treat your own
+    ordinary outgoing texts to other people as if they were messages to
+    Curant.
     """
     cfg = {}
     _cfg_path = os.path.expanduser("~/.curant/config.json")
@@ -1288,6 +1299,10 @@ def main():
                   file=sys.stderr)
             sys.exit(1)
         print(f"Access mode: approved — listening for: {', '.join(CUSTOMER_HANDLES)}")
+        if SELF_MESSAGE_MODE:
+            print(f"Self-message mode: ON — also treating messages YOU send to "
+                  f"{CUSTOMER_APPLE_ID} as incoming (shared-Apple-ID setup; make sure "
+                  f"that's a dedicated alias, not your everyday address).")
     last_rowid = get_last_seen_rowid()
 
     while True:
