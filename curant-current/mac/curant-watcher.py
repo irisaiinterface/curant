@@ -281,6 +281,85 @@ def save_last_seen_rowid(rowid):
         f.write(str(rowid))
 
 
+# In-process registry of ROWIDs for messages THIS PROCESS just sent to
+# CUSTOMER_APPLE_ID. Closes a real feedback loop that self_message_mode
+# otherwise opens: fetch_new_messages' self-message clause matches ANY
+# is_from_me=1 message addressed to CUSTOMER_APPLE_ID, and chat.db gives
+# no way to distinguish "you texted yourself from your phone" from
+# "Curant just sent its own reply to that same address" -- both look
+# identical (same is_from_me=1, same handle.id). Without this, every
+# reply Curant sends gets picked up as a brand-new "incoming customer
+# message" on the very next poll, and Curant ends up replying to itself
+# indefinitely -- confirmed live: a real runaway loop, with Curant
+# visibly noticing and complaining about being "stuck in a loop,"
+# because there genuinely was one.
+#
+# In-process/in-memory only (not persisted to disk) is sufficient: it
+# only needs to survive within one continuous run, since a fresh run's
+# own already-handled messages stay excluded anyway via the separate,
+# persisted last_seen_rowid cursor (see get/save_last_seen_rowid) --
+# the loop this guards against can only ever happen turn-to-turn within
+# a single run in the first place, never across a restart.
+_SELF_SENT_ROWIDS = set()
+
+
+def _record_self_sent_rowid(to_apple_id, text_sent=None, is_attachment=False):
+    """
+    Looks up the ROWID chat.db actually assigned to a message
+    send_text_reply/send_voice_reply just sent, and adds it to
+    _SELF_SENT_ROWIDS so fetch_new_messages knows to exclude it under
+    self_message_mode. Retries briefly (iMessage's own sync into
+    chat.db isn't always instantaneous) rather than giving up on the
+    first empty result.
+
+    No-op entirely when self_message_mode is off -- production installs
+    (a genuinely separate business Apple ID) never hit the loop this
+    guards against in the first place, so there's no reason to pay even
+    this small extra chat.db round-trip per send.
+
+    Best-effort by design: any failure here just risks one extra
+    self-message-mode round-trip in the worst case, never a crash and
+    never a blocked reply -- the actual send already succeeded by the
+    time this runs.
+    """
+    if not SELF_MESSAGE_MODE:
+        return
+    for _ in range(10):
+        try:
+            conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            if is_attachment:
+                row = conn.execute(
+                    """SELECT message.ROWID as rowid FROM message
+                       JOIN handle ON message.handle_id = handle.ROWID
+                       WHERE handle.id = ? AND message.is_from_me = 1
+                             AND message.cache_has_attachments = 1
+                       ORDER BY message.ROWID DESC LIMIT 1""",
+                    (to_apple_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT message.ROWID as rowid FROM message
+                       JOIN handle ON message.handle_id = handle.ROWID
+                       WHERE handle.id = ? AND message.is_from_me = 1
+                             AND message.text = ?
+                       ORDER BY message.ROWID DESC LIMIT 1""",
+                    (to_apple_id, text_sent),
+                ).fetchone()
+            conn.close()
+            if row:
+                _SELF_SENT_ROWIDS.add(row["rowid"])
+                # Bounded growth -- no legitimate reason this ever needs to
+                # hold more than a modest recent window.
+                if len(_SELF_SENT_ROWIDS) > 200:
+                    for old in sorted(_SELF_SENT_ROWIDS)[:-200]:
+                        _SELF_SENT_ROWIDS.discard(old)
+                return
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+
 def fetch_new_messages(since_rowid):
     """
     Query chat.db for new incoming messages from the customer's Apple ID.
@@ -324,7 +403,13 @@ def fetch_new_messages(since_rowid):
         # skipped.
         direction_clause = f"(message.is_from_me = 0{self_msg_clause})"
         cur = conn.execute(
-            base_select + f" AND {direction_clause} ORDER BY message.ROWID ASC",
+            # direction_clause is wrapped in its OWN extra parens here too
+            # (redundant in this branch, since it's already fully self-
+            # contained -- but see the 'approved' branch below for why this
+            # isn't optional in general: SQL's AND binds tighter than OR, so
+            # "ROWID > ? AND (...) OR (...)" silently exempts the OR's right
+            # side from the ROWID filter entirely if not wrapped).
+            base_select + f" AND ({direction_clause}) ORDER BY message.ROWID ASC",
             (since_rowid, *self_msg_params),
         )
     else:
@@ -342,11 +427,25 @@ def fetch_new_messages(since_rowid):
         placeholders = ",".join("?" for _ in allowed_handles)
         direction_clause = f"(message.is_from_me = 0 AND handle.id IN ({placeholders})){self_msg_clause}"
         cur = conn.execute(
-            base_select + f" AND {direction_clause} ORDER BY message.ROWID ASC",
+            # CRITICAL: direction_clause here is "(A) OR (B)", NOT fully
+            # wrapped -- without the extra parens added at the point of use
+            # below, "WHERE ROWID > ? AND (A) OR (B)" parses (SQL's AND
+            # binds tighter than OR) as "(ROWID > ? AND (A)) OR (B)", which
+            # means self_msg_clause's branch is NOT constrained by ROWID at
+            # all -- every self-sent message to CUSTOMER_APPLE_ID, no matter
+            # how old, would be refetched and re-handled on EVERY single
+            # poll forever. Confirmed live: this is what actually produced
+            # a real runaway reply loop, not just the separate echo-back
+            # issue _record_self_sent_rowid guards against.
+            base_select + f" AND ({direction_clause}) ORDER BY message.ROWID ASC",
             (since_rowid, *allowed_handles, *self_msg_params),
         )
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
+    if SELF_MESSAGE_MODE and _SELF_SENT_ROWIDS:
+        # Drop anything this process just sent itself -- see
+        # _record_self_sent_rowid's docstring for why this exists at all.
+        rows = [r for r in rows if r["rowid"] not in _SELF_SENT_ROWIDS]
     return rows
 
 
@@ -749,6 +848,7 @@ def send_text_reply(to_apple_id, text):
     end tell
     '''
     subprocess.run(["osascript", "-e", script])
+    _record_self_sent_rowid(to_apple_id, text_sent=text)
 
 
 def send_voice_reply(to_apple_id, audio_file_path):
@@ -761,6 +861,7 @@ def send_voice_reply(to_apple_id, audio_file_path):
     end tell
     '''
     subprocess.run(["osascript", "-e", script])
+    _record_self_sent_rowid(to_apple_id, is_attachment=True)
 
 
 def send_file_reply(to_apple_id, file_path):
