@@ -2198,6 +2198,32 @@ def get_all_available_tools(config):
         "raw_name": "log_capability_gap",
         "builtin": True,
     })
+    tools.append({
+        "qualified_name": "set_notification_preferences",
+        "description": (
+            "Turns Curant's automated background notifications on or off, on the customer's behalf, "
+            "when they ask in conversation (e.g. \"can you text me an update automatically\", \"stop "
+            "sending the morning briefing\", \"turn on proactive check-ins\", \"set up automated "
+            "notifications for me\"). Two independent settings, always available (not tier-gated): "
+            "daily_briefing (a real structured digest -- today's agenda plus open reminders -- sent "
+            "automatically at 9am and 5pm whenever there's something to report; on by default) and "
+            "proactive_checkins (Curant's own judgment call about whether anything unprompted is worth "
+            "a heads-up right now; off by default and much more conservative -- most days it should "
+            "send nothing at all). Only pass the setting(s) the customer actually asked to change; "
+            "leave the other alone by omitting it. Current status for this customer is given to you "
+            "above in this system prompt -- check that before assuming you need to ask what's on/off."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "daily_briefing": {"type": "boolean", "description": "true to turn the twice-daily briefing on, false to turn it off"},
+                "proactive_checkins": {"type": "boolean", "description": "true to turn ad-hoc proactive check-ins on, false to turn them off"},
+            },
+        },
+        "server_command": None,
+        "raw_name": "set_notification_preferences",
+        "builtin": True,
+    })
 
     if get_customer_august_tier(config) == "grace":
         tools.append({
@@ -4556,6 +4582,20 @@ def execute_tool_call(tool_name, arguments, available_tools):
         ok, msg = set_shell_safety_mode(arguments.get("mode", ""))
         return msg
 
+    if match["builtin"] and tool_name == "set_notification_preferences":
+        config = load_config()
+        changed = []
+        if "daily_briefing" in arguments:
+            config["daily_briefing_enabled"] = bool(arguments["daily_briefing"])
+            changed.append(f"daily briefing {'on' if config['daily_briefing_enabled'] else 'off'}")
+        if "proactive_checkins" in arguments:
+            config["proactivity_enabled"] = bool(arguments["proactive_checkins"])
+            changed.append(f"proactive check-ins {'on' if config['proactivity_enabled'] else 'off'}")
+        if not changed:
+            return "[No setting specified — nothing changed.]"
+        save_config(config)
+        return f"Updated: {', '.join(changed)}."
+
     if match["builtin"] and tool_name in (
         "generate_image", "generate_image_with_text", "generate_voice", "edit_media"
     ):
@@ -6383,6 +6423,17 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         system_parts.append(f"Unlocked add-ons: {', '.join(addons)}. You may use these capabilities.")
     else:
         system_parts.append("Base plan only — do not offer autonomous sending or other locked features; suggest unlocking the relevant add-on instead.")
+    system_parts.append(
+        f"Automated background notifications for this customer — daily briefing (structured digest "
+        f"of today's agenda plus open reminders, sent automatically at 9am and 5pm when there's "
+        f"something to report): {'on' if config.get('daily_briefing_enabled', True) else 'off'}. "
+        f"Proactive check-ins (your own judgment call on whether anything unprompted is worth a "
+        f"heads-up, off by default and much more conservative than the briefing): "
+        f"{'on' if config.get('proactivity_enabled') else 'off'}. If the customer asks to turn either "
+        f"on/off, or asks generally for automated notifications/background updates, use "
+        f"set_notification_preferences directly rather than logging it as a capability gap — this is "
+        f"a real, already-built feature, just one they may not know exists."
+    )
     system_parts.append(
         "You never send anything (email, messages) without explicit confirmation from the customer first, "
         "unless they've specifically set up an approved recurring auto-send task."
