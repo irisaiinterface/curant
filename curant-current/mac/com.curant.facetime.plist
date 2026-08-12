@@ -81,6 +81,23 @@
         <key>CURANT_CALL_ACCESS_MODE</key>
         <string>approved</string>
 
+        <!-- Real bug found live: bare BlackHole 16ch as the system output
+             produces total digital silence for FaceTime call audio
+             (RMS=0.0 across all 16 channels during a genuinely connected
+             call, confirmed in a real test) , see the comment above
+             SYSTEM_OUTPUT_DEVICE in curant-facetime-answerer.py. The fix
+             is a macOS Multi-Output Device (Audio MIDI Setup, combining
+             BlackHole 16ch with the Mac's real speakers), pointing
+             system output at THAT instead of bare BlackHole 16ch while
+             still capturing caller audio from BlackHole 16ch directly.
+             "Curant Call Output" already exists on this Mac from earlier
+             testing (confirmed live via SwitchAudioSource -a -t output)
+             , this just wires it back in, since the script only uses it
+             when this env var is explicitly set (defaults to bare
+             BlackHole 16ch otherwise). -->
+        <key>CURANT_FACETIME_SYSTEM_OUTPUT_DEVICE</key>
+        <string>Curant Call Output</string>
+
         <!-- Dev/testing bypass, matching every other Curant launchd job
              this session (watcher, dailybriefing, proactive, weeklyrollup,
              meetingprep). curant-facetime-answerer.py's replies go through
