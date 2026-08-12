@@ -64,6 +64,15 @@
              Change deliberately, not by accident. -->
         <key>CURANT_ACCESS_MODE</key>
         <string>open</string>
+
+        <!-- Dev/testing bypass, matching every other Curant launchd job
+             this session (watcher, dailybriefing, proactive, weeklyrollup,
+             meetingprep). curant-facetime-answerer.py's replies go through
+             the same curant-cli relay path as texting, so without this
+             every call would get the same not_activated failure until a
+             real license is activated via curant-cli activate. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
     </dict>
 
     <key>StandardOutPath</key>
