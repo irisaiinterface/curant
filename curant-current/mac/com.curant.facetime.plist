@@ -58,12 +58,28 @@
         <key>PATH</key>
         <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
-        <!-- approved mode has no caller-ID verification for calls and
-             refuses everything by design (see SETUP_FACETIME_CALLS.md) —
-             this must be 'open' for the job to ever answer a call.
-             Change deliberately, not by accident. -->
-        <key>CURANT_ACCESS_MODE</key>
-        <string>open</string>
+        <!-- BUG FIXED: this key was previously named CURANT_ACCESS_MODE,
+             which curant-facetime-answerer.py has never actually read —
+             see _read_call_access_mode()'s docstring: the real variable
+             is CURANT_CALL_ACCESS_MODE, deliberately split from texting's
+             CURANT_TEXT_ACCESS_MODE after a real incident where a SHARED
+             key meant enabling open access for calls silently opened
+             texting to anyone too. Confirmed live: with the old wrong
+             key name, this plist silently had zero effect and the
+             process fell back to the "approved" default regardless of
+             what this said.
+
+             'approved' (explicit here, matching the code's own default)
+             does real caller-ID verification now — OCR-reads the caller
+             ID off the incoming-call banner and only answers if it
+             matches CUSTOMER_APPLE_ID/CUSTOMER_HANDLES, refusing (fails
+             CLOSED, never answers unverified) if OCR isn't available or
+             finds no match. Needs `brew install tesseract` and
+             `pip3 install pytesseract` (with the break-system-packages flag, see SETUP_FACETIME_CALLS.md) — without
+             those, every call gets refused rather than answered, which
+             is the safe failure mode, not a bug. -->
+        <key>CURANT_CALL_ACCESS_MODE</key>
+        <string>approved</string>
 
         <!-- Dev/testing bypass, matching every other Curant launchd job
              this session (watcher, dailybriefing, proactive, weeklyrollup,
