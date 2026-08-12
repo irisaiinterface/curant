@@ -43,6 +43,17 @@
     <dict>
         <key>PATH</key>
         <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching every manual run so far this
+             session (export CURANT_DEV_UNLICENSED=1 before starting the
+             watcher by hand). Needed here too now that it's running
+             unattended via launchd, since without it every relay() call
+             fails closed with "not_activated" the moment there is no
+             manual shell export backing it. REMOVE this once a real
+             license is activated via curant-cli activate. See
+             _warn_dev_unlicensed()'s own warning in curant-cli:
+             "Local development only, never set this in production." -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
     </dict>
 
     <key>StandardOutPath</key>
