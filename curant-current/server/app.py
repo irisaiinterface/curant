@@ -2246,13 +2246,19 @@ def owner_deny(request_id):
 
 def _open_browser_once_server_is_up(port):
     """
-    Auto-opens the owner dashboard in the default browser shortly after
-    startup -- purely a local-dev convenience (this is why it's gated on
-    __name__ == "__main__" below, never runs when a real WSGI server
-    imports this module for production). Runs on a background thread with
-    a short delay rather than opening immediately, since the Flask dev
-    server needs a moment to actually be listening -- opening instantly
-    risks a connection-refused page loading before the server's ready.
+    Auto-opens the customer portal (/login) in the default browser shortly
+    after startup -- purely a local-dev convenience (this is why it's
+    gated on __name__ == "__main__" below, never runs when a real WSGI
+    server imports this module for production). Runs on a background
+    thread with a short delay rather than opening immediately, since the
+    Flask dev server needs a moment to actually be listening -- opening
+    instantly risks a connection-refused page loading before the server's
+    ready.
+
+    Deliberately /login, not /owner: the person running `python app.py`
+    day to day is almost always simulating or testing the customer
+    experience, not doing owner admin work -- someone who actually needs
+    the owner dashboard knows to navigate to /owner directly.
 
     Flask's debug-mode reloader forks a second process (the one that
     actually serves requests); WERKZEUG_RUN_MAIN is only set in that
@@ -2265,7 +2271,7 @@ def _open_browser_once_server_is_up(port):
     import webbrowser
 
     def _open():
-        webbrowser.open(f"http://localhost:{port}/owner")
+        webbrowser.open(f"http://localhost:{port}/login")
 
     threading.Timer(1.0, _open).start()
 
