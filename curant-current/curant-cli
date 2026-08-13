@@ -1652,9 +1652,28 @@ def save_feature_request_local(request_text, status="logged"):
 def get_feature_requests_local():
     with closing(get_local_db()) as conn:
         rows = conn.execute(
-            "SELECT request_text, status, created_at FROM feature_requests ORDER BY id DESC"
+            "SELECT id, request_text, status, created_at FROM feature_requests ORDER BY id DESC"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def set_feature_request_status_local(request_id, status):
+    """Updates one feature_requests row's status column -- 'logged' |
+    'reviewed' | 'built' | 'declined' (see the table's own CREATE TABLE
+    comment). Used to mark capability gaps as actually fixed once code
+    ships for them, so the exported .xlsx and `curant-cli
+    feature-requests` output reflect reality instead of everything
+    sitting at 'logged' forever regardless of what's actually been
+    built."""
+    valid_statuses = {"logged", "reviewed", "built", "declined"}
+    if status not in valid_statuses:
+        raise ValueError(f"status must be one of {sorted(valid_statuses)}, got {status!r}")
+    with closing(get_local_db()) as conn:
+        cur = conn.execute(
+            "UPDATE feature_requests SET status = ? WHERE id = ?", (status, request_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 CAPABILITY_GAP_COOLDOWN_MINUTES = 15
@@ -9720,7 +9739,25 @@ def feature_requests_cmd():
         print("No feature requests submitted yet.")
         return
     for r in requests:
-        print(f"[{r['created_at']}] {r['request_text']}")
+        print(f"#{r['id']} [{r['status']}] [{r['created_at']}] {r['request_text']}")
+
+
+def mark_feature_request_cmd(request_id, status):
+    try:
+        request_id_int = int(request_id)
+    except ValueError:
+        print(f"'{request_id}' isn't a valid id — run `curant-cli feature-requests` to see ids (the #N prefix).")
+        sys.exit(1)
+    try:
+        updated = set_feature_request_status_local(request_id_int, status)
+    except ValueError as e:
+        print(str(e))
+        sys.exit(1)
+    if updated:
+        print(f"#{request_id_int} marked as '{status}'.")
+    else:
+        print(f"No feature request with id #{request_id_int} found.")
+        sys.exit(1)
 
 
 def export_capability_gaps_cmd():
@@ -9985,6 +10022,9 @@ def main():
     p_mcp_toggle.add_argument("state", choices=["on", "off"])
 
     sub.add_parser("feature-requests", help="Show feature requests submitted from this Mac")
+    p_mark_fr = sub.add_parser("mark-feature-request", help="Mark a logged capability gap's status (e.g. once it's actually been built)")
+    p_mark_fr.add_argument("id", help="The #N id shown by `curant-cli feature-requests`")
+    p_mark_fr.add_argument("status", choices=["logged", "reviewed", "built", "declined"])
     sub.add_parser("export-capability-gaps", help="Refresh the viewable .xlsx of logged capability gaps (~/.curant/capability_gaps.xlsx)")
 
     sub.add_parser("grading-assignments", help="Show Aaron's grading calibration assignments and example counts")
@@ -10155,6 +10195,8 @@ def main():
         mcp_toggle_cmd(args.name, args.state)
     elif args.command == "feature-requests":
         feature_requests_cmd()
+    elif args.command == "mark-feature-request":
+        mark_feature_request_cmd(args.id, args.status)
     elif args.command == "export-capability-gaps":
         export_capability_gaps_cmd()
     elif args.command == "grading-assignments":
