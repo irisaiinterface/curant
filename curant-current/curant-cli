@@ -10047,7 +10047,16 @@ def main():
 
     p_mcp_add = sub.add_parser("mcp-add", help="Connect a local MCP server (e.g. Gmail, Notion) — command to launch it, e.g.: npx -y @some/mcp-server")
     p_mcp_add.add_argument("name", help="A short name for this connection, e.g. 'gmail'")
-    p_mcp_add.add_argument("command", nargs=argparse.REMAINDER, help="The command to launch the MCP server, e.g. npx -y @some/mcp-server")
+    # Real bug fixed 2026-08-13: this positional was previously named "command",
+    # which collides with add_subparsers(dest="command") above -- both write to
+    # args.command, and since this subparser's own arguments are parsed AFTER
+    # the subcommand is selected, this one silently overwrote args.command with
+    # the REMAINDER list instead of the string "mcp-add". Every dispatch check
+    # below ("if args.command == 'mcp-add'") then silently failed to match, so
+    # `curant-cli mcp-add <name> <command...>` did nothing at all -- no error,
+    # no output, exit code 0 -- confirmed live. Renamed to launch_command,
+    # dispatch below updated to match.
+    p_mcp_add.add_argument("launch_command", nargs=argparse.REMAINDER, help="The command to launch the MCP server, e.g. npx -y @some/mcp-server")
 
     p_mcp_add_http = sub.add_parser("mcp-add-http", help="Connect a hosted MCP server reached by URL (e.g. Ideogram's hosted endpoint)")
     p_mcp_add_http.add_argument("name", help="A short name for this connection")
@@ -10233,7 +10242,7 @@ def main():
     elif args.command == "urgency-log":
         urgency_log_cmd(limit=args.limit)
     elif args.command == "mcp-add":
-        mcp_add_cmd(args.name, args.command)
+        mcp_add_cmd(args.name, args.launch_command)
     elif args.command == "mcp-add-http":
         mcp_add_http_cmd(args.name, args.url, args.headers)
     elif args.command == "mcp-add-oauth":
