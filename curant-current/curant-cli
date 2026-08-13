@@ -1657,6 +1657,63 @@ def get_feature_requests_local():
         return [dict(r) for r in rows]
 
 
+CAPABILITY_GAP_COOLDOWN_MINUTES = 15
+# Real bug this guards against (seen live 2026-08-13): given an
+# unresolved capability gap sitting recently in conversation history,
+# the model sometimes treats a vague/short follow-up ("Hi", "Hello?",
+# "Hi?" -- not a new request at all) as a cue to proactively re-surface
+# and re-log the SAME gap, calling log_capability_gap again each time.
+# That re-texts the owner and re-recites the "call ___ for a quote"
+# notice to the customer on every single greeting, which reads as
+# broken/spammy. This is a genuine model-behavior issue, not just a
+# wording one, so it's guarded here in code rather than relying only on
+# a system-prompt instruction (see build_system_prompt's
+# log_capability_gap guidance) to never re-trigger it. A near-duplicate
+# description logged within this many minutes is treated as "already
+# flagged" rather than logged and texted out again -- see
+# _is_similar_capability_gap() and its use in log_capability_gap().
+
+
+def _is_similar_capability_gap(a, b, threshold=0.3):
+    """Cheap word-overlap similarity (Jaccard over lowercased alnum
+    tokens) -- deliberately not exact-string matching, since the model
+    phrases a re-surfaced gap slightly differently each time (e.g.
+    "Direct email access / reading CAP Gmail inbox" vs. "Directly
+    reading or connecting to Civil Air Patrol (CAP) Gmail email inbox"
+    -- both hit live, clearly the same underlying gap, zero characters
+    in common as exact strings). Not meant to be a precise NLP
+    similarity measure, just good enough to catch "basically the same
+    thing worded differently" without an extra LLM call."""
+    tokens_a = set(re.findall(r"[a-z0-9]+", (a or "").lower()))
+    tokens_b = set(re.findall(r"[a-z0-9]+", (b or "").lower()))
+    if not tokens_a or not tokens_b:
+        return False
+    overlap = len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
+    return overlap >= threshold
+
+
+def _recently_logged_similar_gap(description):
+    """Returns the most recent feature_requests row if it's both within
+    CAPABILITY_GAP_COOLDOWN_MINUTES and similar enough to `description`
+    to be the same underlying gap re-surfacing -- else None. Two
+    DIFFERENT genuine gaps arriving close together (e.g. customer asks
+    about two unrelated unsupported things back to back) are NOT
+    suppressed, only re-surfacing of the same one."""
+    rows = get_feature_requests_local()
+    if not rows:
+        return None
+    most_recent = rows[0]
+    try:
+        logged_at = datetime.strptime(most_recent["created_at"], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    if datetime.utcnow() - logged_at > timedelta(minutes=CAPABILITY_GAP_COOLDOWN_MINUTES):
+        return None
+    if not _is_similar_capability_gap(description, most_recent["request_text"]):
+        return None
+    return most_recent
+
+
 CAPABILITY_GAPS_XLSX_PATH = os.path.join(CONFIG_DIR, "capability_gaps.xlsx")
 
 
@@ -5985,6 +6042,23 @@ def status():
         print("Inactive — subscription may have lapsed. Check curant.app/billing.")
 
 
+def set_quote_phone_cmd(number):
+    """Self-serve setter for get_quote_phone_number()'s config value —
+    same simple show/set pattern as set_spend_cap_cmd. No argument shows
+    the current value (or that none is set, in which case the
+    "call ___" clause is just omitted from capability-gap replies)."""
+    config = load_config()
+    if number is None:
+        current = config.get("quote_phone_number")
+        print(f"Current quote phone number: {current}" if current
+              else "No quote phone number set — capability-gap replies will omit the \"call ___\" "
+                   "line until you set one with `curant-cli set-quote-phone <number>`.")
+        return
+    config["quote_phone_number"] = number.strip()
+    save_config(config)
+    print(f"Quote phone number set to: {config['quote_phone_number']}")
+
+
 def set_spend_cap_cmd(amount):
     """
     Self-serve — this is the customer's own spend limit on their own API
@@ -6210,9 +6284,33 @@ def propose_code_fix_for_gap(description, config):
         print(f"[code proposal] submit failed (non-fatal): {e}", file=sys.stderr)
 
 
-QUOTE_PHONE_NUMBER = "REPLACE_WITH_REAL_PHONE_NUMBER"  # the actual business line to call for
-                                                          # custom development quotes — fill in
-                                                          # once there's a real number to give out
+QUOTE_PHONE_NUMBER = "REPLACE_WITH_REAL_PHONE_NUMBER"  # unused literal placeholder — see
+                                                          # get_quote_phone_number() below, which is
+                                                          # what actually gets called now. Left defined
+                                                          # (not deleted) only so the old name still
+                                                          # resolves if something else in this file
+                                                          # references it; every real use-site was
+                                                          # switched to the function.
+
+
+def get_quote_phone_number(config):
+    """Real bug fixed 2026-08-13: QUOTE_PHONE_NUMBER above was a bare
+    literal that had never been filled in, and log_capability_gap was
+    reciting it verbatim to real customers ("call
+    REPLACE_WITH_REAL_PHONE_NUMBER") — a placeholder value leaking
+    straight into customer-facing text because there was no fallback
+    behavior for "not configured yet," just an assumption someone would
+    remember to edit the constant before shipping.
+
+    Reads config['quote_phone_number'] instead (settable via
+    `curant-cli set-quote-phone <number>` or directly in
+    ~/.curant/config.json) and returns None if it isn't set, so callers
+    can omit the "call ___" clause entirely rather than print a
+    placeholder. A missing phone number should degrade to "no call-to-
+    action for a paid quote yet," never to a broken-looking string sent
+    to a real customer."""
+    number = (config.get("quote_phone_number") or "").strip()
+    return number or None
 
 
 def log_capability_gap(description):
@@ -6242,7 +6340,24 @@ def log_capability_gap(description):
     for the LOGGING itself: this doesn't need confirmation before being
     called, since logging locally + texting the owner has no side effect
     on anyone but the person running this Mac.
+
+    Checks _recently_logged_similar_gap() first -- see that function and
+    CAPABILITY_GAP_COOLDOWN_MINUTES's comment for the real bug this
+    guards against (the model re-surfacing/re-logging the same
+    unresolved gap on unrelated follow-up messages, spamming the owner
+    and reciting the quote-call notice repeatedly). A genuine duplicate
+    within the cooldown window still isn't silently dropped -- it
+    returns a short, honest "already flagged" reply instead of pretending
+    nothing happened, and does NOT re-text the owner or re-export the
+    xlsx for something already reflected there.
     """
+    duplicate = _recently_logged_similar_gap(description)
+    if duplicate:
+        print(f"[capability gap] \"{description}\" -- treating as a duplicate of "
+              f"\"{duplicate['request_text']}\" logged at {duplicate['created_at']} "
+              f"(within {CAPABILITY_GAP_COOLDOWN_MINUTES}min cooldown), not re-notifying", file=sys.stderr)
+        return "Already flagged that one a few minutes ago — no need to log it again."
+
     save_feature_request_local(description, status="logged")
 
     xlsx_path = None
@@ -6303,17 +6418,20 @@ def log_capability_gap(description):
 
     try:
         owner = config.get("customer_apple_id")
+        quote_phone = get_quote_phone_number(config)
         if owner:
+            if forwarded_to_owner_directly:
+                tail = "— flagged directly to Abhy as a priority build request, no need to call anyone."
+            elif quote_phone:
+                tail = (f"— let me know if you want to prioritize building it, or if it's worth a "
+                        f"custom quote (call {quote_phone}).")
+            else:
+                tail = "— let me know if you want to prioritize building it."
             send_imessage(
                 owner,
                 f"(Capability gap logged) Just hit something I can't do yet: \"{description}\". "
                 f"Full list is at {CAPABILITY_GAPS_XLSX_PATH} on this Mac (kept in sync automatically) "
-                + (
-                    "— flagged directly to Abhy as a priority build request, no need to call anyone."
-                    if forwarded_to_owner_directly else
-                    f"— let me know if you want to prioritize building it, or if it's worth a custom "
-                    f"quote (call {QUOTE_PHONE_NUMBER})."
-                )
+                + tail
             )
         else:
             print("[capability gap] no customer_apple_id configured -- couldn't text a notice, "
@@ -6324,8 +6442,12 @@ def log_capability_gap(description):
     if forwarded_to_owner_directly:
         return ("Logged and flagged directly to Abhy as a priority build request — "
                 "no need to call anyone.")
-    return (f"Logged. For custom work like this, they'd need to call {QUOTE_PHONE_NUMBER} "
-            f"for a quote — Curant doesn't build one-off custom features for free.")
+    quote_phone = get_quote_phone_number(config)
+    if quote_phone:
+        return (f"Logged. For custom work like this, they'd need to call {quote_phone} "
+                f"for a quote — Curant doesn't build one-off custom features for free.")
+    return ("Logged. Curant doesn't build one-off custom features for free — I'll flag this "
+            "one for review.")
 
 
 IMAGE_MIME_TYPES = {
@@ -6589,7 +6711,13 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         "If the customer asks for something you genuinely can't do (no tool covers it, and it's not "
         "something you can just help with by reasoning/writing), say so plainly, then let them know "
         "Curant can build custom things like that for a quote — they'd need to call in for that, "
-        "it's not something available for free. Log it with log_capability_gap so it's tracked."
+        "it's not something available for free. Log it with log_capability_gap so it's tracked. "
+        "Only call log_capability_gap when THIS message is itself a new, real request — never because "
+        "an earlier message in the conversation history mentioned something you couldn't do. A short or "
+        "vague follow-up like \"hi\", \"hello?\", or \"you there?\" is just a greeting or a check that "
+        "you're responsive — answer it as that, plainly, don't treat it as a cue to re-raise or re-log "
+        "something unresolved from earlier in the conversation. If the customer wants to bring an old "
+        "capability gap back up, they'll say so themselves."
     )
     system_parts.append(
         "If asked what you can help with, or what Curant does, give a real, specific answer reflecting "
@@ -9807,6 +9935,10 @@ def main():
     p_spend_cap.add_argument("amount", nargs="?", default=None,
                               help="Dollar amount, e.g. '25' or '25.00'. Use 'none' to remove the cap entirely. Omit to just view the current cap and this month's spend.")
 
+    p_quote_phone = sub.add_parser("set-quote-phone", help="Set (or view) the phone number given out for custom-work quotes when a capability gap is logged")
+    p_quote_phone.add_argument("number", nargs="?", default=None,
+                                help="Phone number to give out, e.g. '555-123-4567'. Omit to just view the current value.")
+
     sub.add_parser("remaining-generation-balance", help="Internal — prints the one-line remaining-budget "
                     "string, used by curant-watcher.py to append it after delivering a completed video job")
 
@@ -9989,6 +10121,8 @@ def main():
         status()
     elif args.command == "set-spend-cap":
         set_spend_cap_cmd(args.amount)
+    elif args.command == "set-quote-phone":
+        set_quote_phone_cmd(args.number)
     elif args.command == "remaining-generation-balance":
         line = format_remaining_generation_balance(load_config())
         if line:
