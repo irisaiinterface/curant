@@ -6640,6 +6640,33 @@ def relationship_state_cmd():
         print(f"  Note: {state['note']}")
 
 
+def _current_time_context_str(config):
+    """Real gap fixed 2026-08-13: build_system_prompt never told the
+    model what time it currently is, anywhere. Every other piece of
+    "now"-relative behavior in this file (quiet hours, relationship-
+    state freshness, background job timeouts) computes its own
+    datetime.now() internally, but the MODEL ITSELF -- the thing
+    actually answering "what time is it", converting "brief me at 7pm"
+    to a stored HH:MM, or reasoning about "in 2 hours"/"tomorrow" -- had
+    no grounding on the current date/time at all and could only guess.
+    Reuses the same travel_timezone-or-local-system-time logic as
+    _is_quiet_hours_now for consistency -- whatever timezone quiet hours
+    already treats as authoritative is what the model should reason
+    against too."""
+    now = datetime.now()
+    tz_label = "this Mac's local time"
+    tz_name = config.get("travel_timezone")
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(tz_name))
+            tz_label = tz_name
+        except Exception:
+            pass  # fall back to local time if the stored tz somehow became invalid
+    formatted = now.strftime("%A, %B %d, %Y, %I:%M %p").lstrip("0").replace(" 0", " ")
+    return f"Right now it is {formatted} ({tz_label})."
+
+
 def build_system_prompt(config, memories, people, live_context, extra_instruction=None,
                         active_provider=None, is_first_message=False, urgency=None,
                         relationship_state=None):
@@ -6647,6 +6674,12 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
     addons = config.get("unlocked_addons", [])
 
     system_parts = [persona_prompt]
+    system_parts.append(
+        _current_time_context_str(config) + " Use this as your ground truth for the current date/time "
+        "-- when the customer says something time-relative (\"in 2 hours\", \"tomorrow morning\", "
+        "\"7pm tonight\", \"what time is it\"), compute it from this, don't guess or say you don't "
+        "know what time it is."
+    )
     if relationship_state:
         # Grace-exclusive (see get_relationship_state) -- this is what makes
         # memory shape HOW you talk to this specific customer, not just WHAT
