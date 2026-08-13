@@ -1748,7 +1748,64 @@ PROVIDER_MODELS = {
     # confirmed for gemini-3.5-flash specifically) — if this ALSO 429s,
     # the improved watcher error surfacing will show the real limit
     # number directly, same as it did for 3.6-flash.
-    "gemini": {"main": "gemini-3.5-flash", "fast": "gemini-3.5-flash-lite"},
+    # "main"/"fast" here are just the PRIMARY pick shown in setup/status
+    # output -- the actual retry behavior for gemini specifically comes
+    # from GEMINI_MODEL_CHAINS below, not from cycling between these two
+    # entries (see _model_fallback_chain()). Values here are chain[0] of
+    # the corresponding GEMINI_MODEL_CHAINS list, kept in sync by hand.
+    "gemini": {"main": "gemini-3.6-flash", "fast": "gemini-3.1-flash-lite"},
+}
+
+# Ordered gemini fallback chains, built 2026-08-13 directly off AI
+# Studio's rate-limit dashboard (requests-per-minute / requests-per-day
+# for each model, read live) after gemini-3.5-flash and
+# gemini-3.5-flash-lite -- the only two models previously in rotation --
+# both hit their daily caps from a self-message-echo-loop bug burning
+# through quota before it was caught. Every model below shares the same
+# API key/project, so they're genuinely separate quota buckets, same
+# logic as the original two-model fallback this replaces.
+#
+# "main" (texts, curant-watcher's relay calls): ordered by reply quality
+# first, newest/flagship models tried before older ones, so a customer
+# text gets the best available model that still has quota. Deliberately
+# does NOT prioritize by quota size -- a text is one request, not a
+# multi-turn budget problem the way a live call is.
+#
+# "fast" (live FaceTime calls, tier="fast" via curant-cli relay --
+# distinct from curant-facetime-answerer.py's own GEMINI_CALL_MODEL_CHAIN
+# used for transcription, which mirrors this ordering separately since
+# it's a different process/SDK path): ordered by daily-quota depth
+# first -- a multi-turn call can burn through a 20/day cap in one
+# conversation, so the lite models with the deepest daily budgets
+# (gemini-3.1-flash-lite and gemini-3.5-flash-lite, both 500 RPD) are
+# tried before anything capped at 20/day, quality being a secondary
+# concern for a low-latency relay leg.
+#
+# Left out deliberately: gemini-2-flash/gemini-2-flash-lite/gemini-2.5-pro
+# (0/0 on this API key/project -- not enabled, would just fail
+# immediately every time), and the Gemma 4 models (huge free quota --
+# 30 RPM / 14.4K RPD -- but a different model family not confirmed to
+# support this codebase's tool-calling or native-audio paths; worth
+# revisiting as a true last resort if the chains below are ever
+# insufficient).
+GEMINI_MODEL_CHAINS = {
+    "main": [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
+    ],
+    "fast": [
+        "gemini-3.1-flash-lite",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash",
+        "gemini-2.5-flash",
+        "gemini-3.6-flash",
+    ],
 }
 
 DEFAULT_PROVIDER = "anthropic"
@@ -4807,18 +4864,28 @@ def _is_quota_error(e):
 
 
 def _model_fallback_chain(provider, tier):
-    """Ordered list of models to try for one call: the requested tier's
-    own configured model first, then every OTHER tier's model for the
-    same provider as fallbacks. Deliberately reuses only already-
-    configured, known-good model names (see PROVIDER_MODELS) rather than
-    guessing at additional model names that might not exist or might not
-    be enabled on this API key. Real basis for why this helps at all,
-    not just theoretical: live testing on 2026-08-08 hit RESOURCE_EXHAUSTED
-    on gemini-3.5-flash (the "main" model) while gemini-3.5-flash-lite
-    (the "fast" model, same API key, same day) was still serving requests
-    fine -- different models draw from separate free-tier quota buckets,
-    so falling through to another tier's model is a real way to keep
-    answering, not a no-op."""
+    """Ordered list of models to try for one call.
+
+    For gemini: uses the full ordered GEMINI_MODEL_CHAINS[tier] list (up
+    to 6-7 models deep, see that dict's comment for how the ordering was
+    derived from AI Studio's live rate-limit dashboard). For every other
+    provider: falls back to the older, simpler behavior -- the requested
+    tier's own configured model first, then every OTHER tier's model for
+    the same provider, since anthropic/openai only have the two-entry
+    main/fast split with no deeper chain defined.
+
+    Real basis for why this helps at all, not just theoretical: live
+    testing on 2026-08-08 hit RESOURCE_EXHAUSTED on gemini-3.5-flash (the
+    "main" model) while gemini-3.5-flash-lite ("fast", same API key, same
+    day) was still serving requests fine -- different models draw from
+    separate free-tier quota buckets, so falling through to another
+    model is a real way to keep answering, not a no-op. Confirmed again
+    live on 2026-08-13 when gemini-3.5-flash AND gemini-3.5-flash-lite
+    both hit their daily caps simultaneously -- the two-model chain
+    wasn't deep enough that time, hence the move to the longer
+    GEMINI_MODEL_CHAINS list."""
+    if provider == "gemini":
+        return list(GEMINI_MODEL_CHAINS[tier])
     models = PROVIDER_MODELS[provider]
     chain = [models[tier]]
     for other_tier, other_model in models.items():

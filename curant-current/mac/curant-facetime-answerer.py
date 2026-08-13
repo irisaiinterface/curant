@@ -1497,16 +1497,34 @@ def _config_api_key(cfg, provider):
     return (cfg.get("api_keys", {}) or {}).get(provider)
 
 
-GEMINI_CALL_MODEL = "gemini-3.5-flash-lite"
-# Live calls need a model with a generous free-tier daily quota, not the
-# highest-quality one — gemini-3.6-flash's free tier is capped at only
-# 20 requests/day (confirmed live: hit RESOURCE_EXHAUSTED after a single
-# test turn), while gemini-3.5-flash-lite's free tier allows far more
-# requests/day. A live caller generates one transcription request per
-# turn, so a multi-turn call burns through the 3.6-flash cap almost
-# immediately. Texts (curant-cli relay's "main" tier) stay on the
-# higher-quality gemini-3.6-flash since they aren't latency/quota
-# constrained the same way — see PROVIDER_MODELS in curant-cli.
+# Ordered fallback chain for live-call transcription, mirroring
+# curant-cli's GEMINI_MODEL_CHAINS["fast"] (kept as a separate literal
+# here rather than imported, since this is a standalone process/SDK
+# path using the native google-genai client, not curant-cli's
+# OpenAI-compat call_llm()/_model_fallback_chain() machinery — see that
+# file for the full rationale and the AI Studio dashboard numbers this
+# ordering was derived from). Lite models with the deepest daily quota
+# (500 RPD) come first since a single multi-turn call generates one
+# transcription request per turn and can burn through a 20/day cap
+# fast; quality is a secondary concern for this leg.
+GEMINI_CALL_MODEL_CHAIN = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash",
+    "gemini-2.5-flash",
+    "gemini-3.6-flash",
+]
+GEMINI_CALL_MODEL = GEMINI_CALL_MODEL_CHAIN[0]  # kept for any external reference to a single "the" call model
+
+
+def _is_quota_error(e):
+    """Same detection logic as curant-cli's _is_quota_error() — kept as
+    a separate copy since this is a standalone process/SDK path (see
+    GEMINI_CALL_MODEL_CHAIN comment above for why it isn't imported)."""
+    msg = str(e).lower()
+    return ("429" in msg or "resource_exhausted" in msg or "resource exhausted" in msg
+            or "rate limit" in msg or "quota" in msg)
 
 
 def _transcribe_gemini(wav_path, api_key):
@@ -1514,8 +1532,13 @@ def _transcribe_gemini(wav_path, api_key):
     service needed if you're already on Gemini for replies. Uses the
     same native google-genai SDK as curant-cli's Gemini tool-calling
     path (not the OpenAI-compat shim, which doesn't reliably support
-    audio input). Deliberately pins a cheaper/higher-quota model than
-    curant-cli's "main" tier — see GEMINI_CALL_MODEL comment above."""
+    audio input).
+
+    Walks GEMINI_CALL_MODEL_CHAIN on a quota/rate-limit error instead of
+    failing the whole call turn outright — mirrors curant-cli's
+    call_llm()/_model_fallback_chain(). A non-quota error (bad key,
+    network failure, etc.) is NOT retried against another model; it
+    propagates immediately, same as before this change."""
     from google import genai
     from google.genai import types as genai_types
 
@@ -1523,17 +1546,30 @@ def _transcribe_gemini(wav_path, api_key):
     with open(wav_path, "rb") as f:
         audio_bytes = f.read()
 
-    response = client.models.generate_content(
-        model=GEMINI_CALL_MODEL,
-        contents=[
-            "Transcribe this audio verbatim. Reply with ONLY the transcript "
-            "text, nothing else — no commentary, no quotation marks. If "
-            "there is no discernible speech (silence or just noise), reply "
-            "with an empty string.",
-            genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
-        ],
+    last_err = None
+    for i, model in enumerate(GEMINI_CALL_MODEL_CHAIN):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    "Transcribe this audio verbatim. Reply with ONLY the transcript "
+                    "text, nothing else — no commentary, no quotation marks. If "
+                    "there is no discernible speech (silence or just noise), reply "
+                    "with an empty string.",
+                    genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav"),
+                ],
+            )
+            return (response.text or "").strip()
+        except Exception as e:
+            if not _is_quota_error(e):
+                raise
+            last_err = e
+            more = (f"trying next model ({GEMINI_CALL_MODEL_CHAIN[i + 1]})"
+                     if i + 1 < len(GEMINI_CALL_MODEL_CHAIN) else "no more models left to try")
+            print(f"[quota] gemini/{model} hit a rate/quota limit ({e}) -- {more}.", file=sys.stderr)
+    raise RuntimeError(
+        f"Every model in GEMINI_CALL_MODEL_CHAIN hit a rate/quota limit. Last error: {last_err}"
     )
-    return (response.text or "").strip()
 
 
 def _transcribe_openai_whisper(wav_path, api_key):
