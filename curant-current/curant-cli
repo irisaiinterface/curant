@@ -32,6 +32,7 @@ from __future__ import annotations  # PEP 604 `X | Y` unions used throughout thi
 
 import argparse
 import asyncio
+import getpass
 import json
 import re
 import socket
@@ -8213,6 +8214,103 @@ def _wizard_prompt(prompt_text, default=None):
     return raw if raw else default
 
 
+def setup_wizard_cmd():
+    """
+    A friendlier front door onto first-time setup, available to every
+    customer regardless of tier (unlike onboarding_wizard_cmd, which is
+    Grace-exclusive and covers a different, more advanced set of
+    settings). This exists because the bare-minimum path to a working
+    Curant -- activate, pick a provider, paste in an API key, and say
+    who Curant should listen to -- was otherwise only discoverable by
+    reading docs and running four separate `curant-cli` commands with
+    positional/flag arguments, one of which (the API key) shouldn't be
+    typed as a plain CLI argument at all (see set-api-key's own
+    getpass-based prompt, used here too).
+
+    Everything this collects stays local -- activation aside (a
+    billing/entitlement check against the server, same as always), the
+    API key and customer_apple_id/customer_handles entered here are
+    written straight to ~/.curant/config.json and never touch Curant's
+    server, exactly like running the equivalent `curant-cli set-*`
+    commands by hand would. This is deliberately NOT a web form for
+    that reason -- see the same design note on update_customer_preferences
+    in server/app.py.
+
+    Requires an interactive terminal, same as onboarding_wizard_cmd.
+    """
+    if not sys.stdin.isatty():
+        print("Setup needs an interactive terminal -- run `curant-cli setup` directly "
+              "in a terminal, not from a script.")
+        sys.exit(1)
+
+    print("Let's get Curant set up. Press Enter on any question to skip it.\n")
+
+    config = load_config()
+
+    # 1. Activation
+    if not config.get("license_key"):
+        key_answer = _wizard_prompt("License key (leave blank to skip activation for now): ")
+        if key_answer:
+            activate(key_answer)
+            config = load_config()
+        else:
+            print("Skipping activation -- most things won't work until you run "
+                  "`curant-cli activate <key>` later.")
+    else:
+        print(f"Already activated (license {config['license_key'][:8]}...).")
+
+    # 2. Provider
+    current_provider = get_provider(config)
+    provider_answer = _wizard_prompt(
+        f"Which provider should Curant use for replies? [{', '.join(PROVIDER_MODELS)}] "
+        f"(current: {current_provider}) "
+    )
+    if provider_answer:
+        set_provider(provider_answer)
+        config = load_config()
+
+    # 3. API key -- getpass, never echoed, never a plain CLI argument
+    provider_for_key = get_provider(config)
+    if get_api_key(config, provider_for_key):
+        key_answer = _wizard_prompt(
+            f"An API key is already saved for {provider_for_key}. Replace it? [y/N] ",
+            default="n",
+        )
+        replace_key = key_answer.lower().startswith("y")
+    else:
+        replace_key = True
+    if replace_key:
+        api_key = getpass.getpass(f"Paste your {provider_for_key} API key (input hidden): ").strip()
+        if api_key:
+            set_api_key(api_key, provider=provider_for_key)
+        else:
+            print("No key entered -- skipping.")
+
+    # 4. Customer identity -- who Curant listens to. Local-only, same
+    # fields the web dashboard's preferences form can also set (see
+    # update_customer_preferences in server/app.py) -- whichever path a
+    # customer uses, both land in the same config fields.
+    config = load_config()
+    current_id = config.get("customer_apple_id")
+    id_answer = _wizard_prompt(
+        f"Phone number or Apple ID Curant should listen for messages/calls from "
+        f"(current: {current_id or 'not set'}): "
+    )
+    if id_answer:
+        config["customer_apple_id"] = id_answer
+        save_config(config)
+
+    handles_answer = _wizard_prompt(
+        "Any extra handles (comma-separated, optional): "
+    )
+    if handles_answer:
+        config = load_config()
+        config["customer_handles"] = [h.strip() for h in handles_answer.split(",") if h.strip()]
+        save_config(config)
+
+    print("\nSetup done. Run `curant-cli status` to confirm everything's active.")
+
+
 def onboarding_wizard_cmd():
     """
     Grace-exclusive guided setup -- walks a new executive customer
@@ -9545,7 +9643,7 @@ def main():
     p_activate.add_argument("license_key")
 
     p_key = sub.add_parser("set-api-key", help="Store your own API key locally, for a given provider (never sent to Curant's server)")
-    p_key.add_argument("api_key")
+    p_key.add_argument("api_key", nargs="?", default=None, help="Leave this blank to be prompted instead -- typing the key directly as an argument leaves it sitting in your shell history and briefly visible to other processes via `ps`.")
     p_key.add_argument("--provider", default=None, choices=sorted(PROVIDER_MODELS) + sorted(GENERATION_SERVICES), help="Which provider or specialist service this key is for (default: your currently configured LLM provider)")
 
     p_persona = sub.add_parser("set-persona", help="Switch which persona (tone/system prompt) Curant uses — same instructions/memories carry over")
@@ -9713,6 +9811,8 @@ def main():
     p_full_export = sub.add_parser("full-export", help="Grace-exclusive: encrypted export including memories and important people, not just settings (passphrase prompted)")
     p_full_export.add_argument("--path", default=None, help="Where to write the export file (default: ~/.curant/full_export.curantexport)")
 
+    p_setup = sub.add_parser("setup", help="Guided first-time setup for everyone: activation, provider, API key (prompted securely, not typed as an argument), and who Curant listens to")
+
     p_onboarding_wizard = sub.add_parser("onboarding-wizard", help="Grace-exclusive: guided interactive setup for persona, voice, quiet hours, travel timezone, briefing, backups, VIPs, and delegates")
 
     p_backup_restore = sub.add_parser("backup-restore", help="Restore from a local encrypted settings backup (passphrase prompted, not a CLI arg)")
@@ -9739,7 +9839,13 @@ def main():
     if args.command == "activate":
         activate(args.license_key)
     elif args.command == "set-api-key":
-        set_api_key(args.api_key, provider=args.provider)
+        api_key = args.api_key
+        if not api_key:
+            api_key = getpass.getpass("Paste your API key (input hidden, not echoed): ").strip()
+            if not api_key:
+                print("No key entered -- nothing saved.")
+                sys.exit(1)
+        set_api_key(api_key, provider=args.provider)
     elif args.command == "set-persona":
         set_persona(args.persona)
     elif args.command == "set-voice":
@@ -9852,6 +9958,8 @@ def main():
         backup_now(args.path)
     elif args.command == "full-export":
         full_export_cmd(args.path)
+    elif args.command == "setup":
+        setup_wizard_cmd()
     elif args.command == "onboarding-wizard":
         onboarding_wizard_cmd()
     elif args.command == "backup-restore":
