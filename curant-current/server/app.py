@@ -2323,10 +2323,18 @@ def _open_browser_once_server_is_up(port):
 if __name__ == "__main__":
     init_db()
     PORT = 5050
+    # Debug mode (reloader + auto-browser-open) is a manual-run convenience,
+    # not appropriate for an unattended background service -- set
+    # CURANT_SERVER_DEBUG=false when this runs under launchd (see
+    # mac/com.curant.server.plist) so a crash doesn't spin up a duplicate
+    # reloader child that launchd's KeepAlive then loses track of, and so
+    # it doesn't try to pop open a browser window on every restart.
+    debug_mode = os.environ.get("CURANT_SERVER_DEBUG", "true").lower() == "true"
     print("")
     print("Curant server starting -- open one of these once it's up:")
     print(f"  Owner dashboard:    http://localhost:{PORT}/owner")
     print(f"  Customer dashboard: http://localhost:{PORT}/login")
     print("")
-    _open_browser_once_server_is_up(PORT)
-    app.run(port=PORT, debug=True)
+    if debug_mode:
+        _open_browser_once_server_is_up(PORT)
+    app.run(port=PORT, debug=debug_mode)

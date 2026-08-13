@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
+        <string>/Users/AbhyudayDhundhel/curant/curant-current/server/app.py</string>
+    </array>
+
+    <!-- Flask's relative CURANT_DB_PATH default ("curant.db") and
+         render_template_string calls both assume the process is running
+         from inside server/ , launchd does not cd there on its own, so
+         this has to be set explicitly or the customers table ends up
+         created in the wrong directory every restart. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/AbhyudayDhundhel/curant/curant-current/server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Generated once (python3 -c "import secrets; print(secrets.token_hex(32))")
+             and baked in here rather than left unset , without a fixed
+             value the server invents a new one on every restart (see
+             app.py's own warning), which would silently kill every owner
+             login session each time launchd restarts this job. -->
+        <key>CURANT_SECRET_KEY</key>
+        <string>8300364adf4562474260a8108964498425f1bdb23e256a4ec8b7643d279343cf</string>
+        <!-- Disables Flask's debug reloader + auto-browser-open , see
+             app.py's own comment on why those are wrong for an
+             unattended service. -->
+        <key>CURANT_SERVER_DEBUG</key>
+        <string>false</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-server-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.server.plist ~/Library/LaunchAgents/
+  launchctl bootout gui/$(id -u)/app.curant.server 2>/dev/null
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.server.plist
+
+Check it's running:
+  launchctl print gui/$(id -u)/app.curant.server | grep -E "state|program"
+
+This is the local license/billing server (server/app.py) , runs on
+127.0.0.1:5050 permanently in the background so the customer dashboard
+(/login) and owner dashboard (/owner) are always reachable, and so
+curant-cli's periodic status recheck never sees connection-refused.
+Logs land at /tmp/curant-server.log and /tmp/curant-server-error.log.
+-->
