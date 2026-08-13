@@ -289,6 +289,25 @@ def _read_text_access_mode():
 ACCESS_MODE = _read_text_access_mode()
 POLL_INTERVAL_SECONDS = 5
 LAST_SEEN_ROWID_FILE = os.path.expanduser("~/.curant/last_seen_rowid")
+LAST_CUSTOM_BRIEFING_DATE_FILE = os.path.expanduser("~/.curant/last_custom_briefing_date")
+# Real capability gap fixed 2026-08-13 ("schedule a custom/one-off
+# briefing at a specific time, e.g. 19:00" -- logged live, customer
+# actually wants this): the daily briefing was ONLY ever fireable at
+# the two fixed times baked into com.curant.dailybriefing.plist (9am,
+# 5pm) -- there was no way to add a customer-chosen third time without
+# editing and reinstalling that plist by hand. Rather than generate a
+# per-customer plist (real deploy complexity for something this main
+# polling loop can already check cheaply), a custom time is handled
+# entirely in-process here: every poll (every POLL_INTERVAL_SECONDS)
+# checks whether the current local HH:MM matches
+# config["custom_briefing_time"] (set via curant-cli's
+# set_notification_preferences tool) and, if so and it hasn't already
+# fired today, runs the exact same run_daily_briefing() used by the
+# 9am/5pm plist-triggered path. LAST_CUSTOM_BRIEFING_DATE_FILE persists
+# which calendar date it last fired on so a multi-second poll interval
+# can't send it more than once within the same matching minute, and so
+# a watcher restart mid-day doesn't re-fire something already sent
+# today.
 
 
 def report_watcher_error(error_code):
@@ -941,6 +960,44 @@ def run_proactive_check():
         send_text_reply(CUSTOMER_APPLE_ID, message_text)
 
 
+def _get_last_custom_briefing_date():
+    if os.path.exists(LAST_CUSTOM_BRIEFING_DATE_FILE):
+        with open(LAST_CUSTOM_BRIEFING_DATE_FILE) as f:
+            return f.read().strip()
+    return ""
+
+
+def _save_last_custom_briefing_date(date_str):
+    os.makedirs(os.path.dirname(LAST_CUSTOM_BRIEFING_DATE_FILE), exist_ok=True)
+    with open(LAST_CUSTOM_BRIEFING_DATE_FILE, "w") as f:
+        f.write(date_str)
+
+
+def check_custom_briefing_time():
+    """Called every poll from main()'s loop (see LAST_CUSTOM_BRIEFING_DATE_FILE's
+    comment above for the full rationale). Cheap on every call that
+    doesn't match: one config read, one time.strftime comparison, no
+    subprocess spawned unless it's actually time to send."""
+    try:
+        with open(os.path.expanduser("~/.curant/config.json")) as f:
+            cfg = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    custom_time = (cfg.get("custom_briefing_time") or "").strip()
+    if not custom_time:
+        return
+    now = time.localtime()
+    current_hhmm = time.strftime("%H:%M", now)
+    today = time.strftime("%Y-%m-%d", now)
+    if current_hhmm != custom_time:
+        return
+    if _get_last_custom_briefing_date() == today:
+        return  # already sent today -- don't re-fire every poll within the same minute
+    _save_last_custom_briefing_date(today)
+    print(f"Custom briefing time {custom_time} reached -- sending.", file=sys.stderr)
+    run_daily_briefing()
+
+
 def run_daily_briefing():
     """
     Executive daily briefing, on by default for every customer --
@@ -1447,6 +1504,7 @@ def main():
                 last_rowid = msg["rowid"]
                 save_last_seen_rowid(last_rowid)
             deliver_completed_background_jobs()
+            check_custom_briefing_time()
         except sqlite3.OperationalError as e:
             print(f"Watcher error reading chat.db: {e}", file=sys.stderr)
             report_watcher_error("chatdb_read_failed")
