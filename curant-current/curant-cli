@@ -5435,9 +5435,20 @@ def activate(license_key):
     config.setdefault("instructions", "")
     config["last_status_check"] = time.time()
     config["last_status_active"] = True
+    # Apply customer_apple_id/customer_handles (and anything else synced
+    # via the dashboard) immediately at activation, not just on the next
+    # periodic /v1/status recheck up to STATUS_RECHECK_SECONDS later --
+    # a customer who filled in "who should Curant listen to" on the web
+    # dashboard before running `activate` shouldn't have to wait hours
+    # for curant-watcher.py to stop refusing to start.
+    apply_synced_preferences_if_newer(config, result)
     save_config(config)
     init_local_db()
     print(f"Activated. Welcome, {result.get('customer_name', 'there')} — your Curant is ready.")
+    if not config.get("customer_apple_id"):
+        print("Note: no phone number/Apple ID is set for Curant to listen to yet. Set it at "
+              "curant.app/dashboard (or run curant-cli directly against ~/.curant/config.json) "
+              "before starting the watcher, or it will refuse to run.")
     if not get_api_key(config):
         print(f"One more step: run `curant-cli set-api-key <your-api-key>` to connect your "
               f"own {get_provider(config)} API key. This stays on your Mac only — it is never "
@@ -5779,6 +5790,8 @@ def apply_synced_preferences_if_newer(config, status_result):
     persona = status_result.get("persona")
     instructions = status_result.get("instructions")
     voice_tier = status_result.get("voice_tier")
+    customer_apple_id = status_result.get("customer_apple_id")
+    customer_handles = status_result.get("customer_handles")
 
     changed = []
     if persona and persona != config.get("persona"):
@@ -5790,6 +5803,12 @@ def apply_synced_preferences_if_newer(config, status_result):
     if voice_tier and voice_tier != config.get("voice_tier"):
         config["voice_tier"] = voice_tier
         changed.append(f"voice_tier -> {voice_tier}")
+    if customer_apple_id and customer_apple_id != config.get("customer_apple_id"):
+        config["customer_apple_id"] = customer_apple_id
+        changed.append("customer_apple_id updated")
+    if customer_handles and customer_handles != config.get("customer_handles"):
+        config["customer_handles"] = customer_handles
+        changed.append("customer_handles updated")
 
     config["last_synced_preferences_at"] = updated_at
     if changed:

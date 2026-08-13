@@ -308,6 +308,19 @@ def init_db():
             conn.execute("ALTER TABLE customers ADD COLUMN voice_tier TEXT DEFAULT 'standard'")
         if "preferences_updated_at" not in existing_cols:
             conn.execute("ALTER TABLE customers ADD COLUMN preferences_updated_at TEXT")
+        if "customer_apple_id" not in existing_cols:
+            # The phone number/email/Apple ID Curant listens for messages
+            # from on the customer's own Mac -- purely a convenience so a
+            # customer can set this from the web dashboard instead of
+            # hand-editing ~/.curant/config.json or exporting an env var.
+            # Synced down the same way as persona/instructions/voice_tier
+            # (piggybacked on /v1/status and /v1/activate, gated by the
+            # same preferences_updated_at timestamp) -- this is still just
+            # a convenience relay, not the server "knowing" the customer;
+            # curant-watcher.py only ever reads it from local config.
+            conn.execute("ALTER TABLE customers ADD COLUMN customer_apple_id TEXT")
+        if "customer_handles" not in existing_cols:
+            conn.execute("ALTER TABLE customers ADD COLUMN customer_handles TEXT DEFAULT '[]'")
         if "email" not in existing_cols:
             conn.execute("ALTER TABLE customers ADD COLUMN email TEXT")
         if "created_at" not in existing_cols:
@@ -858,15 +871,23 @@ INSTRUCTIONS_MAX_CHARS_DEFAULT = 4000
 INSTRUCTIONS_MAX_CHARS_GRACE = 20000
 
 
-def update_customer_preferences(license_key, persona, instructions, voice_tier):
+def update_customer_preferences(license_key, persona, instructions, voice_tier, customer_apple_id="", customer_handles=None):
     """
-    Applies a customer's own explicit persona/instructions/voice-tier
-    choice from the web dashboard. Validates against the known-good
-    choice lists rather than trusting form input directly -- a bad
-    persona id landing in the DB would silently break curant-cli's
+    Applies a customer's own explicit persona/instructions/voice-tier/
+    identity choice from the web dashboard. Validates against the
+    known-good choice lists rather than trusting form input directly --
+    a bad persona id landing in the DB would silently break curant-cli's
     PERSONAS.get() fallback logic on the customer's Mac otherwise.
     Stamps preferences_updated_at so curant-cli's next /v1/status poll
-    knows there's something new to pull down.
+    (or /v1/activate, for a first-time setup) knows there's something
+    new to pull down.
+
+    customer_apple_id/customer_handles are NOT validated against any
+    choice list (they're free-form phone numbers/emails) -- just
+    trimmed. Empty string/list means "not set", same as before this
+    field existed, so a customer who never touches this section keeps
+    whatever they've configured locally untouched (see
+    apply_synced_preferences_if_newer's docstring on the same pattern).
     Returns (ok: bool, error: str | None).
     """
     if persona not in PERSONA_CHOICES:
@@ -881,11 +902,14 @@ def update_customer_preferences(license_key, persona, instructions, voice_tier):
     )
     if len(instructions) > max_chars:
         return False, "instructions_too_long"
+    customer_apple_id = (customer_apple_id or "").strip()
+    customer_handles = customer_handles or []
     with closing(get_db()) as conn:
         conn.execute(
             "UPDATE customers SET persona = ?, instructions = ?, voice_tier = ?, "
-            "preferences_updated_at = ? WHERE license_key = ?",
-            (persona, instructions, voice_tier, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), license_key),
+            "customer_apple_id = ?, customer_handles = ?, preferences_updated_at = ? WHERE license_key = ?",
+            (persona, instructions, voice_tier, customer_apple_id, json.dumps(customer_handles),
+             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), license_key),
         )
         conn.commit()
     return True, None
@@ -1168,6 +1192,13 @@ def activate():
         "customer_name": customer["customer_name"],
         "plan": customer["plan"],
         "unlocked_addons": json.loads(customer["unlocked_addons"] or "[]"),
+        # Included at activation time (not just the next /v1/status poll)
+        # so a customer who filled in the dashboard's identity field
+        # before activating gets it applied immediately on `curant-cli
+        # activate`, rather than waiting up to STATUS_RECHECK_SECONDS.
+        "customer_apple_id": customer["customer_apple_id"],
+        "customer_handles": json.loads(customer["customer_handles"] or "[]"),
+        "preferences_updated_at": customer["preferences_updated_at"],
     })
 
 
@@ -1208,6 +1239,8 @@ def status():
         "persona": customer["persona"],
         "instructions": customer["instructions"],
         "voice_tier": customer["voice_tier"],
+        "customer_apple_id": customer["customer_apple_id"],
+        "customer_handles": json.loads(customer["customer_handles"] or "[]"),
         "preferences_updated_at": customer["preferences_updated_at"],
     })
 
@@ -1813,6 +1846,11 @@ def customer_dashboard():
               <option value="{{ v }}" {% if customer.voice_tier == v %}selected{% endif %}>{{ v|capitalize }}</option>
               {% endfor %}
             </select>
+            <label>Your phone number or Apple ID</label>
+            <input type="text" name="customer_apple_id" style="width:100%; padding:8px; margin:8px 0; box-sizing:border-box;" placeholder="e.g. +1 555 123 4567 or you@icloud.com" value="{{ customer.customer_apple_id or '' }}">
+            <p class="muted" style="margin-top:-4px;">The number or email Curant listens for messages/calls from on your Mac.</p>
+            <label>Extra handles (optional)</label>
+            <input type="text" name="customer_handles" style="width:100%; padding:8px; margin:8px 0; box-sizing:border-box;" placeholder="Comma-separated, e.g. a second email or number" value="{{ customer_handles_display }}">
             <button type="submit">Save preferences</button>
           </form>
         </div>
@@ -1875,6 +1913,7 @@ def customer_dashboard():
         addons=addons_view, persona_choices=PERSONA_CHOICES, voice_tier_choices=VOICE_TIER_CHOICES,
         prefs_message=request.args.get("prefs_message"), feature_message=request.args.get("feature_message"),
         my_feature_requests=list_feature_requests_for(license_key),
+        customer_handles_display=", ".join(json.loads(customer["customer_handles"] or "[]")),
     )
 
 
@@ -1888,7 +1927,12 @@ def dashboard_update_preferences():
     persona = request.form.get("persona", "curant")
     instructions = request.form.get("instructions", "")
     voice_tier = request.form.get("voice_tier", "standard")
-    ok, error = update_customer_preferences(license_key, persona, instructions, voice_tier)
+    customer_apple_id = request.form.get("customer_apple_id", "")
+    customer_handles = [h.strip() for h in request.form.get("customer_handles", "").split(",") if h.strip()]
+    ok, error = update_customer_preferences(
+        license_key, persona, instructions, voice_tier,
+        customer_apple_id=customer_apple_id, customer_handles=customer_handles,
+    )
     if ok:
         msg = "Saved — Curant will pick this up next time it checks in with the server."
     else:
