@@ -70,6 +70,7 @@ Claude on anyone's behalf.
 from __future__ import annotations  # PEP 604 `X | Y` unions used throughout this file need this on Python < 3.10 (e.g. the Xcode Command Line Tools' bundled python3.9).
 
 import os
+import re
 import sqlite3
 import secrets
 import json
@@ -871,6 +872,30 @@ INSTRUCTIONS_MAX_CHARS_DEFAULT = 4000
 INSTRUCTIONS_MAX_CHARS_GRACE = 20000
 
 
+def _normalize_handle(h):
+    """
+    Same fix, same reasoning, as curant-cli's identical copy of this
+    function (no shared module between the server and curant-cli, see
+    the note on ESTIMATED_GENERATION_COST_USD above for why constants/
+    small helpers get duplicated rather than imported across the two).
+    chat.db always stores phone numbers in E.164 form; a customer typing
+    "240-839-0687" into this dashboard form would otherwise be saved
+    exactly as typed and never match a single incoming text on their
+    Mac, with no error surfaced anywhere -- a real bug, found live.
+    """
+    h = (h or "").strip()
+    if not h or "@" in h:
+        return h
+    if h.startswith("+"):
+        return h
+    digits = re.sub(r"\D", "", h)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return h
+
+
 def update_customer_preferences(license_key, persona, instructions, voice_tier, customer_apple_id="", customer_handles=None):
     """
     Applies a customer's own explicit persona/instructions/voice-tier/
@@ -902,8 +927,8 @@ def update_customer_preferences(license_key, persona, instructions, voice_tier, 
     )
     if len(instructions) > max_chars:
         return False, "instructions_too_long"
-    customer_apple_id = (customer_apple_id or "").strip()
-    customer_handles = customer_handles or []
+    customer_apple_id = _normalize_handle(customer_apple_id)
+    customer_handles = [_normalize_handle(h) for h in (customer_handles or [])]
     with closing(get_db()) as conn:
         conn.execute(
             "UPDATE customers SET persona = ?, instructions = ?, voice_tier = ?, "

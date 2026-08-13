@@ -32,6 +32,7 @@ import sqlite3
 import subprocess
 import time
 import os
+import re
 import sys
 import json
 
@@ -54,6 +55,38 @@ CHAT_DB_PATH = os.path.expanduser("~/Library/Messages/chat.db")
 #           CURANT_CUSTOMER_HANDLES="+15551234567,alt@me.com"   (optional extras)
 #   config: {"customer_apple_id": "name@icloud.com",
 #            "customer_handles": ["+15551234567"]}
+def _normalize_handle(h):
+    """
+    chat.db always stores phone numbers in E.164 form (e.g. "+12408390687"),
+    never as typed by a human ("240-839-0687", "(240) 839-0687", etc.) --
+    matching CUSTOMER_HANDLES against handle.id is a plain exact-string
+    comparison (see fetch_new_messages), so any un-normalized number here
+    silently matches nothing, forever, with no error anywhere. This was a
+    real bug found live: a customer's own number, entered exactly as they'd
+    naturally type it via the web dashboard or `curant-cli setup`, never
+    matched a single incoming text.
+
+    Email-style handles (Apple ID addresses) pass through untouched --
+    only things that look like phone numbers get reshaped. This is a
+    best-effort US/Canada-centric normalization (strip formatting, assume
+    a bare 10-digit number is NANP and prepend +1) since there's no
+    country context available here to do this fully generally -- a
+    number from outside NANP that's typed without its country code will
+    still need to be entered with a leading + and country code already.
+    """
+    h = (h or "").strip()
+    if not h or "@" in h:
+        return h
+    if h.startswith("+"):
+        return h
+    digits = re.sub(r"\D", "", h)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return h  # not a recognizable phone shape -- leave as-is rather than guess wrong
+
+
 def _read_customer_handles():
     cfg = {}
     _cfg_path = os.path.expanduser("~/.curant/config.json")
@@ -69,12 +102,12 @@ def _read_customer_handles():
     extra = extra if isinstance(extra, list) else [h.strip() for h in str(extra).split(",")]
     ordered, seen = [], set()
     for h in [primary, *extra]:
-        h = (h or "").strip()
+        h = _normalize_handle(h)
         if h and h not in seen:
             seen.add(h); ordered.append(h)
     # Primary (used as the proactive-message target) defaults to the first
     # handle if only CUSTOMER_HANDLES was provided.
-    primary = primary or (ordered[0] if ordered else "")
+    primary = _normalize_handle(primary) or (ordered[0] if ordered else "")
     return primary, ordered
 
 

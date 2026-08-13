@@ -5759,6 +5759,38 @@ def refresh_status_if_stale(config):
         return config, config.get("last_status_active", False)
 
 
+def _normalize_handle(h):
+    """
+    chat.db (read by curant-watcher.py) always stores phone numbers in
+    E.164 form ("+12408390687"), never as a human would type one
+    ("240-839-0687"), and handle matching there is a plain exact-string
+    comparison -- a mismatched format means every text from that number
+    silently never matches, forever, with no error surfaced anywhere.
+    Applied here too (not just in curant-watcher.py, which has its own
+    identical copy since curant-cli and the watcher are separate
+    deployables) so a value typed into the web dashboard or this file's
+    own setup wizard is already correct by the time it's saved, rather
+    than relying on the watcher to catch it. Real bug, found live: a
+    customer's own number, entered exactly as they'd naturally type it,
+    never matched a single incoming text until this existed.
+
+    Best-effort US/Canada-centric (NANP) -- there's no country context
+    available at the point this is called, so a non-NANP number typed
+    without its country code still needs a leading + entered by hand.
+    """
+    h = (h or "").strip()
+    if not h or "@" in h:
+        return h
+    if h.startswith("+"):
+        return h
+    digits = re.sub(r"\D", "", h)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return h
+
+
 def apply_synced_preferences_if_newer(config, status_result):
     """
     Pulls persona/instructions/voice_tier from the server's /v1/status
@@ -5804,6 +5836,8 @@ def apply_synced_preferences_if_newer(config, status_result):
     if voice_tier and voice_tier != config.get("voice_tier"):
         config["voice_tier"] = voice_tier
         changed.append(f"voice_tier -> {voice_tier}")
+    customer_apple_id = _normalize_handle(customer_apple_id)
+    customer_handles = [_normalize_handle(h) for h in customer_handles] if customer_handles else customer_handles
     if customer_apple_id and customer_apple_id != config.get("customer_apple_id"):
         config["customer_apple_id"] = customer_apple_id
         changed.append("customer_apple_id updated")
@@ -8297,7 +8331,7 @@ def setup_wizard_cmd():
         f"(current: {current_id or 'not set'}): "
     )
     if id_answer:
-        config["customer_apple_id"] = id_answer
+        config["customer_apple_id"] = _normalize_handle(id_answer)
         save_config(config)
 
     handles_answer = _wizard_prompt(
@@ -8305,7 +8339,7 @@ def setup_wizard_cmd():
     )
     if handles_answer:
         config = load_config()
-        config["customer_handles"] = [h.strip() for h in handles_answer.split(",") if h.strip()]
+        config["customer_handles"] = [_normalize_handle(h.strip()) for h in handles_answer.split(",") if h.strip()]
         save_config(config)
 
     print("\nSetup done. Run `curant-cli status` to confirm everything's active.")
