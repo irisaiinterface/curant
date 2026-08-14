@@ -125,6 +125,28 @@ if not app.config["SESSION_COOKIE_SECURE"]:
 #   export CURANT_ADMIN_PASSWORD="something long and random, not reused elsewhere"
 ADMIN_PASSWORD = os.environ.get("CURANT_ADMIN_PASSWORD")
 
+# Real feature added 2026-08-14 ("make sure customer can add emails without
+# me"): a customer connecting their own Gmail account previously required
+# THEM to create their own Google Cloud project and OAuth client -- utterly
+# unreasonable for a non-technical customer. The fix is the standard
+# "one app, many users" OAuth pattern (same as any real "Sign in with
+# Google" button): ONE shared OAuth client, registered once by the owner,
+# handed out to any ACTIVATED customer via /v1/gmail-oauth-config below so
+# their own curant-cli can build a gcp-oauth.keys.json locally and run the
+# real per-customer browser login/consent step themselves -- that one step
+# (an actual human approving access to their own inbox) can never be
+# removed, and shouldn't be; everything BEFORE it now can be.
+# No default on purpose, same reasoning as ADMIN_PASSWORD above -- if
+# unset, the feature is cleanly unavailable (a clear error, not a
+# silently-broken OAuth flow) rather than serving out empty credentials.
+# Set via:
+#   export CURANT_GMAIL_OAUTH_CLIENT_ID="....apps.googleusercontent.com"
+#   export CURANT_GMAIL_OAUTH_CLIENT_SECRET="...."
+#   export CURANT_GMAIL_OAUTH_PROJECT_ID="...."  (optional, cosmetic only)
+GMAIL_OAUTH_CLIENT_ID = os.environ.get("CURANT_GMAIL_OAUTH_CLIENT_ID")
+GMAIL_OAUTH_CLIENT_SECRET = os.environ.get("CURANT_GMAIL_OAUTH_CLIENT_SECRET")
+GMAIL_OAUTH_PROJECT_ID = os.environ.get("CURANT_GMAIL_OAUTH_PROJECT_ID", "")
+
 # Separate, stricter rate limit for login attempts (both customer and
 # owner) — this is the endpoint most worth protecting against brute force,
 # so it gets its own budget rather than sharing the general API one.
@@ -1267,6 +1289,46 @@ def status():
         "customer_apple_id": customer["customer_apple_id"],
         "customer_handles": json.loads(customer["customer_handles"] or "[]"),
         "preferences_updated_at": customer["preferences_updated_at"],
+    })
+
+
+@app.route("/v1/gmail-oauth-config", methods=["GET"])
+def gmail_oauth_config():
+    """
+    Hands out the shared Gmail OAuth client (see GMAIL_OAUTH_CLIENT_ID's
+    comment above) to any activated customer, so their own curant-cli
+    (see connect_email_cmd) can build a valid gcp-oauth.keys.json locally
+    without them ever touching Google Cloud Console. This is app-level
+    OAuth client config, not a per-customer secret and not message
+    content -- same category as the license/billing basics this server
+    already handles, not a departure from "server never sees message
+    content."
+
+    Gated on an active license (same auth pattern as /v1/status) purely
+    to keep this from being a fully open, unauthenticated endpoint
+    anyone could hit -- the client_id/secret pair for an installed/
+    desktop-app OAuth client isn't treated as fully confidential by
+    Google's own model (this is the same category of credential every
+    CLI tool that does "sign in with Google" ships publicly), but there's
+    no reason to serve it to a request with no license key at all either.
+    """
+    auth = request.headers.get("Authorization", "")
+    license_key = auth.replace("Bearer ", "")
+
+    if not check_rate_limit(license_key or "unknown"):
+        return jsonify({"error": "rate_limited"}), 429
+
+    customer = get_customer(license_key)
+    if not customer or not customer["active"]:
+        return jsonify({"error": "not_activated"}), 404
+
+    if not GMAIL_OAUTH_CLIENT_ID or not GMAIL_OAUTH_CLIENT_SECRET:
+        return jsonify({"error": "gmail_oauth_not_configured"}), 503
+
+    return jsonify({
+        "client_id": GMAIL_OAUTH_CLIENT_ID,
+        "client_secret": GMAIL_OAUTH_CLIENT_SECRET,
+        "project_id": GMAIL_OAUTH_PROJECT_ID,
     })
 
 
