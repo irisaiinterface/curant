@@ -1532,5 +1532,14 @@ if __name__ == "__main__":
         # Invoked every 15 minutes by com.curant.meetingprep.plist --
         # same run-and-exit pattern as --proactive-check above.
         run_meeting_prep_check()
+    elif "--iris-inbox-check" in sys.argv:
+        # Invoked periodically by com.curant.irisinbox.plist -- same
+        # run-and-exit pattern as --proactive-check above. Just shells
+        # out to curant-cli iris-inbox-check; no local logic needed
+        # here since (unlike daily-briefing/proactive-check) this job
+        # doesn't produce a message to send itself -- it only reads and
+        # queues drafts, which the customer then hears about via the
+        # next daily briefing.
+        subprocess.run(["curant-cli", "iris-inbox-check"], capture_output=True, text=True)
     else:
         main()

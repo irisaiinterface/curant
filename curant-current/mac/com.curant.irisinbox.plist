@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.irisinbox</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Homebrew python3.12, NOT /usr/bin/python3 (Apple's system
+             Python) , same reasoning as every other scheduled plist
+             in this directory: this run's subprocess.run(["curant-cli",
+             "iris-inbox-check"]) call needs curant-cli on PATH, and this
+             process's own Automation permissions (if it ever needs
+             them for anything downstream) are tied to the exact
+             requesting binary, which only the Homebrew python has been
+             granted. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+        <string>--iris-inbox-check</string>
+    </array>
+
+    <!-- Runs every hour (3600 seconds) rather than a fixed clock time ,
+         unlike the daily briefing, there's no reason to wait for a
+         specific hour to check an inbox for something that might need
+         a reply. This job never messages the customer directly (see
+         run_iris_inbox_check's docstring) , it only reads and queues
+         drafts into pending_email_sends, which the next daily briefing
+         (com.curant.dailybriefing.plist) surfaces and asks the customer
+         to approve/reject. Adjust StartInterval if hourly is too
+         frequent or not frequent enough for how busy the connected
+         inbox actually is. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin) is not found on the
+         default PATH without this , same fix already applied to every
+         other scheduled plist here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching every other plist here.
+             Remove once a real license is activated via curant-cli
+             activate. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-irisinbox.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-irisinbox-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.irisinbox.plist ~/Library/LaunchAgents/
+  launchctl load ~/Library/LaunchAgents/com.curant.irisinbox.plist
+
+Before loading, connect the inbox this job should watch:
+  curant-cli mcp-add iris-gmail npx -y @shinzolabs/gmail-mcp
+(or use a different connection name and point this job at it with
+curant-cli set-iris-inbox NAME , default is "iris-gmail").
+
+This job can only READ and DRAFT (queue_email_for_approval) , it has
+no ability to actually send, delete, or modify anything in the real
+inbox. Sending only ever happens after a live customer approves a
+queued draft in a real conversation (see process_email_approvals in
+curant-cli). Review what's pending anytime with:
+  curant-cli pending-email-sends
+
+To test immediately, run curant-watcher.py directly with the flag shown
+in ProgramArguments above, or just run curant-cli iris-inbox-check
+directly.
+
+Logs land at /tmp/curant-irisinbox.log and /tmp/curant-irisinbox-error.log.
+-->

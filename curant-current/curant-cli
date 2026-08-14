@@ -822,6 +822,27 @@ def init_local_db():
             estimated_cost_usd REAL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- Real feature added 2026-08-13: lets an unattended background job
+        -- (see run_iris_inbox_check / queue_email_for_approval) read email and
+        -- DRAFT a proposed reply entirely on its own, without ever being able
+        -- to actually send anything without a human approving it first --
+        -- same "never send without confirmation" rule every other send path
+        -- in this file already follows, just implemented as a queue instead
+        -- of an in-conversation confirmation, since there's no live customer
+        -- to confirm with the moment a background job runs.
+        CREATE TABLE IF NOT EXISTS pending_email_sends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mcp_server_name TEXT,       -- which connected email MCP server this is for (e.g. 'iris-gmail')
+            to_addr TEXT,
+            subject TEXT,
+            body TEXT,
+            reasoning TEXT,             -- the model's own short explanation of why it's proposing this send
+            source_context TEXT,        -- optional: which inbound email/thread this is a reply to, for the customer's own review
+            status TEXT DEFAULT 'pending',  -- 'pending' | 'approved' | 'rejected' | 'sent' | 'send_failed'
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            decided_at TEXT
+        );
         """)
         conn.commit()
     # Lightweight migration: installs that created messages/local.db before
@@ -1733,6 +1754,144 @@ def _recently_logged_similar_gap(description):
     return most_recent
 
 
+def queue_pending_email_send(mcp_server_name, to_addr, subject, body, reasoning="", source_context=""):
+    """The ONLY way an unattended background job can propose sending an
+    email -- see pending_email_sends' table comment. This never sends
+    anything itself; it just writes a row with status='pending' and
+    returns its id. A real send only ever happens via
+    send_approved_email_sends(), which is only called after the
+    customer approves in a live conversation (see process_email_approvals_tool
+    / relay()'s handling of an approval reply)."""
+    with closing(get_local_db()) as conn:
+        cur = conn.execute(
+            "INSERT INTO pending_email_sends (mcp_server_name, to_addr, subject, body, reasoning, source_context) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (mcp_server_name, to_addr, subject, body, reasoning, source_context),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_pending_email_sends(status="pending"):
+    with closing(get_local_db()) as conn:
+        rows = conn.execute(
+            "SELECT id, mcp_server_name, to_addr, subject, body, reasoning, source_context, status, "
+            "created_at, decided_at FROM pending_email_sends WHERE status = ? ORDER BY id",
+            (status,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_pending_email_send_by_id(send_id):
+    with closing(get_local_db()) as conn:
+        row = conn.execute(
+            "SELECT id, mcp_server_name, to_addr, subject, body, reasoning, source_context, status, "
+            "created_at, decided_at FROM pending_email_sends WHERE id = ?",
+            (send_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_pending_email_send_status(send_id, status):
+    with closing(get_local_db()) as conn:
+        cur = conn.execute(
+            "UPDATE pending_email_sends SET status = ?, decided_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, send_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+SEND_TO_PARAM_HINTS = ("to", "recipients", "recipient")
+SEND_SUBJECT_PARAM_HINTS = ("subject",)
+SEND_BODY_PARAM_HINTS = ("body", "message", "text", "content")
+SEND_TOOL_NAME_HINTS = ("send",)
+
+
+def _build_send_email_arguments(input_schema, to_addr, subject, body):
+    """Best-effort mapping from (to, subject, body) onto whatever field
+    names a given MCP server's send tool actually expects -- same
+    "no fixed contract with a customer-chosen MCP server" reasoning as
+    _pick_query_param_name above, just for the three fields a send
+    needs instead of one search query. If a field's schema says it
+    wants an array (several send tools take `to` as a list of
+    recipients, e.g. shinzo-labs/gmail-mcp), wraps the single address
+    in a one-item list rather than sending a bare string a strict
+    schema might reject."""
+    props = (input_schema or {}).get("properties") or {}
+
+    def _find(hints):
+        for hint in hints:
+            if hint in props:
+                return hint
+        return None
+
+    args = {}
+    to_key = _find(SEND_TO_PARAM_HINTS)
+    if to_key:
+        wants_array = props.get(to_key, {}).get("type") == "array"
+        args[to_key] = [to_addr] if wants_array else to_addr
+    subject_key = _find(SEND_SUBJECT_PARAM_HINTS)
+    if subject_key:
+        args[subject_key] = subject
+    body_key = _find(SEND_BODY_PARAM_HINTS)
+    if body_key:
+        args[body_key] = body
+    return args
+
+
+def process_email_approvals_tool(approve_ids, reject_ids):
+    """Dispatch target for the process_email_approvals builtin tool --
+    see that tool's schema/description for the full safety rationale.
+    This is the ONLY code path anywhere in this file that turns a
+    pending_email_sends row into a real, actually-sent email, and it
+    only runs because a live customer message triggered it (this
+    function is never called from an unattended background job)."""
+    results = []
+
+    for send_id in approve_ids:
+        row = get_pending_email_send_by_id(send_id)
+        if not row:
+            results.append(f"#{send_id}: not found (already handled, or never existed).")
+            continue
+        if row["status"] != "pending":
+            results.append(f"#{send_id}: already {row['status']}, skipping.")
+            continue
+        server = next((s for s in get_mcp_servers(enabled_only=True) if s["name"] == row["mcp_server_name"]), None)
+        if not server:
+            set_pending_email_send_status(send_id, "send_failed")
+            results.append(f"#{send_id}: the '{row['mcp_server_name']}' connection isn't available anymore -- not sent.")
+            continue
+        tools = _get_server_tools_cached(server)
+        send_tool = next((t for t in tools if any(hint in t["name"].lower() for hint in SEND_TOOL_NAME_HINTS)
+                           and "draft" not in t["name"].lower()), None)
+        if not send_tool:
+            set_pending_email_send_status(send_id, "send_failed")
+            results.append(f"#{send_id}: couldn't find a send tool on '{row['mcp_server_name']}' -- not sent.")
+            continue
+        send_args = _build_send_email_arguments(send_tool.get("input_schema"), row["to_addr"], row["subject"], row["body"])
+        result = call_mcp_tool(server, send_tool["name"], send_args)
+        if isinstance(result, str) and result.startswith("[Error"):
+            set_pending_email_send_status(send_id, "send_failed")
+            results.append(f"#{send_id}: send failed -- {result}")
+        else:
+            set_pending_email_send_status(send_id, "sent")
+            results.append(f"#{send_id}: sent to {row['to_addr']}.")
+
+    for send_id in reject_ids:
+        row = get_pending_email_send_by_id(send_id)
+        if not row:
+            results.append(f"#{send_id}: not found.")
+            continue
+        if row["status"] != "pending":
+            results.append(f"#{send_id}: already {row['status']}, skipping.")
+            continue
+        set_pending_email_send_status(send_id, "rejected")
+        results.append(f"#{send_id}: rejected, not sent.")
+
+    return "\n".join(results) if results else "No valid ids given -- nothing changed."
+
+
 CAPABILITY_GAPS_XLSX_PATH = os.path.join(CONFIG_DIR, "capability_gaps.xlsx")
 
 
@@ -2332,6 +2491,34 @@ def get_all_available_tools(config):
         "raw_name": "log_capability_gap",
         "builtin": True,
     })
+    pending_sends = get_pending_email_sends(status="pending")
+    if pending_sends:
+        tools.append({
+            "qualified_name": "process_email_approvals",
+            "description": (
+                "Call this when the customer is responding to the pending-email-approvals digest "
+                "they were sent (e.g. \"approve 1 and 3\", \"send all of them\", \"reject #2, that's "
+                "not right\", \"yes go ahead\"). Each pending item was already shown to you above in "
+                "this system prompt with its own id number, recipient, subject, and body -- use those "
+                "ids. Approving an id ACTUALLY SENDS that email for real, right now, via the real "
+                "connected email account -- this is the one and only point anything queued by the "
+                "unattended inbox-check job is allowed to actually send, exactly because a real human "
+                "(the customer, right here) is confirming it first. Rejecting an id just discards it, "
+                "nothing is sent. Only call this when the customer's message is clearly about the "
+                "pending items -- if they're just asking what's pending, answer from the context above "
+                "directly instead of calling this."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "approve_ids": {"type": "array", "items": {"type": "integer"}, "description": "ids to actually send"},
+                    "reject_ids": {"type": "array", "items": {"type": "integer"}, "description": "ids to discard without sending"},
+                },
+            },
+            "server_command": None,
+            "raw_name": "process_email_approvals",
+            "builtin": True,
+        })
     tools.append({
         "qualified_name": "set_notification_preferences",
         "description": (
@@ -4721,6 +4908,18 @@ def execute_tool_call(tool_name, arguments, available_tools):
         ok, msg = set_shell_safety_mode(arguments.get("mode", ""))
         return msg
 
+    if match["builtin"] and tool_name == "process_email_approvals":
+        return process_email_approvals_tool(arguments.get("approve_ids") or [], arguments.get("reject_ids") or [])
+
+    if match["builtin"] and tool_name == "queue_email_for_approval":
+        send_id = queue_pending_email_send(
+            match["_iris_server_name"],
+            arguments.get("to", ""), arguments.get("subject", ""), arguments.get("body", ""),
+            reasoning=arguments.get("reasoning", ""), source_context=arguments.get("source_context", ""),
+        )
+        return (f"Queued as #{send_id} -- NOT sent. The customer will see this in their next digest "
+                f"and has to approve it before it actually sends.")
+
     if match["builtin"] and tool_name == "set_notification_preferences":
         config = load_config()
         changed = []
@@ -6680,6 +6879,19 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         "\"7pm tonight\", \"what time is it\"), compute it from this, don't guess or say you don't "
         "know what time it is."
     )
+    pending_sends = get_pending_email_sends(status="pending")
+    if pending_sends:
+        lines = [
+            f"#{p['id']}: to {p['to_addr']}, subject \"{p['subject']}\" -- {p['reasoning'] or 'no reasoning given'}"
+            for p in pending_sends
+        ]
+        system_parts.append(
+            "Emails an unattended background check drafted and is waiting on the customer to approve "
+            "before anything actually sends (see process_email_approvals):\n" + "\n".join(lines) +
+            "\nIf the customer's message is about approving/rejecting/reviewing these, use "
+            "process_email_approvals with the right ids. If they just ask what's pending, answer from "
+            "this list directly."
+        )
     if relationship_state:
         # Grace-exclusive (see get_relationship_state) -- this is what makes
         # memory shape HOW you talk to this specific customer, not just WHAT
@@ -8012,7 +8224,15 @@ def daily_briefing(context):
         print(json.dumps({"should_send": False, "error": "no_api_key_set"}))
         return
 
-    if not context:
+    pending_sends = get_pending_email_sends(status="pending")
+    # Real fix 2026-08-13: this used to bail out entirely on empty
+    # calendar/reminders context, which meant a customer with pending
+    # emails awaiting approval (see run_iris_inbox_check /
+    # pending_email_sends) but nothing on their calendar today would
+    # NEVER hear about the pending queue through the briefing -- it'd
+    # just sit there silently until they happened to ask. Pending sends
+    # alone are now also a valid reason to still produce a briefing.
+    if not context and not pending_sends:
         # Nothing to summarize -- an empty briefing isn't useful, don't send one.
         print(json.dumps({"should_send": False}))
         return
@@ -8026,6 +8246,16 @@ def daily_briefing(context):
         if email_summary:
             context = context + "\n\nRecent email activity (raw, from a connected email tool):\n" + email_summary
 
+    if pending_sends:
+        pending_lines = "\n".join(
+            f"#{p['id']}: to {p['to_addr']}, subject \"{p['subject']}\" -- {p['reasoning'] or 'no reasoning given'}"
+            for p in pending_sends
+        )
+        context = (context or "") + (
+            "\n\nEmails an unattended background check drafted, awaiting your approval before "
+            f"anything sends:\n{pending_lines}"
+        )
+
     memories = get_memories()
     people = get_important_people()
     extra = (
@@ -8035,7 +8265,10 @@ def daily_briefing(context):
         "sending -- always produce a real briefing as long as there's something in the "
         "context to summarize. Keep it tight and scannable: today's agenda first, then "
         "anything open/overdue worth flagging. No filler, no 'let me know if you need "
-        "anything else' -- just the briefing itself.\n\n"
+        "anything else' -- just the briefing itself. If there are pending emails awaiting "
+        "approval in the context below, mention them clearly with their id numbers and tell "
+        "the customer they can reply e.g. \"approve 1\" or \"reject 2\" or \"approve all\" to act "
+        "on them.\n\n"
         f"Today's live context:\n{context}\n\n"
         'Respond with ONLY a JSON object: {"message": "..."}.'
     )
@@ -8069,6 +8302,148 @@ def daily_briefing(context):
         "reply_format": config.get("reply_format", "text"),
         "voice_tier": config.get("voice_tier", "standard"),
     }))
+
+
+DEFAULT_IRIS_INBOX_SERVER_NAME = "iris-gmail"
+
+
+def get_iris_inbox_server_name(config):
+    return config.get("iris_inbox_mcp_server") or DEFAULT_IRIS_INBOX_SERVER_NAME
+
+
+def _get_iris_inbox_check_tools(server_name):
+    """The tool list for run_iris_inbox_check() -- deliberately much
+    narrower than get_all_available_tools(). Real safety property this
+    exists to guarantee: an unattended job with no human watching must
+    NEVER be able to call anything that actually sends, deletes, or
+    modifies something in a real inbox. Gmail's REST-derived MCP tool
+    names are consistent about this -- get_*/list_* are always
+    read-only, everything else (create_/update_/patch_/delete_/send_/
+    modify_/trash_/untrash_/verify_/insert_/set_default_/add_/remove_/
+    batch_/watch_/stop_) has a real side effect -- so filtering on that
+    prefix is a genuine safety boundary, not just a naming convention,
+    for this specific well-known server. The only way this job can
+    propose a reply is queue_email_for_approval, which writes to
+    curant-cli's OWN local queue table, never to the real account --
+    see process_email_approvals_tool for the only path that can turn a
+    queued item into a real sent email, and it requires a live customer
+    to trigger it."""
+    server = next((s for s in get_mcp_servers(enabled_only=True) if s["name"] == server_name), None)
+    if not server:
+        return None, []
+    all_tools = _get_server_tools_cached(server)
+    read_only = [t for t in all_tools if t["name"].startswith(("get_", "list_"))]
+    tools = [{
+        "qualified_name": f"{server_name}__{t['name']}",
+        "description": f"[{server_name}] {t['description']}",
+        "input_schema": t["input_schema"],
+        "server_command": server,
+        "raw_name": t["name"],
+        "builtin": False,
+    } for t in read_only]
+    tools.append({
+        "qualified_name": "queue_email_for_approval",
+        "description": (
+            "Propose a reply or new email based on something you found in the inbox you're checking. "
+            "This does NOT send anything -- it queues the draft for the customer to review and approve "
+            "later (they'll see it in their next briefing). This is the only way you're able to "
+            "propose an outgoing email during this unattended check; there is no send tool available "
+            "to you right now, by design."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "recipient email address"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+                "reasoning": {"type": "string", "description": "short explanation of why this reply is worth sending, for the customer's review"},
+                "source_context": {"type": "string", "description": "brief excerpt/reference to the email this is responding to"},
+            },
+            "required": ["to", "subject", "body", "reasoning"],
+        },
+        "server_command": None,
+        "raw_name": "queue_email_for_approval",
+        "builtin": True,
+        "_iris_server_name": server_name,
+    })
+    return server, tools
+
+
+def set_iris_inbox_cmd(name):
+    config = load_config()
+    if name is None:
+        print(f"Currently watching: {get_iris_inbox_server_name(config)}")
+        return
+    config["iris_inbox_mcp_server"] = name
+    save_config(config)
+    print(f"iris-inbox-check will now watch the '{name}' connection.")
+
+
+def pending_email_sends_cmd():
+    rows = get_pending_email_sends(status="pending")
+    if not rows:
+        print("Nothing pending.")
+        return
+    for r in rows:
+        print(f"#{r['id']} [{r['created_at']}] to {r['to_addr']} -- \"{r['subject']}\"\n"
+              f"    reason: {r['reasoning']}\n"
+              f"    body: {r['body'][:200]}{'...' if len(r['body']) > 200 else ''}")
+
+
+def run_iris_inbox_check():
+    """Unattended background job (see mac/curant-watcher.py's
+    --iris-inbox-check entry point and com.curant.irisinbox.plist) --
+    reads/searches a specifically-connected email account with real
+    tool-calling (unlike daily_briefing/proactive_check, which only get
+    a single best-effort blind inbox summary folded into plain text)
+    and can propose replies, but literally cannot send anything itself
+    -- see _get_iris_inbox_check_tools' docstring. Fail-closed on
+    anything: no license, no key, no connected server, or any error
+    just means this run does nothing, same contract as every other
+    background job in this file."""
+    config = load_config()
+    key = config.get("license_key")
+    if not key:
+        print("[iris-inbox-check] not activated, skipping.", file=sys.stderr)
+        return
+    config, active = refresh_status_if_stale(config)
+    if not active:
+        print("[iris-inbox-check] license inactive, skipping.", file=sys.stderr)
+        return
+    provider = get_provider(config)
+    api_key = get_api_key(config, provider)
+    if not api_key:
+        print("[iris-inbox-check] no API key set, skipping.", file=sys.stderr)
+        return
+
+    server_name = get_iris_inbox_server_name(config)
+    server, tools = _get_iris_inbox_check_tools(server_name)
+    if not server:
+        print(f"[iris-inbox-check] no connected MCP server named '{server_name}' -- skipping. "
+              f"Connect one with `curant-cli mcp-add {server_name} ...` or set "
+              f"config['iris_inbox_mcp_server'] to the name you used.", file=sys.stderr)
+        return
+
+    memories = get_memories()
+    people = get_important_people()
+    extra = (
+        f"You're doing an unattended check of the '{server_name}' email inbox -- no one is watching "
+        "this run, and there is no send tool available to you (see queue_email_for_approval's "
+        "description for why). Look for anything that genuinely needs a reply. For each one, use "
+        "queue_email_for_approval to propose a draft -- don't propose a reply for routine/no-action-"
+        "needed emails just to seem thorough. If nothing needs a reply, that's a normal, correct "
+        "outcome -- do nothing further."
+    )
+    system_prompt = build_system_prompt(config, memories, people, "", extra_instruction=extra)
+
+    try:
+        call_llm_with_tools(
+            provider, api_key, system_prompt,
+            messages=[{"role": "user", "content": f"Check the '{server_name}' inbox for anything that needs a reply."}],
+            tools=tools, available_tools=tools, max_tokens=1000, tier="main",
+        )
+    except Exception as e:
+        print(f"[iris-inbox-check] failed (non-fatal): {e}", file=sys.stderr)
 
 
 def weekly_rollup(context):
@@ -10137,6 +10512,13 @@ def main():
     p_rollup = sub.add_parser("weekly-rollup", help="Grace-exclusive: generate this week's executive rollup (internal use)")
     p_rollup.add_argument("--context", default="", help="Live device context (calendar/reminders)")
 
+    sub.add_parser("iris-inbox-check", help="Unattended read+draft-only check of a connected email inbox (internal use, see run_iris_inbox_check)")
+
+    p_iris_inbox = sub.add_parser("set-iris-inbox", help="Set (or view) which connected MCP server name run_iris_inbox_check watches")
+    p_iris_inbox.add_argument("name", nargs="?", default=None, help=f"Server name, e.g. '{DEFAULT_IRIS_INBOX_SERVER_NAME}' (the default). Omit to view current setting.")
+
+    sub.add_parser("pending-email-sends", help="Show emails an unattended check drafted that are waiting on your approval")
+
     p_meeting = sub.add_parser("meeting-prep-check", help="Grace-exclusive: check for an imminent meeting and send a prep note (internal use)")
     p_meeting.add_argument("--context", default="", help="Live device context (calendar/reminders)")
 
@@ -10291,6 +10673,12 @@ def main():
         daily_briefing(args.context)
     elif args.command == "weekly-rollup":
         weekly_rollup(args.context)
+    elif args.command == "iris-inbox-check":
+        run_iris_inbox_check()
+    elif args.command == "set-iris-inbox":
+        set_iris_inbox_cmd(args.name)
+    elif args.command == "pending-email-sends":
+        pending_email_sends_cmd()
     elif args.command == "meeting-prep-check":
         meeting_prep_check(args.context)
     elif args.command == "backup-now":
