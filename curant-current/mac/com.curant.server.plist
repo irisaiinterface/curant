@@ -42,6 +42,27 @@
              unattended service. -->
         <key>CURANT_SERVER_DEBUG</key>
         <string>false</string>
+        <!-- Shared Gmail OAuth client, added 2026-08-14 so /v1/gmail-oauth-config
+             can hand this out to any activated customer , see that endpoint's
+             docstring in app.py for the full feature. DELIBERATELY left as
+             placeholders here, NOT committed as real values , GitHub's own
+             push protection caught a first attempt at baking the real
+             client_id/secret directly into this tracked file and correctly
+             rejected the push (a Google OAuth client secret is a recognized
+             credential pattern regardless of "installed app" secrets being
+             less sensitive than most). Fill these in on your OWN deployed
+             copy at ~/Library/LaunchAgents/com.curant.server.plist only ,
+             same "no default, filled in locally, never committed" pattern
+             as CURANT_ADMIN_PASSWORD/ADMIN_PASSWORD elsewhere in this repo.
+             Get the values from Google Cloud Console > APIs & Services >
+             Credentials (the same OAuth client you may have already created
+             for your own first Gmail connection). -->
+        <key>CURANT_GMAIL_OAUTH_CLIENT_ID</key>
+        <string>REPLACE_WITH_YOUR_GMAIL_OAUTH_CLIENT_ID</string>
+        <key>CURANT_GMAIL_OAUTH_CLIENT_SECRET</key>
+        <string>REPLACE_WITH_YOUR_GMAIL_OAUTH_CLIENT_SECRET</string>
+        <key>CURANT_GMAIL_OAUTH_PROJECT_ID</key>
+        <string>REPLACE_WITH_YOUR_GMAIL_OAUTH_PROJECT_ID</string>
     </dict>
 
     <key>StandardOutPath</key>
