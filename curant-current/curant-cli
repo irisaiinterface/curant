@@ -8199,6 +8199,7 @@ def daily_briefing(context):
     license, or no API key just results in should_send=false, never a
     broken/partial message.
     """
+    init_local_db()  # needed for get_pending_email_sends below (pending_email_sends table)
     config = load_config()
     key = config.get("license_key")
     if not key:
@@ -8380,6 +8381,7 @@ def set_iris_inbox_cmd(name):
 
 
 def pending_email_sends_cmd():
+    init_local_db()
     rows = get_pending_email_sends(status="pending")
     if not rows:
         print("Nothing pending.")
@@ -8401,6 +8403,7 @@ def run_iris_inbox_check():
     anything: no license, no key, no connected server, or any error
     just means this run does nothing, same contract as every other
     background job in this file."""
+    init_local_db()
     config = load_config()
     key = config.get("license_key")
     if not key:
