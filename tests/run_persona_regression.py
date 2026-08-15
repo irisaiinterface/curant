@@ -151,6 +151,26 @@ def check_case(case, reply):
         word_count = len(reply.split())
         if word_count > case.get("max_words", 9999):
             return False, f"Reply was {word_count} words, expected under {case['max_words']} for this persona's tone."
+
+        # Literal, case-sensitive check — for style markers like "!" where
+        # lowercasing would be irrelevant or actively wrong.
+        forbidden = case.get("forbid_phrases") or []
+        hit = [p for p in forbidden if p in reply]
+        if hit:
+            return False, f"Reply contained forbidden style marker(s) {hit} — violates this persona's tone rule."
+
+        required_any = case.get("require_any_phrases") or []
+        if required_any:
+            reply_lower = reply.lower()
+            matched = [p for p in required_any if p in reply_lower]
+            if not matched:
+                return False, (
+                    "None of the expected warmth/tone markers appeared — read the reply "
+                    "manually before concluding this is a real regression, since tone can "
+                    "come through in ways this keyword list doesn't capture."
+                )
+            return True, f"Matched tone marker(s): {matched}"
+
         return True, f"{word_count} words — within tone expectation."
 
     reply_lower = reply.lower()

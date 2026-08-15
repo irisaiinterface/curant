@@ -106,7 +106,7 @@ Split honestly into two categories — what's buildable but simply hasn't been p
 - **Portal-cancellation cleanup behavior is configured but defaults to the conservative option.** Cancelling in-app immediately releases the phone number and deprovisions Workspace; cancelling via Stripe's portal only disables the account unless a specific env var is deliberately flipped.
 - **The regression test suite has never actually been run against a live model.** It's real, working code (verified via import-only dry runs), but needs a real `ANTHROPIC_API_KEY` to execute for real — that hasn't happened yet.
 - **Home and Cloud diverge slightly in model-tier structure** — Home has a two-tier main/fast split, Cloud doesn't. Both are pinned to the same primary model version as of this pass; the structural difference is unresolved.
-- **Regression test coverage is currently limited** to Miles, Leo, and the generalist Curant persona — the other seven personas don't have dedicated test cases yet.
+- **Regression test coverage now spans all 10 personas** (16 cases total, up from 3 personas) — but tone-fidelity checking is still limited to a handful of literal style markers (e.g. Grace's no-exclamation-points rule, Frank's warmth markers), not a holistic judge of whether a persona actually "sounds like itself." See `tests/README.md`.
 - **Multi-worker deployment requires a manual infrastructure step** (sticky sessions at the reverse proxy) that hasn't been configured — irrelevant at today's single-process deployment scale, but documented so it isn't a surprise later.
 
 ### Genuinely external, not solvable by more code

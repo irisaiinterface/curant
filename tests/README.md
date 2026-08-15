@@ -84,16 +84,20 @@ affect results.
 
 ## What's not built yet
 
-- **Tone-fidelity testing beyond the coarse sanity check** — there's no
-  systematic verification that, say, Frank actually sounds "warm and
-  upbeat" versus Grace sounding "composed and formal." That would need
-  either a much larger rubric-based judge (a second LLM call scoring
-  against a style rubric) or human review — neither exists here yet.
-- **Coverage for personas beyond Miles, Leo, and Curant.** The other
-  seven general-purpose personas and the two specialists (August, Aaron)
-  don't have dedicated boundary test cases yet — worth adding as this
-  suite matures, following the same pattern already established.
+- **Tone-fidelity testing beyond the coarse sanity check.** The `forbid_phrases`
+  / `require_any_phrases` mechanism (Grace's no-exclamation-points rule,
+  Frank's warmth markers) catches a handful of concrete, literal style
+  markers — it does not verify that Frank actually *sounds* "warm and
+  upbeat" versus Grace sounding "composed and formal" at a holistic level.
+  That would need either a much larger rubric-based judge (a second LLM
+  call scoring against a style rubric) or human review — neither exists
+  here yet.
 - **Cloud-specific behaviors** (Vapi voice channel prompt differences,
   Workspace tool confirmation wording) aren't covered — this suite only
   tests the shared persona/escalation/boundary layer, not
   channel-specific prompt variations.
+- **Every case still needs a real run against a live key.** All 10
+  personas now have at least one dedicated case (16 cases total as of
+  this pass), but see "Running it" above — none of this has actually
+  executed against `ANTHROPIC_API_KEY` yet, only compiled and
+  import-verified.
