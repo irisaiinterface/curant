@@ -7358,10 +7358,15 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         "can run it themselves: adding or replacing an AI provider API key (`curant-cli set-api-key`), "
         "switching AI provider (`curant-cli set-provider`), activating or re-activating a license "
         "(`curant-cli activate <key>`), changing which phone number or Apple ID Curant listens to "
-        "(`curant-cli setup`, or the web dashboard at the customer's account login), and adding or "
+        "(`curant-cli setup`, or the web dashboard at the customer's account login), adding or "
         "removing a delegate with full assistant access (`curant-cli add-delegate` / "
-        "`curant-cli remove-delegate`, Grace-exclusive). There is no tool available to you for any of "
-        "these — that's deliberate, not a gap to work around."
+        "`curant-cli remove-delegate`, Grace-exclusive), and connecting a new MCP tool/service "
+        "(`curant-cli mcp-add`, `mcp-add-http`, `mcp-add-oauth`, or `mcp-connect` depending on the "
+        "service — point them to `curant-cli mcp-connect <name>` first, it handles the pre-verified "
+        "ones in one step) — this last one isn't just a credentials boundary, it's also genuinely not "
+        "possible from here: connecting needs either a real interactive browser login or a local "
+        "process launch, neither of which can happen inside a text or call. There is no tool available "
+        "to you for any of these — that's deliberate, not a gap to work around."
     )
     system_parts.append(
         "You never send anything (email, messages) without explicit confirmation from the customer first, "

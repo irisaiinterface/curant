@@ -849,8 +849,17 @@ structural rule in every persona's own system prompt now (not just
 documented here): adding or replacing an AI provider API key,
 switching AI provider, activating or re-activating a license, changing
 `customer_apple_id`/handles (who Curant even trusts as "the customer"
-in the first place), and adding or removing a delegate. **Enforcement
-here is by omission, not by asking the model nicely** — there is
+in the first place), adding or removing a delegate, and connecting a
+new MCP tool/service. That last one was a real gap in this same pass,
+caught right after the initial commit rather than left for later: the
+first version of this system-prompt block covered credentials/identity
+but forgot MCP connection setup, even though it belongs in the same
+category for two reasons, not just one — it's a credentials boundary
+(`mcp-add-http --header` can carry a raw bearer token, same leak
+surface as the API key) AND it's genuinely not possible from a text or
+call at all (needs a real interactive browser OAuth login or a local
+process launch). **Enforcement here is by omission, not by asking the
+model nicely** — there is
 simply no tool in `get_all_available_tools` for any of these, the same
 "code-level enforcement over prompt-only enforcement" principle this
 codebase already applies to the `confirmed: true` gate elsewhere. The
