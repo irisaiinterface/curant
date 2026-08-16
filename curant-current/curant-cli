@@ -5742,9 +5742,78 @@ def request_with_retries(req, timeout, max_attempts=3):
     raise last_error
 
 
+# Bumped whenever Curant_ToS_Privacy_Draft.md changes in a way that
+# materially affects what's disclosed (e.g. the Grace conversation-
+# retention window fix). Anyone who already agreed to an older version
+# is asked again once, not silently carried forward -- consent to a
+# document is consent to what it actually says, not to whatever it
+# later becomes.
+PRIVACY_ACK_VERSION = "2026-08-16"
+
+PRIVACY_ACK_SUMMARY = """
+Before continuing, here's the short version of what Curant does with
+your data (full draft: Curant_ToS_Privacy_Draft.md in the repo -- this
+is a plain-language summary of it, not a separate or looser policy):
+
+  - Your persona, instructions, memory, and recent conversation history
+    live on this Mac only. They are never sent to Curant's servers.
+  - Your AI provider API key is stored locally and used to call your
+    provider directly from this machine -- never seen by Curant.
+  - Curant's servers only ever see: your license key, plan/add-ons,
+    which Mac your license is bound to, a running count of how many
+    messages you've exchanged (not their content), and generic error
+    codes if something breaks.
+  - This account is for one person's own use, not a shared or team tool,
+    and you must be 18 or older to use it.
+  - This is beta software, provided as-is -- expect rough edges, and
+    the underlying draft policy is still pending a real attorney review
+    before any paid, public launch.
+"""
+
+
+def _ensure_privacy_consent(config):
+    """Gate first activation on a one-time, explicit acknowledgment of
+    the plain-language privacy/ToS summary above. Nothing in this file
+    asked for this before -- activate() ran straight from a license key
+    to a bound device with no acknowledgment step at all, closed beta or
+    not. Re-asks if PRIVACY_ACK_VERSION has moved past whatever the
+    customer last agreed to. Returns True if consent is already on file
+    or was just given; False if it wasn't (caller should not proceed).
+    """
+    if config.get("privacy_ack_version") == PRIVACY_ACK_VERSION:
+        return True
+
+    if os.environ.get("CURANT_SKIP_PRIVACY_ACK") == "1":
+        # Escape hatch for automated/non-interactive test environments
+        # only (mirrors CURANT_DEV_UNLICENSED's pattern) -- never set
+        # this for a real customer or beta tester.
+        return True
+
+    if not sys.stdin.isatty():
+        print("Activation needs a one-time privacy acknowledgment, which requires "
+              "an interactive terminal. Run `curant-cli activate <key>` directly "
+              "in a terminal, not from a script.")
+        return False
+
+    print(PRIVACY_ACK_SUMMARY)
+    answer = _wizard_prompt("Type 'I agree' to continue: ", default="") or ""
+    if answer.strip().lower() not in ("i agree", "agree", "y", "yes"):
+        print("Not activated -- Curant needs this acknowledgment before it can run.")
+        return False
+
+    config["privacy_ack_version"] = PRIVACY_ACK_VERSION
+    config["privacy_ack_time"] = time.time()
+    save_config(config)
+    return True
+
+
 def activate(license_key):
     """Verify a license key against the server (billing/entitlement check
     only) and store the result locally."""
+    config = load_config()
+    if not _ensure_privacy_consent(config):
+        sys.exit(1)
+
     device_id = get_device_id()
     payload = json.dumps({"license_key": license_key, "device_id": device_id}).encode()
     req = urllib.request.Request(

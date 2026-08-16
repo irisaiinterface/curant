@@ -558,6 +558,32 @@ set once — legacy single-key installs still work via a fallback),
 `proactivity_enabled`, `pending_usage_count` (accumulates locally,
 reported and reset on the
 periodic status check), and a cached status-check timestamp.
+`privacy_ack_version` / `privacy_ack_time` — see the consent gate note
+just below; both are local-only, never reported to the server.
+
+### Privacy/ToS acknowledgment gate on first activation (Aug 2026)
+
+Real gap found during a beta-readiness pass, closed group or not:
+`activate()` had no consent step at all — a license key went straight
+to a bound device with nobody ever having agreed to anything, since
+there was no web signup flow to put a checkbox on. `activate()` now
+shows a short plain-language summary of `Curant_ToS_Privacy_Draft.md`
+(what's local-only vs. what the server sees, the 18+/one-person clause,
+and an explicit "this is beta software" note) and requires typing "I
+agree" before continuing, in any terminal-based entry point (`curant-cli
+activate <key>` directly, or via `setup_wizard_cmd`'s guided flow, since
+both call the same `activate()`). The acknowledgment — a version string
+tied to the draft doc plus a timestamp — is stored locally only and
+never reported to the server. `PRIVACY_ACK_VERSION` gets bumped whenever
+the underlying draft changes in a way that materially affects what's
+disclosed, which re-prompts anyone who agreed to an older version rather
+than silently carrying old consent forward. `CURANT_SKIP_PRIVACY_ACK=1`
+exists purely for automated/non-interactive test environments — never
+set it for a real customer or beta tester. **Honestly flagged:** this is
+still the plain-language draft, not the attorney-reviewed policy — the
+gate makes sure someone actually saw and agreed to *something* before
+using the product, it doesn't substitute for that review before a real
+paid, public launch.
 
 **Locally, in `~/.curant/local.db`** (file permissions `600`, owner-only):
 `important_people`, `memories` (no expiry — the intentional long-term
