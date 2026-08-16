@@ -2551,6 +2551,73 @@ def get_all_available_tools(config):
         "builtin": True,
     })
 
+    # Preference tools moved from CLI/web-only to text, Aug 2026 pass --
+    # same reasoning as set_notification_preferences above: these are
+    # customer-facing PREFERENCES, not credentials or trust-boundary
+    # changes, so there's no reason a text request should be redirected
+    # to the terminal for them. Deliberately NOT included here: API key
+    # entry, provider switching, adding a delegate, and anything that
+    # establishes who Curant should even trust as "the customer" in the
+    # first place -- see the explicit terminal-only note this function's
+    # caller (build_system_prompt) adds to every persona's system prompt.
+    tools.append({
+        "qualified_name": "set_persona",
+        "description": (
+            "Switches which persona (tone/system prompt) Curant uses going forward, when the "
+            "customer asks in conversation (e.g. \"switch me to Grace\", \"can I talk to Dean instead\", "
+            "\"go back to being Curant\"). Instructions, memories, and important people all carry over "
+            "unchanged -- only the tone/specialization changes. Valid persona names are given to you "
+            "above in this system prompt's context; if the customer names one that doesn't exist, "
+            "tell them plainly rather than guessing which one they meant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"persona": {"type": "string", "description": "One of the valid persona names (lowercase), e.g. 'grace', 'dean', 'curant'"}},
+            "required": ["persona"],
+        },
+        "server_command": None,
+        "raw_name": "set_persona",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "set_spend_cap",
+        "description": (
+            "Sets, removes, or reports the customer's own monthly dollar cap on August's paid "
+            "generation tools (image/voice/video), when they ask in conversation (e.g. \"cap my "
+            "image spend at $20 a month\", \"what's my generation spend cap\", \"remove my spend "
+            "cap\"). This is the customer's own limit on their own API usage -- no confirmation "
+            "needed beyond the request itself. Pass amount_usd to set a new cap, remove_cap=true to "
+            "take it off entirely, or neither to just report the current cap and this month's spend "
+            "so far."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount_usd": {"type": "number", "description": "New monthly cap in dollars, e.g. 20 or 20.00"},
+                "remove_cap": {"type": "boolean", "description": "true to remove the cap entirely instead of setting an amount"},
+            },
+        },
+        "server_command": None,
+        "raw_name": "set_spend_cap",
+        "builtin": True,
+    })
+    tools.append({
+        "qualified_name": "set_quote_phone",
+        "description": (
+            "Sets or reports the phone number given out when Curant logs a capability gap and "
+            "tells the customer to call for a custom quote (e.g. \"set my quote line to 555-0100\", "
+            "\"what's my quote phone number set to\"). Purely a config value used in capability-gap "
+            "replies -- no confirmation needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"phone_number": {"type": "string", "description": "The phone number to use, in any reasonable format"}},
+        },
+        "server_command": None,
+        "raw_name": "set_quote_phone",
+        "builtin": True,
+    })
+
     if get_customer_august_tier(config) == "grace":
         tools.append({
             "qualified_name": "search_order_status",
@@ -2571,6 +2638,117 @@ def get_all_available_tools(config):
             },
             "server_command": None,
             "raw_name": "search_order_status",
+            "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "set_vip_status",
+            "description": (
+                "Marks or unmarks a contact as VIP, when the customer asks in conversation (e.g. "
+                "\"make my mom a VIP\", \"my business partner should always get through to me\", "
+                "\"take Dave off VIP\"). A VIP's texts always notify the customer in real time, even "
+                "if their text access mode is 'approved' (the default, which otherwise silently drops "
+                "texts from anyone who isn't the customer). Needs the contact's actual handle (phone "
+                "number or email) -- if the customer only gave a name, use lookup_person first, or ask "
+                "for the number/email if it truly can't be resolved."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "Phone number or email of the contact"},
+                    "is_vip": {"type": "boolean", "description": "true to mark VIP, false to unmark"},
+                },
+                "required": ["handle", "is_vip"],
+            },
+            "server_command": None,
+            "raw_name": "set_vip_status",
+            "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "manage_auto_reply_contact",
+            "description": (
+                "Opts a specific contact in or out of Curant actually SENDING routine replies to them "
+                "on the customer's behalf, instead of only ever drafting and asking first -- when the "
+                "customer asks in conversation (e.g. \"let Curant handle routine texts from my assistant "
+                "automatically\", \"stop auto-replying to Dave, go back to asking me first\"). This never "
+                "applies to anything urgent or high-stakes regardless of this setting, and never "
+                "overrides VIP status -- both checked fresh on every message, not just at opt-in time. "
+                "Needs the contact's actual handle (phone number or email)."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "string", "description": "Phone number or email of the contact"},
+                    "action": {"type": "string", "enum": ["add", "remove"], "description": "'add' to opt them in, 'remove' to go back to draft-and-ask"},
+                    "label": {"type": "string", "description": "Optional short label for this contact, e.g. 'assistant'"},
+                },
+                "required": ["handle", "action"],
+            },
+            "server_command": None,
+            "raw_name": "manage_auto_reply_contact",
+            "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "set_quiet_hours",
+            "description": (
+                "Sets or removes a quiet window during which the daily briefing and weekly rollup skip "
+                "sending, when the customer asks in conversation (e.g. \"don't send me anything after "
+                "9pm\", \"quiet hours 10pm to 7am\", \"turn off quiet hours\"). Does NOT affect real-time "
+                "third-party message notifications or VIP escalation -- those still come through "
+                "regardless of this setting. Pass start_time and end_time as 24-hour 'HH:MM', or "
+                "off=true to remove quiet hours entirely."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "start_time": {"type": "string", "description": "24-hour 'HH:MM', e.g. '21:00'"},
+                    "end_time": {"type": "string", "description": "24-hour 'HH:MM', e.g. '07:00' -- wrapping past midnight is fine"},
+                    "off": {"type": "boolean", "description": "true to remove quiet hours entirely instead of setting a window"},
+                },
+            },
+            "server_command": None,
+            "raw_name": "set_quiet_hours",
+            "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "set_travel_mode",
+            "description": (
+                "Sets which IANA timezone quiet-hours comparisons use, when the customer asks in "
+                "conversation (e.g. \"I'm in Tokyo this week\", \"switch back to my home timezone\"). "
+                "Only affects the quiet-hours suppression check, not when scheduled jobs actually fire "
+                "(those still run at this Mac's own local clock time). Pass timezone as a real IANA "
+                "name like 'Asia/Tokyo' or 'Europe/London', or off=true to go back to this Mac's local "
+                "timezone."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "timezone": {"type": "string", "description": "IANA timezone name, e.g. 'Asia/Tokyo'"},
+                    "off": {"type": "boolean", "description": "true to remove travel mode and use this Mac's local timezone"},
+                },
+            },
+            "server_command": None,
+            "raw_name": "set_travel_mode",
+            "builtin": True,
+        })
+        tools.append({
+            "qualified_name": "set_elevenlabs_voice",
+            "description": (
+                "Sets a custom ElevenLabs voice id (including the customer's own cloned voice, if "
+                "they've set one up on their own ElevenLabs account) for August's generate_voice tool, "
+                "when the customer asks in conversation (e.g. \"use my cloned voice for narration\", "
+                "\"switch back to the default voice\"). This is purely a config value plus a tier check "
+                "at generation time -- there's no cost implication either way since ElevenLabs is "
+                "BYOK regardless. The voice id must actually exist on the customer's own ElevenLabs "
+                "account; Curant can't verify that here, just tell them to double-check if narration "
+                "later comes back wrong."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {"voice_id": {"type": "string", "description": "The ElevenLabs voice id to use"}},
+                "required": ["voice_id"],
+            },
+            "server_command": None,
+            "raw_name": "set_elevenlabs_voice",
             "builtin": True,
         })
 
@@ -4945,6 +5123,133 @@ def execute_tool_call(tool_name, arguments, available_tools):
         save_config(config)
         return f"Updated: {', '.join(changed)}."
 
+    if match["builtin"] and tool_name == "set_persona":
+        persona = (arguments.get("persona") or "").strip().lower()
+        if persona not in PERSONAS:
+            return f"[Refused: '{persona}' isn't a valid persona. Available: {', '.join(PERSONAS.keys())}.]"
+        config = load_config()
+        config["persona"] = persona
+        save_config(config)
+        return (f"Switched to {persona}. Instructions, memories, and important people all carry over "
+                f"unchanged — only the tone/specialization changed.")
+
+    if match["builtin"] and tool_name == "set_spend_cap":
+        config = load_config()
+        current_spend = get_monthly_estimated_spend()
+        if arguments.get("remove_cap"):
+            config["monthly_spend_cap_usd"] = None
+            save_config(config)
+            return "Spend cap removed — generation tools are now uncapped."
+        if "amount_usd" in arguments:
+            try:
+                new_cap = float(arguments["amount_usd"])
+                if new_cap < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return f"[Refused: '{arguments.get('amount_usd')}' isn't a valid non-negative dollar amount.]"
+            config["monthly_spend_cap_usd"] = new_cap
+            save_config(config)
+            note = ""
+            if current_spend >= new_cap:
+                note = " Note: this month's spend already meets or exceeds this cap — generation tools will be blocked until next month or a higher cap."
+            return f"Monthly spend cap set to ${new_cap:.2f}. This month's spend so far: ~${current_spend:.2f}.{note}"
+        current_cap = get_monthly_spend_cap(config)
+        cap_str = "no cap set" if current_cap is None else f"${current_cap:.2f}/month"
+        return f"This month's generation spend so far: ~${current_spend:.2f}. Current cap: {cap_str}."
+
+    if match["builtin"] and tool_name == "set_quote_phone":
+        config = load_config()
+        number = (arguments.get("phone_number") or "").strip()
+        if not number:
+            current = config.get("quote_phone_number")
+            return (f"Current quote phone number: {current}" if current
+                    else "No quote phone number set yet — capability-gap replies omit the \"call ___\" line until one is set.")
+        config["quote_phone_number"] = number
+        save_config(config)
+        return f"Quote phone number set to: {number}"
+
+    if match["builtin"] and tool_name == "set_vip_status":
+        handle = (arguments.get("handle") or "").strip()
+        if not handle:
+            return "[No handle provided — nothing was changed.]"
+        is_vip = bool(arguments.get("is_vip", True))
+        set_vip(handle, is_vip=is_vip)
+        return (f"{handle} marked {'VIP' if is_vip else 'not VIP'}."
+                + (" Their texts will now reach the customer even in 'approved' access mode." if is_vip else ""))
+
+    if match["builtin"] and tool_name == "manage_auto_reply_contact":
+        handle = (arguments.get("handle") or "").strip()
+        action = (arguments.get("action") or "").strip().lower()
+        if not handle or action not in ("add", "remove"):
+            return "[Refused: needs a handle and action ('add' or 'remove').]"
+        if action == "add":
+            label = (arguments.get("label") or "").strip()
+            with closing(get_local_db()) as conn:
+                conn.execute(
+                    "INSERT INTO auto_reply_contacts (handle, label) VALUES (?, ?) "
+                    "ON CONFLICT(handle) DO UPDATE SET label = excluded.label",
+                    (handle, label),
+                )
+                conn.commit()
+            return (f"{handle} added as an auto-reply contact{f' ({label})' if label else ''}. Curant may now "
+                    f"send routine replies to them directly (never anything urgent or high-stakes) instead of "
+                    f"asking the customer first each time — they'll still get an FYI notice after it happens.")
+        with closing(get_local_db()) as conn:
+            conn.execute("DELETE FROM auto_reply_contacts WHERE handle = ?", (handle,))
+            conn.commit()
+        return f"{handle} removed from auto-reply contacts — back to drafting suggestions and asking first."
+
+    if match["builtin"] and tool_name == "set_quiet_hours":
+        config = load_config()
+        if arguments.get("off"):
+            config.pop("quiet_hours_start", None)
+            config.pop("quiet_hours_end", None)
+            save_config(config)
+            return "Quiet hours turned off."
+        start_str = arguments.get("start_time")
+        end_str = arguments.get("end_time")
+        if not start_str and not end_str:
+            start = config.get("quiet_hours_start")
+            end = config.get("quiet_hours_end")
+            return f"Quiet hours: {start}-{end}." if start and end else "No quiet hours set."
+        start = _parse_hhmm(start_str) if start_str else None
+        end = _parse_hhmm(end_str) if end_str else None
+        if not start or not end:
+            return "[Refused: needs both start_time and end_time as 24-hour 'HH:MM', e.g. '21:00' and '07:00'.]"
+        config["quiet_hours_start"] = start_str
+        config["quiet_hours_end"] = end_str
+        save_config(config)
+        return f"Quiet hours set: {start_str}-{end_str}. Daily briefing and weekly rollup will skip sending during this window."
+
+    if match["builtin"] and tool_name == "set_travel_mode":
+        config = load_config()
+        if arguments.get("off"):
+            config.pop("travel_timezone", None)
+            save_config(config)
+            return "Travel mode turned off — back to this Mac's local timezone."
+        tz_str = (arguments.get("timezone") or "").strip()
+        if not tz_str:
+            current = config.get("travel_timezone")
+            return f"Travel timezone: {current or 'not set (using this Mac' + chr(39) + 's local timezone)'}."
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_str)
+        except Exception:
+            return f"[Refused: '{tz_str}' isn't a recognized IANA timezone, e.g. 'Asia/Tokyo' or 'Europe/London'.]"
+        config["travel_timezone"] = tz_str
+        save_config(config)
+        return f"Travel timezone set to {tz_str}. Quiet hours now compare against this timezone."
+
+    if match["builtin"] and tool_name == "set_elevenlabs_voice":
+        voice_id = (arguments.get("voice_id") or "").strip()
+        if not voice_id:
+            return "[No voice_id provided — nothing was changed.]"
+        config = load_config()
+        config["elevenlabs_voice_id"] = voice_id
+        save_config(config)
+        return (f"Voice set to {voice_id}. This applies to the customer's own ElevenLabs account/key — "
+                f"it must actually exist there (a cloned voice or one of ElevenLabs' own presets).")
+
     if match["builtin"] and tool_name in (
         "generate_image", "generate_image_with_text", "generate_voice", "edit_media"
     ):
@@ -7029,6 +7334,34 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         f"time (e.g. \"send it at 7pm instead\"), use set_notification_preferences directly rather "
         f"than logging it as a capability gap — this is a real, already-built feature, just one they "
         f"may not know exists."
+    )
+    system_parts.append(
+        "Other real, already-built preference changes you can make directly in conversation, never "
+        "logged as capability gaps: switching persona (set_persona), setting/removing a monthly "
+        "generation spend cap (set_spend_cap), and setting the quote-line phone number used in "
+        "capability-gap replies (set_quote_phone)."
+        + (
+            " Grace-exclusive, also available directly: marking/unmarking a VIP contact "
+            "(set_vip_status), adding/removing an auto-reply contact (manage_auto_reply_contact), "
+            "setting or removing quiet hours (set_quiet_hours), setting travel-mode timezone "
+            "(set_travel_mode), and setting a custom ElevenLabs voice id (set_elevenlabs_voice)."
+            if get_customer_august_tier(config) == "grace" else ""
+        )
+    )
+    system_parts.append(
+        "A firm, structural boundary, not a preference: some settings can ONLY be changed from the "
+        "terminal on the customer's own Mac, never here in conversation, because they involve real "
+        "credentials or change who Curant trusts as \"the customer\" in the first place — the same "
+        "reasoning Dean applies to shell safety mode, just for account-level settings instead of shell "
+        "access. If asked to change any of these by text, don't attempt it, don't pretend it's done, "
+        "and don't just say \"I can't do that\" — name the specific terminal command so the customer "
+        "can run it themselves: adding or replacing an AI provider API key (`curant-cli set-api-key`), "
+        "switching AI provider (`curant-cli set-provider`), activating or re-activating a license "
+        "(`curant-cli activate <key>`), changing which phone number or Apple ID Curant listens to "
+        "(`curant-cli setup`, or the web dashboard at the customer's account login), and adding or "
+        "removing a delegate with full assistant access (`curant-cli add-delegate` / "
+        "`curant-cli remove-delegate`, Grace-exclusive). There is no tool available to you for any of "
+        "these — that's deliberate, not a gap to work around."
     )
     system_parts.append(
         "You never send anything (email, messages) without explicit confirmation from the customer first, "

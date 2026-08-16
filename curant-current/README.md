@@ -818,6 +818,49 @@ browser tools, a real behavior change from before, confirmed
 deliberately rather than assumed; August's own generation tools remain
 unaffected by any of this.
 
+## Preferences moved to conversation, and a firm terminal-only boundary (Aug 2026)
+
+Before this pass, `set_notification_preferences` was the only actual
+preference change a customer could make by just asking in a text or
+call — everything else (persona, VIP contacts, auto-reply contacts,
+quiet hours, travel timezone, a custom ElevenLabs voice id, the
+generation spend cap, the capability-gap quote phone number) required
+the CLI or the web dashboard, even though none of it is more
+security-sensitive than what `set_notification_preferences` already
+allowed. Ten new builtin tools close that gap, same pattern as the
+existing one: `set_persona`, `set_spend_cap`, `set_quote_phone`
+(available to everyone), and `set_vip_status`,
+`manage_auto_reply_contact`, `set_quiet_hours`, `set_travel_mode`,
+`set_elevenlabs_voice` (Grace-exclusive, gated the same way
+`search_order_status` already was — the tool simply isn't in the list
+`get_all_available_tools` returns for anyone else). Each one validates
+input the same way its CLI equivalent did and returns a plain string
+result instead of `print()`+`sys.exit()` — calling the original
+`*_cmd` functions directly from a tool handler would have killed the
+whole `curant-cli` process on invalid input mid-conversation, since
+`sys.exit()` doesn't stop at the tool call, it stops the program.
+Manually verified all ten against a real config file, not just
+`py_compile` — every valid input, every invalid/refused input, and the
+Grace-tier gate itself, checked against the actual JSON written to
+`~/.curant/config.json` after each call.
+
+**Deliberately NOT moved to conversation**, and stated as a real,
+structural rule in every persona's own system prompt now (not just
+documented here): adding or replacing an AI provider API key,
+switching AI provider, activating or re-activating a license, changing
+`customer_apple_id`/handles (who Curant even trusts as "the customer"
+in the first place), and adding or removing a delegate. **Enforcement
+here is by omission, not by asking the model nicely** — there is
+simply no tool in `get_all_available_tools` for any of these, the same
+"code-level enforcement over prompt-only enforcement" principle this
+codebase already applies to the `confirmed: true` gate elsewhere. The
+system prompt addition is there so the model doesn't just say "I can't
+do that" unhelpfully, or worse, hallucinate that it succeeded — it's
+told to name the exact terminal command instead, borrowing the same
+framing Dean already uses for shell safety mode (a real capability
+that still requires an explicit, once-per-conversation choice before
+Curant touches it) and applying it to account-level settings instead.
+
 ## Local front-door layer — a small local model sitting in front of Claude
 
 A small local model (via [Ollama](https://ollama.com), running on the
