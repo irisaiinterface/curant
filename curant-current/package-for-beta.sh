@@ -17,7 +17,11 @@ cd "$SCRIPT_DIR"
 
 DATE_TAG="$(date +%Y-%m-%d)"
 STAGE_DIR="$(mktemp -d)/curant-current"
-OUT_ZIP="$SCRIPT_DIR/curant-current-beta-${DATE_TAG}.zip"
+# Lands in ~/Downloads rather than next to this script -- matches where a
+# real customer's copy would actually sit (AirDrop/browser downloads both
+# default there), and keeps it out of the git working tree so it never
+# shows up in `git status` or gets accidentally committed.
+OUT_ZIP="$HOME/Downloads/curant-current-beta-${DATE_TAG}.zip"
 
 echo "==> Staging a clean copy in a temp directory..."
 mkdir -p "$STAGE_DIR"
@@ -65,7 +69,8 @@ echo ""
 echo "==> Done: $OUT_ZIP"
 echo "    ($(du -h "$OUT_ZIP" | cut -f1))"
 echo ""
-echo "Send this file to a tester. They should:"
+echo "It's in your Downloads folder now -- send it to a tester as-is, or"
+echo "AirDrop/upload it directly from there. They should:"
 echo "  1. Unzip it"
 echo "  2. Open the curant-current folder"
 echo "  3. Double-click install.command"

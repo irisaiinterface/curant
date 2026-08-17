@@ -74,6 +74,17 @@ echo "==> Removing log files..."
 rm -f /tmp/curant-*.log /tmp/curant-*-error.log
 echo "    Done."
 
+echo "==> Removing leftover __pycache__ directories..."
+# Real gap found live: Python leaves a __pycache__ directory with compiled
+# .pyc files next to any .py file it runs (curant-watcher.py, and even
+# curant-cli itself despite having no .py extension -- Python still
+# compiles and caches it). Removing the source files above doesn't clean
+# these up, and they were still showing up in a filesystem search well
+# after an otherwise-complete uninstall.
+rm -rf "$HOME/bin/__pycache__"
+sudo rm -rf /usr/local/bin/__pycache__ 2>/dev/null || true
+echo "    Done."
+
 echo ""
 echo "==> Checking for leftover PATH/env additions in ~/.zprofile..."
 if [ -f "$HOME/.zprofile" ] && grep -q "CURANT_BETA_INSTALL_BLOCK" "$HOME/.zprofile" 2>/dev/null; then
