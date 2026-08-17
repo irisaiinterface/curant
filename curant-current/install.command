@@ -118,7 +118,16 @@ echo "    Using: $PY312"
 echo ""
 echo "==> Installing required Python packages..."
 "$PY312" -m pip install --break-system-packages --quiet --upgrade pip
-"$PY312" -m pip install --break-system-packages --quiet anthropic openai cryptography mcp requests
+"$PY312" -m pip install --break-system-packages --quiet anthropic openai google-genai cryptography mcp requests
+# google-genai specifically: real gap found live -- curant-cli setup offers
+# Gemini as an equal first-class provider choice alongside Anthropic/OpenAI
+# (same prompt, no caveat), but its actual live relay path imports the
+# native google-genai SDK directly (from google import genai), not just
+# OpenAI's compatibility endpoint. Without this package installed, picking
+# Gemini during setup produces a completely silent, working-looking install
+# that then fails every single message with "No module named 'google'" --
+# confirmed live on a fresh install, customer gets no response at all with
+# no indication why.
 echo "    Done."
 
 # ---------------------------------------------------------------------------

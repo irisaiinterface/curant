@@ -31,7 +31,7 @@ class Curant < Formula
     # Protocol client — only actually used if the customer connects an
     # MCP server (curant-cli mcp-add), but needs to be present for that
     # to work at all.
-    system Formula["python@3.12"].opt_bin/"pip3", "install", "anthropic", "openai", "cryptography", "mcp", "--quiet"
+    system Formula["python@3.12"].opt_bin/"pip3", "install", "anthropic", "openai", "google-genai", "cryptography", "mcp", "--quiet"
     # Future: also install the watcher/launchd service files here, e.g.
     # (prefix/"homebrew.mxcl.curant.plist").write launchd_plist_contents
   end
