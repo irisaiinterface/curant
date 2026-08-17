@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>app.curant.autoupdate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Homebrew python3.12, NOT /usr/bin/python3 (Apple's system
+             Python) - same reasoning as every other scheduled job here:
+             this run may send a text via osascript/Messages.app to tell
+             the customer an update happened (or failed), and macOS ties
+             Automation/AppleEvents permission to the exact requesting
+             binary. Apple's system python3 was never granted that
+             permission; the Homebrew one already was. -->
+        <string>/opt/homebrew/opt/python@3.12/bin/python3.12</string>
+        <string>-u</string>
+        <string>/usr/local/bin/curant-watcher.py</string>
+        <string>--auto-update-check</string>
+    </array>
+
+    <!-- Runs once a night at an off-peak hour, so an update (which
+         restarts the watcher service) never lands mid-conversation.
+         curant-cli auto-update itself is a no-op unless
+         config["auto_update_enabled"] is true (default on - see
+         `curant-cli set-auto-update`) and a genuinely newer version is
+         actually available, so this firing nightly costs nothing beyond
+         one small network check on nights with nothing to do. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- launchd does not source .zshrc/.zprofile, so curant-cli
+         (installed to this Mac's personal ~/bin) is not found on the
+         default PATH. Without this, curant-watcher.py's own internal
+         subprocess.run(["curant-cli", "auto-update"]) call fails
+         outright with "No such file or directory", same bug already
+         confirmed live and fixed in every other plist here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/AbhyudayDhundhel/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Dev/testing bypass, matching every other plist here.
+             Remove once a real license is activated via curant-cli
+             activate. -->
+        <key>CURANT_DEV_UNLICENSED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/curant-autoupdate.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/curant-autoupdate-error.log</string>
+</dict>
+</plist>
+<!--
+Install with:
+  cp com.curant.autoupdate.plist ~/Library/LaunchAgents/
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.autoupdate.plist
+
+On by default for every customer (config["auto_update_enabled"] defaults
+to True; a customer can turn it off with `curant-cli set-auto-update off`,
+or run updates by hand only via `curant-cli update`/`curant-cli
+check-update`). install.command generates this plist with the real
+detected $HOME/$PY312 paths, same as every other scheduled job - never
+install this checked-in copy directly, since it hardcodes the original
+developer's username and an Apple-Silicon-only Homebrew path.
+
+To test immediately rather than waiting for 4am, run curant-watcher.py
+directly with the flag shown in ProgramArguments above.
+
+Logs land at /tmp/curant-autoupdate.log and /tmp/curant-autoupdate-error.log.
+-->

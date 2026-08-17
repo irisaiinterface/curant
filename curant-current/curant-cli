@@ -48,6 +48,8 @@ import time
 from datetime import datetime, timedelta
 import urllib.request
 import urllib.error
+import zipfile
+import shutil
 from contextlib import closing
 
 CONFIG_DIR = os.path.expanduser("~/.curant")
@@ -57,6 +59,30 @@ SERVER_BASE = os.environ.get("CURANT_SERVER_BASE", "https://api.curant.app").rst
 # ^ Real endpoint once the license server is deployed. Override with
 #   CURANT_SERVER_BASE=http://127.0.0.1:5000 to point at a locally-run
 #   curant-current/server/app.py for development/self-hosted testing.
+
+# Bump this by hand every time a new beta build is cut with
+# package-for-beta.sh, and update the manifest at UPDATE_MANIFEST_URL to
+# match. Format MUST stay "YYYY-MM-DD.N" (zero-padded ISO date + a plain
+# sequence number for same-day releases) -- version comparison in
+# _version_is_newer() is a plain string comparison, which only sorts
+# correctly for this exact format, not arbitrary version strings.
+CURANT_VERSION = "2026-08-17.1"
+
+# Where curant-cli checks for updates. NOT a real access-controlled
+# channel -- see the honest note below -- deliberately kept as free,
+# unlisted hosting (e.g. a secret GitHub Gist) rather than a real
+# authenticated endpoint, since there's no live license server yet to
+# proxy through, and baking a real credential into this file wouldn't
+# actually be secret anyway: curant-cli ships as plain, readable source
+# to every customer (see the module docstring above), so any token
+# embedded here is exactly as exposed as this file itself. An unlisted
+# URL (not indexed, not advertised) is honest about being obscurity, not
+# real access control -- a reasonable tradeoff for a beta with trusted
+# testers, not something to describe as more secure than it is.
+UPDATE_MANIFEST_URL = os.environ.get(
+    "CURANT_UPDATE_MANIFEST_URL",
+    "REPLACE_WITH_YOUR_UPDATE_MANIFEST_URL",
+)
 
 # Development-only entitlement bypass. When CURANT_DEV_UNLICENSED=1, the
 # license/activation checks in relay() and status() are skipped so the brain
@@ -9534,6 +9560,210 @@ def onboarding_wizard_cmd():
           "set-*` commands -- run `curant-cli --help` to see them all.")
 
 
+def _fetch_update_manifest():
+    """
+    GETs UPDATE_MANIFEST_URL and returns the parsed
+    {"version": ..., "download_url": ..., "changelog": ...} dict, or None
+    on any failure (unreachable, not configured yet, malformed JSON) --
+    every caller treats None as "couldn't check, nothing to report" and
+    fails silently rather than alarming the customer over a network blip.
+    """
+    if not UPDATE_MANIFEST_URL or UPDATE_MANIFEST_URL.startswith("REPLACE_WITH_"):
+        return None
+    try:
+        req = urllib.request.Request(UPDATE_MANIFEST_URL, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            manifest = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(manifest, dict) or "version" not in manifest or "download_url" not in manifest:
+            return None
+        return manifest
+    except Exception:
+        return None
+
+
+def _version_is_newer(remote_version, local_version):
+    """
+    Plain string comparison -- only correct because CURANT_VERSION's
+    format is fixed as "YYYY-MM-DD.N" (see its own comment), which sorts
+    lexicographically the same as chronologically. Do not use this for
+    arbitrary semver-style strings.
+    """
+    return isinstance(remote_version, str) and remote_version > local_version
+
+
+def _download_and_apply_update(download_url):
+    """
+    Downloads the zip at download_url (the same shape package-for-beta.sh
+    produces: a top-level curant-current/ directory containing curant-cli
+    and mac/curant-watcher.py), replaces this Mac's installed copies in
+    ~/bin, and restarts the watcher service so it picks up the new code
+    immediately rather than waiting for the next unrelated restart.
+
+    Deliberately narrow scope: only curant-cli and curant-watcher.py get
+    replaced, never the *.plist files, install.command, or anything
+    else -- this is an update to the running brain/watcher, not a full
+    reinstall, and shouldn't risk touching a customer's already-working
+    launchd configuration.
+
+    Returns (success: bool, detail: str).
+    """
+    bin_dir = os.path.expanduser("~/bin")
+    tmp_dir = tempfile.mkdtemp(prefix="curant-update-")
+    try:
+        zip_path = os.path.join(tmp_dir, "update.zip")
+        req = urllib.request.Request(download_url)
+        with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp_dir)
+
+        # Locate the two files regardless of the exact top-level folder
+        # name inside the zip (package-for-beta.sh always names it
+        # curant-current/, but this stays robust to that changing).
+        new_cli = None
+        new_watcher = None
+        for root, _dirs, files in os.walk(tmp_dir):
+            if "curant-cli" in files and new_cli is None:
+                candidate = os.path.join(root, "curant-cli")
+                # Skip the zip file itself and anything under mac/ when
+                # looking for the top-level curant-cli specifically.
+                if os.path.basename(root) != "mac":
+                    new_cli = candidate
+            if "curant-watcher.py" in files and new_watcher is None:
+                new_watcher = os.path.join(root, "curant-watcher.py")
+
+        if not new_cli or not new_watcher:
+            return False, "update package didn't contain both curant-cli and curant-watcher.py"
+
+        os.makedirs(bin_dir, exist_ok=True)
+        shutil.copy2(new_cli, os.path.join(bin_dir, "curant-cli"))
+        shutil.copy2(new_watcher, os.path.join(bin_dir, "curant-watcher.py"))
+        os.chmod(os.path.join(bin_dir, "curant-cli"), 0o755)
+        os.chmod(os.path.join(bin_dir, "curant-watcher.py"), 0o755)
+
+        # Restart the watcher so the new code is actually running, not
+        # just sitting on disk until some unrelated future restart.
+        gui_domain = f"gui/{os.getuid()}"
+        plist_path = os.path.expanduser("~/Library/LaunchAgents/com.curant.watcher.plist")
+        subprocess.run(["launchctl", "bootout", f"{gui_domain}/app.curant.watcher"],
+                        capture_output=True)
+        if os.path.exists(plist_path):
+            subprocess.run(["launchctl", "bootstrap", gui_domain, plist_path], capture_output=True)
+
+        return True, "applied"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def check_update_cmd():
+    """`curant-cli check-update` -- read-only, just reports status."""
+    manifest = _fetch_update_manifest()
+    if manifest is None:
+        print("Couldn't check for updates (unreachable, or updates aren't configured yet).")
+        return
+    remote = manifest.get("version", "")
+    if _version_is_newer(remote, CURANT_VERSION):
+        print(f"Update available: {CURANT_VERSION} -> {remote}")
+        if manifest.get("changelog"):
+            print(f"What's new: {manifest['changelog']}")
+        print("Run `curant-cli update` to apply it.")
+    else:
+        print(f"Up to date (version {CURANT_VERSION}).")
+
+
+def update_cmd():
+    """
+    `curant-cli update` -- manual, on-demand. Running this command IS the
+    explicit action, so it applies without an extra confirmation prompt
+    once a real update is found (consistent with how e.g. `brew upgrade`
+    behaves) -- it does not silently run on its own; see auto_update_cmd
+    for the scheduled/unattended version of this.
+    """
+    print("Checking for updates...")
+    manifest = _fetch_update_manifest()
+    if manifest is None:
+        print("Couldn't check for updates right now (unreachable, or updates aren't configured yet).")
+        return
+    remote = manifest.get("version", "")
+    if not _version_is_newer(remote, CURANT_VERSION):
+        print(f"Already up to date (version {CURANT_VERSION}).")
+        return
+
+    print(f"Updating {CURANT_VERSION} -> {remote}...")
+    if manifest.get("changelog"):
+        print(f"What's new: {manifest['changelog']}")
+    success, detail = _download_and_apply_update(manifest["download_url"])
+    if success:
+        print(f"Updated to {remote}. The background watcher has been restarted.")
+    else:
+        print(f"Update failed: {detail}")
+        sys.exit(1)
+
+
+def auto_update_cmd():
+    """
+    Invoked unattended by com.curant.autoupdate.plist, once nightly at a
+    quiet off-peak hour -- deliberately NOT mid-conversation or on a
+    tight polling interval, to avoid ever restarting the watcher while a
+    real exchange with the customer is in progress. Opt-out, not opt-in
+    (config["auto_update_enabled"] defaults True) -- for a beta
+    specifically, getting fixes out reliably matters more than requiring
+    every tester to remember to run `curant-cli update` by hand; toggle
+    with `curant-cli set-auto-update off` if that's the wrong default
+    for a given install.
+
+    Prints a single JSON line either way so curant-watcher.py's
+    --auto-update-check entry point can text the customer what happened
+    -- success AND failure are both reported, never silent, so a failed
+    auto-update doesn't leave a customer confused about why nothing
+    changed with no explanation at all.
+    """
+    config = load_config()
+    if not config.get("auto_update_enabled", True):
+        print(json.dumps({"notify_text": None}))
+        return
+
+    manifest = _fetch_update_manifest()
+    if manifest is None:
+        print(json.dumps({"notify_text": None}))
+        return
+
+    remote = manifest.get("version", "")
+    if not _version_is_newer(remote, CURANT_VERSION):
+        print(json.dumps({"notify_text": None}))
+        return
+
+    success, detail = _download_and_apply_update(manifest["download_url"])
+    if success:
+        changelog = manifest.get("changelog", "")
+        text = f"Curant just updated itself to version {remote}."
+        if changelog:
+            text += f" What's new: {changelog}"
+        print(json.dumps({"notify_text": text}))
+    else:
+        print(json.dumps({
+            "notify_text": (
+                f"Tried to auto-update to version {remote} but it failed ({detail}). "
+                f"Nothing changed -- still running {CURANT_VERSION}. Run `curant-cli update` "
+                f"to try again by hand, or let us know if it keeps failing."
+            )
+        }))
+
+
+def set_auto_update_cmd(enabled_str):
+    config = load_config()
+    if enabled_str is None:
+        current = config.get("auto_update_enabled", True)
+        print(f"Auto-update is currently {'ON' if current else 'OFF'} (default: ON).")
+        return
+    config["auto_update_enabled"] = enabled_str.strip().lower() == "on"
+    save_config(config)
+    print(f"Auto-update is now {'ON' if config['auto_update_enabled'] else 'OFF'}.")
+
+
 def run_automated_backup():
     """
     Grace-exclusive, unattended -- invoked by com.curant.autobackup.plist
@@ -10879,6 +11109,12 @@ def main():
 
     sub.add_parser("run-automated-backup", help="Internal — runs the scheduled weekly auto-backup (Grace-only, no-op otherwise)")
 
+    sub.add_parser("check-update", help="Check whether a newer version of Curant is available (read-only)")
+    sub.add_parser("update", help="Check for and apply a Curant update now")
+    sub.add_parser("auto-update", help="Internal — runs the unattended nightly update check (see com.curant.autoupdate.plist)")
+    p_auto_update_toggle = sub.add_parser("set-auto-update", help="Turn unattended nightly auto-update on or off (default: on)")
+    p_auto_update_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
+
     p_mark_vip = sub.add_parser("mark-vip", help="Grace-exclusive: mark a contact as VIP -- their texts reach you even in 'approved' access mode")
     p_mark_vip.add_argument("handle", help="Phone number or email, as it appears in Messages")
     p_mark_vip.add_argument("enabled", choices=["on", "off"])
@@ -11098,6 +11334,14 @@ def main():
         set_auto_backup_cmd(args.enabled)
     elif args.command == "run-automated-backup":
         run_automated_backup()
+    elif args.command == "check-update":
+        check_update_cmd()
+    elif args.command == "update":
+        update_cmd()
+    elif args.command == "auto-update":
+        auto_update_cmd()
+    elif args.command == "set-auto-update":
+        set_auto_update_cmd(args.enabled)
     elif args.command == "mark-vip":
         mark_vip_cmd(args.handle, args.enabled)
     elif args.command == "vip-handles":

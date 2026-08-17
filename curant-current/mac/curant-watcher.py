@@ -1558,6 +1558,35 @@ def main():
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
+def run_auto_update_check():
+    """
+    Invoked nightly by com.curant.autoupdate.plist (see install.command) --
+    same run-and-exit pattern as run_daily_briefing/run_proactive_check.
+    Shells out to `curant-cli auto-update`, which does the actual version
+    check/download/apply and prints a single JSON line:
+    {"notify_text": "..."} if the customer should be told something
+    (a successful update, or a failed one -- auto-update never fails
+    silently), or {"notify_text": null} if there's nothing to report
+    (already up to date, auto-update turned off, or the manifest is
+    unreachable/not configured yet).
+    """
+    result = subprocess.run(
+        ["curant-cli", "auto-update"],
+        capture_output=True, text=True,
+    )
+    try:
+        decision = json.loads(result.stdout.strip())
+    except (json.JSONDecodeError, TypeError):
+        print(f"Unexpected auto-update output (length {len(result.stdout)})", file=sys.stderr)
+        return
+
+    notify_text = decision.get("notify_text")
+    if not notify_text:
+        return
+
+    send_text_reply(CUSTOMER_APPLE_ID, notify_text)
+
+
 if __name__ == "__main__":
     if "--proactive-check" in sys.argv:
         # Invoked once by com.curant.proactive.plist on a schedule — runs
@@ -1584,5 +1613,9 @@ if __name__ == "__main__":
         # queues drafts, which the customer then hears about via the
         # next daily briefing.
         subprocess.run(["curant-cli", "iris-inbox-check"], capture_output=True, text=True)
+    elif "--auto-update-check" in sys.argv:
+        # Invoked nightly by com.curant.autoupdate.plist -- same
+        # run-and-exit pattern as --proactive-check above.
+        run_auto_update_check()
     else:
         main()

@@ -293,7 +293,21 @@ write_plist "irisinbox" "--iris-inbox-check" \
     <false/>" \
 ""
 
-for svc in watcher dailybriefing proactive weeklyrollup meetingprep irisinbox; do
+# Auto-update check -- 4am nightly, off-peak so a restart of the watcher
+# service (which an applied update triggers) never lands mid-conversation.
+# curant-cli auto-update itself is a no-op unless a genuinely newer
+# version is actually published, so this firing nightly costs nothing
+# beyond one small network check on nights with nothing to do. On by
+# default (config["auto_update_enabled"] defaults to True); a tester can
+# turn it off with `curant-cli set-auto-update off`.
+write_plist "autoupdate" "--auto-update-check" \
+"    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+    <key>RunAtLoad</key>
+    <false/>" \
+""
+
+for svc in watcher dailybriefing proactive weeklyrollup meetingprep irisinbox autoupdate; do
     load_plist "$svc"
 done
 
