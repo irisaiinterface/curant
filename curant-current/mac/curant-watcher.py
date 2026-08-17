@@ -320,11 +320,54 @@ def report_watcher_error(error_code):
         pass  # telemetry reporting must never itself become a new failure
 
 
+def _get_current_max_rowid():
+    """
+    Real bug, found live on a genuinely fresh install: with no persisted
+    cursor yet, get_last_seen_rowid() used to fall back to 0, which
+    fetch_new_messages() then reads as "everything in chat.db counts as
+    new" -- on a customer's Mac whose Apple ID/number already has ANY
+    prior message history (not unusual; a customer's Apple ID is
+    normally their existing everyday one, not a fresh one made just for
+    Curant), the very first poll after install replays the entire
+    historical thread through Curant instantly, all at once, including
+    (confirmed live) advancing a stateful flow like the personalization
+    Q&A through every question in one burst with no real customer reply
+    ever received, since each stale historical message got treated as a
+    fresh "answer."
+
+    Fixed by seeding the cursor to the CURRENT max ROWID the first time
+    the watcher ever starts, so it only ever reacts to messages that
+    arrive from this point forward -- never replays history. Global max
+    across the whole message table (not filtered to the customer's own
+    handle) is intentional and sufficient: ROWIDs are monotonically
+    increasing across the entire table regardless of sender, so this
+    just establishes "now" as a starting line; fetch_new_messages still
+    does its own real customer/VIP/delegate filtering on top of it.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{CHAT_DB_PATH}?mode=ro", uri=True)
+        row = conn.execute("SELECT MAX(ROWID) as max_rowid FROM message").fetchone()
+        conn.close()
+        return row[0] if row and row[0] is not None else 0
+    except Exception:
+        # chat.db unreadable (e.g. Full Disk Access not granted yet) --
+        # fall back to the old behavior rather than crashing startup.
+        # This is a pre-existing hard prerequisite for the watcher to
+        # work at all, so this path rarely matters in practice.
+        return 0
+
+
 def get_last_seen_rowid():
     if os.path.exists(LAST_SEEN_ROWID_FILE):
         with open(LAST_SEEN_ROWID_FILE) as f:
             return int(f.read().strip() or 0)
-    return 0
+    # No cursor yet -- fresh install. Seed to "now" (see
+    # _get_current_max_rowid's docstring) and persist it immediately so
+    # this only ever happens once, not on every restart before the file
+    # exists for some other reason.
+    current = _get_current_max_rowid()
+    save_last_seen_rowid(current)
+    return current
 
 
 def save_last_seen_rowid(rowid):
