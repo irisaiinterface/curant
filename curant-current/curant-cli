@@ -7384,13 +7384,14 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
     system_parts.append(
         "Other real, already-built preference changes you can make directly in conversation, never "
         "logged as capability gaps: switching persona (set_persona), setting/removing a monthly "
-        "generation spend cap (set_spend_cap), and setting the quote-line phone number used in "
-        "capability-gap replies (set_quote_phone)."
+        "generation spend cap (set_spend_cap), setting the quote-line phone number used in "
+        "capability-gap replies (set_quote_phone), and adding/removing an auto-reply contact "
+        "(manage_auto_reply_contact -- available on every tier, not Grace-exclusive)."
         + (
             " Grace-exclusive, also available directly: marking/unmarking a VIP contact "
-            "(set_vip_status), adding/removing an auto-reply contact (manage_auto_reply_contact), "
-            "setting or removing quiet hours (set_quiet_hours), setting travel-mode timezone "
-            "(set_travel_mode), and setting a custom ElevenLabs voice id (set_elevenlabs_voice)."
+            "(set_vip_status), setting or removing quiet hours (set_quiet_hours), setting "
+            "travel-mode timezone (set_travel_mode), and setting a custom ElevenLabs voice id "
+            "(set_elevenlabs_voice)."
             if get_customer_august_tier(config) == "grace" else ""
         )
     )
