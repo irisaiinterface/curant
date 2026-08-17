@@ -2078,6 +2078,49 @@ GEMINI_MODEL_CHAINS = {
     ],
 }
 
+# Anthropic and OpenAI fallback chains, added to match Gemini's pattern
+# above ("add smart model selection for claude, gemini, and chatgpt" --
+# previously only Gemini had a real ordered multi-model chain; Anthropic
+# and OpenAI just bounced between their own two PROVIDER_MODELS entries
+# via _model_fallback_chain's generic fallback branch).
+#
+# Deliberately shallower than Gemini's 6-7-model chain right now: every
+# entry below is a model this codebase ALREADY references in
+# PROVIDER_MODELS (so already confirmed to be a real, working model id
+# for this app) rather than a newly invented model name. Gemini's deep
+# chain was built the same way Gemini's was earned -- by hitting real
+# quota walls live and adding the next confirmed-working model one at a
+# time (see GEMINI_MODEL_CHAINS's own comment above) -- not guessed
+# ahead of time. Extend these the same way once a real rate-limit/quota
+# error is actually observed live against Anthropic or OpenAI: add the
+# next model AFTER confirming its id is correct, same discipline as
+# above, rather than padding this out with unverified guesses now.
+#
+# "main": quality first, same reasoning as Gemini's main chain -- a text
+# reply isn't latency-constrained the way a live call is, so try the
+# best available model before falling back.
+# "fast": speed/cost first, same reasoning as Gemini's fast chain --
+# used for live calls and by _text_prefers_fast_tier's downgrade for
+# short/routine text (see that function's docstring).
+ANTHROPIC_MODEL_CHAINS = {
+    "main": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+    "fast": ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"],
+}
+
+OPENAI_MODEL_CHAINS = {
+    "main": ["gpt-4o", "gpt-4o-mini"],
+    "fast": ["gpt-4o-mini", "gpt-4o"],
+}
+
+# Every provider's chain lives in one place, keyed by provider name --
+# _model_fallback_chain looks up here first now, uniformly, instead of
+# special-casing Gemini as the only provider with a real chain.
+MODEL_CHAINS_BY_PROVIDER = {
+    "anthropic": ANTHROPIC_MODEL_CHAINS,
+    "openai": OPENAI_MODEL_CHAINS,
+    "gemini": GEMINI_MODEL_CHAINS,
+}
+
 DEFAULT_PROVIDER = "anthropic"
 
 # Gemini speaks the OpenAI wire format via this compatibility endpoint, so it
@@ -5508,13 +5551,16 @@ def _is_quota_error(e):
 def _model_fallback_chain(provider, tier):
     """Ordered list of models to try for one call.
 
-    For gemini: uses the full ordered GEMINI_MODEL_CHAINS[tier] list (up
-    to 6-7 models deep, see that dict's comment for how the ordering was
-    derived from AI Studio's live rate-limit dashboard). For every other
-    provider: falls back to the older, simpler behavior -- the requested
-    tier's own configured model first, then every OTHER tier's model for
-    the same provider, since anthropic/openai only have the two-entry
-    main/fast split with no deeper chain defined.
+    Looks up MODEL_CHAINS_BY_PROVIDER[provider][tier] uniformly for all
+    three providers now (previously only Gemini had a real chain here;
+    Anthropic/OpenAI fell back to a generic "requested tier, then every
+    other tier" shuffle -- see ANTHROPIC_MODEL_CHAINS/OPENAI_MODEL_CHAINS
+    above for why their chains are intentionally shallower than
+    Gemini's). Falls back to the old generic behavior only if a provider
+    somehow isn't in MODEL_CHAINS_BY_PROVIDER at all (shouldn't happen
+    for any currently-supported provider, but fails safe rather than
+    raising a KeyError mid-relay if one is ever added to PROVIDER_MODELS
+    without a matching chain entry).
 
     Real basis for why this helps at all, not just theoretical: live
     testing on 2026-08-08 hit RESOURCE_EXHAUSTED on gemini-3.5-flash (the
@@ -5526,8 +5572,8 @@ def _model_fallback_chain(provider, tier):
     both hit their daily caps simultaneously -- the two-model chain
     wasn't deep enough that time, hence the move to the longer
     GEMINI_MODEL_CHAINS list."""
-    if provider == "gemini":
-        return list(GEMINI_MODEL_CHAINS[tier])
+    if provider in MODEL_CHAINS_BY_PROVIDER:
+        return list(MODEL_CHAINS_BY_PROVIDER[provider][tier])
     models = PROVIDER_MODELS[provider]
     chain = [models[tier]]
     for other_tier, other_model in models.items():
@@ -7649,6 +7695,55 @@ def redact_pii(text):
 
 # ── Triviality short-circuit ─────────────────────────────────────────────────
 
+def _text_prefers_fast_tier(message_text, is_first_message, has_image, urgency, is_high_stakes):
+    """
+    Task-aware model tier selection for TEXT (relay()'s tier defaults to
+    "main" for every text message today, regardless of what the message
+    actually needs -- this is the missing half of "smart model
+    selection": decide_provider() above already picks WHICH provider
+    fits the task, this picks WHICH TIER within that provider).
+
+    Deliberately conservative and purely local (no LLM/network call of
+    its own -- classify_message_triviality already spends up to 4s on
+    an Ollama round trip just to MAYBE save a cloud call; adding another
+    real call here to decide speed would work against the whole point).
+    Every signal used is already computed elsewhere in relay() at
+    essentially zero marginal cost (classify_urgency, classify_high_stakes,
+    is_first_message) or is a single len()/split() on text already in
+    memory.
+
+    Refuses fast tier (stays on "main") on any of these, in order of how
+    much it would cost to get wrong:
+      - has_image: a photo deserves real vision reasoning, not a
+        quick/cheap pass.
+      - is_first_message: someone's first impression of Curant shouldn't
+        be the cut-rate model.
+      - urgency == "urgent" / is_high_stakes: exactly the messages this
+        codebase already treats with extra care elsewhere (second-
+        opinion routing, real-time notification) -- speed is not the
+        priority here.
+      - anything over a short word count: a message that's actually
+        substantive (a real question, a task, a request with detail)
+        gets full reasoning quality. This only fires for the kind of
+        short, low-stakes, everyday exchange (a quick check-in, a
+        one-line follow-up, "what's on my calendar", "did that send")
+        where a smaller/faster model answers just as well.
+
+    Every one of these is a false-negative-safe default: getting the
+    call "wrong" here only ever means an ordinary message stays on the
+    slower/better model, never that something sensitive gets a degraded
+    answer -- same asymmetric design as classify_urgency/
+    classify_high_stakes above.
+    """
+    if has_image or is_first_message:
+        return False
+    if urgency == "urgent" or is_high_stakes:
+        return False
+    if not message_text or not message_text.strip():
+        return False
+    return len(message_text.split()) <= 12
+
+
 def classify_message_triviality(text):
     """
     Conservative by design: returns False (not trivial — use full
@@ -8057,6 +8152,23 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     history = get_history(limit=_message_history_keep(config))
     is_first_message = len(history) == 0
     urgency = classify_urgency(message_text)
+    # Computed here (once, before the model call) rather than only at the
+    # existing second-opinion check further down, so both the new tier
+    # decision below AND that check share one result instead of running
+    # this cheap local keyword check twice.
+    is_high_stakes_msg = classify_high_stakes(message_text)
+
+    # Smart model tier selection, text side (voice already gets tier="fast"
+    # unconditionally from its caller -- see relay()'s docstring). See
+    # _text_prefers_fast_tier's docstring for the full reasoning. Only
+    # ever DOWNGRADES an explicit tier="main" call to "fast" -- never
+    # overrides a caller that already asked for tier="fast" or anything
+    # else, and never touches voice_mode (which has its own, separate,
+    # already-latency-tuned path).
+    if not voice_mode and tier == "main" and _text_prefers_fast_tier(
+        message_text, is_first_message, bool(image_path), urgency, is_high_stakes_msg
+    ):
+        tier = "fast"
 
     voice_instruction = (
         "This message came in through a live FaceTime voice call, not a text -- your reply will be "
@@ -8108,19 +8220,23 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
 
     # Voice replies are spoken aloud in real time to someone waiting on
     # the line, so they're capped shorter than text's 1000-token default
-    # -- LOWERED further, 300 -> 150 (2026-08-08, explicit "make
-    # transcription and response faster" request): fewer tokens the
-    # model has to generate is a direct, proportional latency win on
-    # top of the earlier brevity instruction (which asks nicely but
-    # doesn't bound worst case) -- 150 tokens is still a genuine couple
-    # of spoken sentences, not a single word, but caps a rambling reply
-    # far more aggressively than 300 did. Real tradeoff, not hidden: a
-    # reply that genuinely needs more room (a longer explanation the
-    # caller actually asked for) gets cut off mid-thought instead of
-    # finishing -- raise this back up if that starts happening in real
-    # calls, using the per-turn timing now printed by the FaceTime
-    # answerer to see the actual token-count-vs-latency tradeoff.
-    reply_max_tokens = 150 if voice_mode else 1000
+    # -- LOWERED further, 300 -> 150 (2026-08-08, "make transcription and
+    # response faster"), then 150 -> 100 (this change, "cut call latency
+    # ~0.5s" request): fewer tokens the model has to generate is a
+    # direct, proportional latency win on top of the brevity instruction
+    # (which asks nicely but doesn't bound worst case) -- 100 tokens is
+    # still a genuine sentence or two, not a single word, but this is
+    # getting close to the floor of "still sounds like a real answer."
+    # NOT independently measured against a live call yet (this sandbox
+    # has no network access to actually time a real model call) -- the
+    # mechanism (fewer tokens = proportionally less generation time) is
+    # well-established, but the exact wall-clock savings need confirming
+    # on a real call using the per-turn timing the FaceTime answerer
+    # already prints. Real tradeoff, not hidden: a reply that genuinely
+    # needs more room gets cut off mid-thought instead of finishing --
+    # raise this back up (100 -> 150 -> 300) if that starts happening in
+    # real calls.
+    reply_max_tokens = 100 if voice_mode else 1000
     try:
         if available_tools:
             reply_text = call_llm_with_tools(
@@ -8176,7 +8292,7 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     # for the two non-generated fallback replies (quota-exhausted notice,
     # offline local reply) -- there's no real model output to review in
     # either of those cases.
-    if not voice_mode and provider not in ("quota_exhausted_notice", "local_offline") and classify_high_stakes(message_text):
+    if not voice_mode and provider not in ("quota_exhausted_notice", "local_offline") and is_high_stakes_msg:
         second_opinion_note = _get_second_opinion(message_text, reply_text, config, provider, api_key)
         if second_opinion_note:
             reply_text = f"{reply_text}\n\n(Second opinion: {second_opinion_note})"
