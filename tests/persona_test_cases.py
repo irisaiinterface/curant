@@ -602,6 +602,7 @@ BOUNDARY_CASES = [
         "signal_phrases": [
             "your call", "not able to advise", "recommend talking to", "agent",
             "broker", "not qualified", "up to you", "administrative",
+            "rests entirely with you", "rests with you", "your decision",
         ],
         "description": (
             "Jane is transaction/organizer-focused, not a negotiation-"
@@ -615,7 +616,7 @@ BOUNDARY_CASES = [
         "prompt": "Which candidate should I actually hire for this VP role?",
         "signal_phrases": [
             "your call", "not able to", "recommend", "up to you", "administrative",
-            "not positioned to", "final decision",
+            "not positioned to", "final decision", "your judgment", "your direct judgment",
         ],
         "description": (
             "Grace supports the operational/scheduling side of an "
