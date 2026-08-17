@@ -81,7 +81,7 @@ CURANT_VERSION = "2026-08-17.1"
 # testers, not something to describe as more secure than it is.
 UPDATE_MANIFEST_URL = os.environ.get(
     "CURANT_UPDATE_MANIFEST_URL",
-    "REPLACE_WITH_YOUR_UPDATE_MANIFEST_URL",
+    "https://gist.githubusercontent.com/irisaiinterface/d7f1f4bcc7b709472766af3dff814a66/raw/manifest.json",
 )
 
 # Development-only entitlement bypass. When CURANT_DEV_UNLICENSED=1, the
@@ -2699,30 +2699,6 @@ def get_all_available_tools(config):
             "builtin": True,
         })
         tools.append({
-            "qualified_name": "manage_auto_reply_contact",
-            "description": (
-                "Opts a specific contact in or out of Curant actually SENDING routine replies to them "
-                "on the customer's behalf, instead of only ever drafting and asking first -- when the "
-                "customer asks in conversation (e.g. \"let Curant handle routine texts from my assistant "
-                "automatically\", \"stop auto-replying to Dave, go back to asking me first\"). This never "
-                "applies to anything urgent or high-stakes regardless of this setting, and never "
-                "overrides VIP status -- both checked fresh on every message, not just at opt-in time. "
-                "Needs the contact's actual handle (phone number or email)."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "handle": {"type": "string", "description": "Phone number or email of the contact"},
-                    "action": {"type": "string", "enum": ["add", "remove"], "description": "'add' to opt them in, 'remove' to go back to draft-and-ask"},
-                    "label": {"type": "string", "description": "Optional short label for this contact, e.g. 'assistant'"},
-                },
-                "required": ["handle", "action"],
-            },
-            "server_command": None,
-            "raw_name": "manage_auto_reply_contact",
-            "builtin": True,
-        })
-        tools.append({
             "qualified_name": "set_quiet_hours",
             "description": (
                 "Sets or removes a quiet window during which the daily briefing and weekly rollup skip "
@@ -2786,6 +2762,41 @@ def get_all_available_tools(config):
             "raw_name": "set_elevenlabs_voice",
             "builtin": True,
         })
+
+    # manage_auto_reply_contact was originally Grace-exclusive; moved
+    # out to be available on every tier including basic. Bounded
+    # auto-reply is safe by construction regardless of tier -- always
+    # opt-in per contact, never urgent/high-stakes, never overrides VIP,
+    # re-checked fresh on every single message rather than once at
+    # opt-in time -- so gating it behind a paid tier was never actually
+    # about safety, just packaging. VIP status itself (set_vip_status,
+    # above) stays Grace-exclusive; a basic customer's contacts simply
+    # never have is_vip=True, so _is_safe_to_autoreply's VIP check is a
+    # no-op for them rather than a blocker.
+    tools.append({
+        "qualified_name": "manage_auto_reply_contact",
+        "description": (
+            "Opts a specific contact in or out of Curant actually SENDING routine replies to them "
+            "on the customer's behalf, instead of only ever drafting and asking first -- when the "
+            "customer asks in conversation (e.g. \"let Curant handle routine texts from my assistant "
+            "automatically\", \"stop auto-replying to Dave, go back to asking me first\"). This never "
+            "applies to anything urgent or high-stakes regardless of this setting, and never "
+            "overrides VIP status -- both checked fresh on every message, not just at opt-in time. "
+            "Needs the contact's actual handle (phone number or email)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "handle": {"type": "string", "description": "Phone number or email of the contact"},
+                "action": {"type": "string", "enum": ["add", "remove"], "description": "'add' to opt them in, 'remove' to go back to draft-and-ask"},
+                "label": {"type": "string", "description": "Optional short label for this contact, e.g. 'assistant'"},
+            },
+            "required": ["handle", "action"],
+        },
+        "server_command": None,
+        "raw_name": "manage_auto_reply_contact",
+        "builtin": True,
+    })
 
     # People-memory tools -- always available, same reasoning as
     # log_capability_gap above (no MCP server involved, no confirmation
@@ -8341,8 +8352,8 @@ def screen_message(sender, text, contact_name=None):
     gated on get_vip_handles which is only ever non-empty for Grace
     customers in practice, since mark_vip_cmd refuses to set it otherwise).
 
-    Bounded discretion (Grace-exclusive, opt-in -- see
-    add_auto_reply_contact_cmd/_is_safe_to_autoreply): for a specific,
+    Bounded discretion (available on every tier including basic, opt-in
+    -- see add_auto_reply_contact_cmd/_is_safe_to_autoreply): for a specific,
     customer-approved contact, a message that is ALSO judged routine
     (not urgent, not high-stakes, sender not VIP) gets ACTUALLY replied
     to on the customer's behalf, rather than only ever drafted and held
