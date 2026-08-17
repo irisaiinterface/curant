@@ -75,8 +75,22 @@ def load_cloud():
     of its normal startup. Harmless for a short test run (it's just a
     sleep loop that dies with this process when the script exits), but
     worth knowing rather than a silent surprise.
+
+    REAL BUG FIXED: app.py does a bare `import billing` (its sibling
+    module in curant-cloud/server/), which only resolves if that
+    directory is on sys.path. Normal Flask usage always has it there
+    implicitly (app.py is run FROM that directory), but loading it via
+    SourceFileLoader from tests/ -- as this script does -- does not add
+    it automatically. Confirmed live: this crashed with
+    "ModuleNotFoundError: No module named 'billing'" the first time this
+    suite was actually run end-to-end (against a real Gemini key), which
+    is exactly the kind of gap the suite's own docstring warned it had
+    never been executed enough to catch.
     """
-    return _load_module_from_path("cloud_app_under_test", os.path.join(REPO_ROOT, "curant-cloud", "server", "app.py"))
+    server_dir = os.path.join(REPO_ROOT, "curant-cloud", "server")
+    if server_dir not in sys.path:
+        sys.path.insert(0, server_dir)
+    return _load_module_from_path("cloud_app_under_test", os.path.join(server_dir, "app.py"))
 
 
 def build_home_prompt(home_module, persona, model_override=None):
