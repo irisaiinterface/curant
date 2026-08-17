@@ -9333,6 +9333,20 @@ def setup_wizard_cmd():
 
     config = load_config()
 
+    # 0. Privacy/ToS consent -- REAL GAP, found during the beta-readiness
+    # pass: this used to only run as a side effect of calling activate()
+    # below, which means a customer who skips activation (leaves the
+    # license key blank -- exactly the path every beta tester takes right
+    # now, since there is no live license server to activate against) never
+    # saw this screen at all. Consent has nothing to do with billing/
+    # entitlement, so it shouldn't be gated behind a step that does. Called
+    # unconditionally here, before activation is even asked about;
+    # _ensure_privacy_consent() itself is a no-op if this version's already
+    # been acknowledged, so re-running setup never re-prompts unnecessarily.
+    if not _ensure_privacy_consent(config):
+        sys.exit(1)
+    config = load_config()
+
     # 1. Activation
     if not config.get("license_key"):
         key_answer = _wizard_prompt("License key (leave blank to skip activation for now): ")
