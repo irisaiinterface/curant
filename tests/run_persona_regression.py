@@ -34,7 +34,9 @@ any FAIL before concluding something is actually broken.
 import argparse
 import importlib.util
 import os
+import re
 import sys
+import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "tests"))
@@ -194,16 +196,58 @@ def check_case(case, reply):
     return False, "No expected signal phrase found — read the reply manually before concluding this is a real regression."
 
 
+# Real bug, found live: a full 50-case run against Gemini's free tier
+# reliably hits its 15-requests-per-minute cap partway through, and this
+# runner had NO retry/backoff at all -- every 429 became a spurious
+# [ERROR], recorded as a FAIL indistinguishable from an actual persona
+# regression in the final summary. Fixed two ways: a small proactive
+# delay between calls when talking to Gemini specifically (this provider
+# is the only one with a free-tier-relevant per-minute cap here), and a
+# real retry-with-backoff for any 429 that still gets through, honoring
+# the server's own suggested retryDelay when it provides one rather than
+# guessing.
+RATE_LIMIT_RETRIES = 4
+
+
+def _parse_retry_delay_seconds(error_text, default=15):
+    match = re.search(r"retryDelay.{0,6}?(\d+)", error_text)
+    if match:
+        return int(match.group(1)) + 1  # pad by 1s, don't cut it exactly at the edge
+    return default
+
+
+def call_model_with_retry(system_prompt, user_prompt, model, provider):
+    last_error = None
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        try:
+            return call_model(system_prompt, user_prompt, model, provider)
+        except Exception as e:
+            error_text = str(e)
+            is_rate_limit = "429" in error_text or "RESOURCE_EXHAUSTED" in error_text
+            last_error = e
+            if not is_rate_limit or attempt == RATE_LIMIT_RETRIES:
+                raise
+            delay = _parse_retry_delay_seconds(error_text)
+            print(f"        (rate limited, waiting {delay}s and retrying -- attempt {attempt + 1}/{RATE_LIMIT_RETRIES})")
+            time.sleep(delay)
+    raise last_error
+
+
 def run_target(target_name, module, prompt_builder, model, results, provider="anthropic"):
     print(f"\n{'=' * 70}\n{target_name}  (provider: {provider}, model: {model})\n{'=' * 70}")
     for case in ALL_CASES:
         system_prompt = prompt_builder(module, case["persona"])
         try:
-            reply = call_model(system_prompt, case["prompt"], model, provider)
+            reply = call_model_with_retry(system_prompt, case["prompt"], model, provider)
         except Exception as e:
             print(f"[ERROR] {target_name} / {case['persona']} / {case['category']}: API call failed — {e}")
             results.append((target_name, case, False, f"API call failed: {e}"))
             continue
+        if provider == "gemini":
+            # Stay comfortably under the free tier's 15-requests-per-minute
+            # cap (4s/request = 15/min exactly; 4.5s gives real headroom)
+            # rather than relying entirely on the retry path above.
+            time.sleep(4.5)
 
         passed, reason = check_case(case, reply)
         status = "PASS" if passed else "FAIL"
