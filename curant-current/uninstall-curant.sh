@@ -42,6 +42,26 @@ echo "==> Removing ~/bin/curant-cli and ~/bin/curant-watcher.py..."
 rm -f "$HOME/bin/curant-cli" "$HOME/bin/curant-watcher.py"
 echo "    Done."
 
+echo "==> Removing legacy /usr/local/bin copies (from manual/pre-install.command setups)..."
+# Real gap found live: earlier manual setup this session (before
+# install.command existed) put curant-cli, curant-watcher.py, and
+# curant-facetime-answerer.py at /usr/local/bin/ directly, following
+# deploy.sh's symlink pattern -- install.command itself never touches
+# that location (everything it installs goes to ~/bin), so a Mac that
+# was set up manually before install.command existed still has a
+# working curant-cli on PATH from /usr/local/bin even after the steps
+# above. Confirmed live: `which curant-cli` still resolved there after
+# an otherwise-complete uninstall. sudo is used here specifically
+# because /usr/local/bin on Intel Macs (and on Apple Silicon Macs where
+# it predates Homebrew) is commonly root-owned, unlike ~/bin.
+for legacy in curant-cli curant-watcher.py curant-facetime-answerer.py; do
+    if [ -e "/usr/local/bin/$legacy" ] || [ -L "/usr/local/bin/$legacy" ]; then
+        echo "    Found /usr/local/bin/$legacy -- removing (may ask for your password)..."
+        sudo rm -f "/usr/local/bin/$legacy"
+    fi
+done
+echo "    Done."
+
 echo "==> Removing ~/.curant (config, memory, database, backups)..."
 rm -rf "$HOME/.curant"
 echo "    Done."
