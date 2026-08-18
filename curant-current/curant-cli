@@ -5548,6 +5548,49 @@ def _is_quota_error(e):
             or "rate limit" in msg or "quota" in msg)
 
 
+def _is_transient_server_error(e):
+    """Real bug found live (2026-08-18): a customer's text got a live
+    503 'high demand, try again later' from Gemini and got NOTHING back
+    -- not even an error message, total silence. Root cause:
+    _is_quota_error only recognizes 429/RESOURCE_EXHAUSTED/rate-limit/
+    quota text, so a 503 fell through as a 'non-quota error' and
+    call_llm/call_llm_with_tools raised it immediately instead of
+    trying the next model in the fallback chain, same as this file's
+    generic-failure path (bad key, network down) -- but a 503 'try
+    again' is a TRANSIENT server-side overload, not a permanent
+    failure, and is if anything MORE naturally suited to falling
+    through to another model than a quota error is (a different model
+    is a different service instance, not just a different quota
+    bucket). It then hit relay()'s offline fallback, which returned
+    None (no local Ollama model available on this Mac) -- silent
+    failure, no reply, no error text either.
+
+    Deliberately broad-but-safe pattern matching across providers'
+    actual error text (confirmed live for Gemini's '503 UNAVAILABLE...
+    high demand'; OpenAI and Anthropic use their own overload-style
+    codes/wording -- 503/'server_error' for OpenAI, 529/'overloaded'
+    for Anthropic -- included here even though not yet independently
+    confirmed live against those two, same as how Gemini's chain
+    started from real observed errors and grew from there). None of
+    these patterns overlap with a genuine non-retryable failure like a
+    bad API key ('401'/'invalid api key'/'authentication') or a
+    malformed request ('400'), so this can't accidentally mask a real
+    permanent problem as something worth retrying."""
+    msg = str(e).lower()
+    return ("503" in msg or "529" in msg or "unavailable" in msg or "overloaded" in msg
+            or "server_error" in msg or "high demand" in msg or "internal server error" in msg
+            or "service unavailable" in msg)
+
+
+def _is_retryable_llm_error(e):
+    """Union of both known-transient error categories -- what
+    call_llm/call_llm_with_tools should actually check before giving up
+    on a model and trying the next one in the fallback chain. See
+    _is_quota_error and _is_transient_server_error's docstrings for the
+    two categories this covers."""
+    return _is_quota_error(e) or _is_transient_server_error(e)
+
+
 def _model_fallback_chain(provider, tier):
     """Ordered list of models to try for one call.
 
@@ -5608,14 +5651,15 @@ def call_llm(provider, api_key, system_prompt, messages, max_tokens=1000, tier="
         try:
             return caller(api_key, system_prompt, messages, max_tokens, model)
         except Exception as e:
-            if not _is_quota_error(e):
+            if not _is_retryable_llm_error(e):
                 raise
             last_err = e
             more = f"trying next model ({chain[i + 1]})" if i + 1 < len(chain) else "no more models left to try"
-            print(f"[quota] {provider}/{model} hit a rate/quota limit ({e}) -- {more}.", file=sys.stderr)
+            reason = "rate/quota limit" if _is_quota_error(e) else "transient server error"
+            print(f"[retry] {provider}/{model} hit a {reason} ({e}) -- {more}.", file=sys.stderr)
     raise AllModelsExhaustedError(
         f"Every model in {provider}'s fallback chain for tier={tier} ({chain}) hit a rate/quota "
-        f"limit. Last error: {last_err}"
+        f"limit or transient server error. Last error: {last_err}"
     )
 
 
@@ -5954,14 +5998,15 @@ def call_llm_with_tools(provider, api_key, system_prompt, messages, tools, avail
         try:
             return caller(api_key, system_prompt, messages, max_tokens, model, tools, available_tools)
         except Exception as e:
-            if not _is_quota_error(e):
+            if not _is_retryable_llm_error(e):
                 raise
             last_err = e
             more = f"trying next model ({chain[i + 1]})" if i + 1 < len(chain) else "no more models left to try"
-            print(f"[quota] {provider}/{model} hit a rate/quota limit ({e}) -- {more}.", file=sys.stderr)
+            reason = "rate/quota limit" if _is_quota_error(e) else "transient server error"
+            print(f"[retry] {provider}/{model} hit a {reason} ({e}) -- {more}.", file=sys.stderr)
     raise AllModelsExhaustedError(
         f"Every model in {provider}'s fallback chain for tier={tier} ({chain}) hit a rate/quota "
-        f"limit. Last error: {last_err}"
+        f"limit or transient server error. Last error: {last_err}"
     )
 
 
