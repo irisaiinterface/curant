@@ -20,24 +20,27 @@
         <string>--auto-update-check</string>
     </array>
 
-    <!-- Checks every 30 minutes (explicit "check every 30 minutes"
-         request, 2026-08-18) - previously a fixed 4am off-peak slot.
-         Real tradeoff, not hidden: curant-cli auto-update is a no-op
-         unless a genuinely newer version is actually available AND
+    <!-- Checks every 60 seconds (explicit "check every 1 minute"
+         request, 2026-08-18, tightened from an earlier 30-minute
+         interval). True instant delivery the moment a manifest is
+         published isn't built here - that needs a webhook/push
+         listener, which doesn't exist - so this is the closest real
+         approximation: poll as often as reasonably works. Real
+         tradeoff, not hidden: curant-cli auto-update is a no-op unless
+         a genuinely newer version is actually available AND
          config["auto_update_enabled"] is true (default on - see
-         `curant-cli set-auto-update`), so most of these firings cost
-         nothing beyond one small network check - but on the rare
-         occasion an update IS applied, it can now land at any time of
-         day, including mid-conversation, rather than only at a chosen
-         off-peak hour. Low real risk in practice: conversation state
-         lives in chat.db/local sqlite, not in the watcher process's
-         memory, so a restart between poll cycles doesn't lose anything
-         - but it's still a real behavior change from the original
-         design, worth knowing. Same pattern already used elsewhere in
-         this file (see com.curant.meetingprep.plist's 900s / 15-minute
-         StartInterval, com.curant.irisinbox.plist's 3600s / hourly). -->
+         `curant-cli set-auto-update`), so the large majority of these
+         firings cost nothing beyond one small network fetch of
+         manifest.json - but this is now 1,440 checks/day against a
+         public Gist instead of 48, worth knowing if that Gist is ever
+         swapped for something rate-limited. A genuinely new version is
+         also no longer applied silently (see auto_update_cmd's
+         consent-first redesign, 2026-08-18) - it only ever TEXTS an
+         offer and waits for a reply, so a tight polling interval just
+         means the text arrives sooner, not that anything installs
+         itself faster or more riskily. -->
     <key>StartInterval</key>
-    <integer>1800</integer>
+    <integer>60</integer>
 
     <key>RunAtLoad</key>
     <false/>
