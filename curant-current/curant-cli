@@ -2841,6 +2841,46 @@ def get_all_available_tools(config):
         "builtin": True,
     })
 
+    # Pending software-update approval -- only registered when there's
+    # actually something waiting (config["pending_auto_update"], set by
+    # auto_update_cmd when a newer version is found -- see that
+    # function's docstring for the full consent-first design). Same
+    # "only offer this tool when it's actually relevant" pattern as
+    # process_email_approvals just above, and the same confirm-before-
+    # real-effect bar as fill_and_submit_form/send_message_to_person:
+    # this is the only place an update is allowed to actually download
+    # and install itself, precisely because the customer is confirming
+    # it right here, not because an unattended background check decided
+    # to on its own.
+    pending_update = config.get("pending_auto_update")
+    if pending_update:
+        tools.append({
+            "qualified_name": "apply_pending_update",
+            "description": (
+                f"Call this when the customer is responding to the pending Curant software-update "
+                f"notice they were already sent (update to version {pending_update['version']}"
+                + (f", changelog: {pending_update['changelog']}" if pending_update.get("changelog") else "")
+                + ") -- e.g. \"yes\", \"go ahead\", \"install it\", \"do it\", \"not now\", "
+                  "\"no\", \"skip it\". Pass approved=true to actually download and install it now "
+                  "(this restarts the background watcher as part of applying it, briefly interrupting "
+                  "texting), or approved=false to decline -- declining is remembered so this specific "
+                  "version won't be offered again unprompted, though the customer can always ask "
+                  "directly to reconsider. Only call this when the customer's message is clearly "
+                  "responding to the update offer -- if they're just asking what's pending, answer "
+                  "from the version/changelog given above directly instead."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "approved": {"type": "boolean", "description": "true to install now, false to decline this version"},
+                },
+                "required": ["approved"],
+            },
+            "server_command": None,
+            "raw_name": "apply_pending_update",
+            "builtin": True,
+        })
+
     # People-memory tools -- always available, same reasoning as
     # log_capability_gap above (no MCP server involved, no confirmation
     # needed: these only ever read/write LOCAL people-memory, they never
@@ -5178,6 +5218,33 @@ def execute_tool_call(tool_name, arguments, available_tools):
     if match["builtin"] and tool_name == "process_email_approvals":
         return process_email_approvals_tool(arguments.get("approve_ids") or [], arguments.get("reject_ids") or [])
 
+    if match["builtin"] and tool_name == "apply_pending_update":
+        config = load_config()
+        pending = config.get("pending_auto_update")
+        if not pending:
+            return "[No pending update to respond to -- nothing changed.]"
+        approved = bool(arguments.get("approved", False))
+        if not approved:
+            config.pop("pending_auto_update", None)
+            config["auto_update_declined_version"] = pending["version"]
+            save_config(config)
+            return (f"Okay, skipping version {pending['version']} for now. I won't ask about this "
+                    f"specific version again, but let me know if you change your mind or a newer "
+                    f"version comes out.")
+        _notify_task_starting("installing the update (I'll be back in a moment)")
+        success, detail = _download_and_apply_update(pending["download_url"])
+        config = load_config()  # reload -- _download_and_apply_update restarts the watcher, which
+                                  # doesn't touch config, but reloading fresh here avoids clobbering
+                                  # any change written by another process in the meantime
+        config.pop("pending_auto_update", None)
+        if success:
+            config.pop("auto_update_declined_version", None)  # a fresh accepted version supersedes any old decline
+            save_config(config)
+            return f"Updated to version {pending['version']} and restarted the background watcher."
+        save_config(config)
+        return (f"Update to version {pending['version']} failed: {detail}. Nothing changed -- still "
+                f"running {CURANT_VERSION}. Say the word to try again, or run `curant-cli update` by hand.")
+
     if match["builtin"] and tool_name == "queue_email_for_approval":
         send_id = queue_pending_email_send(
             match["_iris_server_name"],
@@ -7402,6 +7469,17 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
             "\nIf the customer's message is about approving/rejecting/reviewing these, use "
             "process_email_approvals with the right ids. If they just ask what's pending, answer from "
             "this list directly."
+        )
+    pending_update = config.get("pending_auto_update")
+    if pending_update:
+        system_parts.append(
+            f"There's a Curant software update waiting on the customer's approval: version "
+            f"{pending_update['version']} (currently running {CURANT_VERSION})"
+            + (f" -- {pending_update['changelog']}" if pending_update.get("changelog") else "") +
+            ". If the customer's message is responding to this offer (yes/no/go ahead/not now/install "
+            "it/skip it/etc.), use apply_pending_update with their answer -- true to install, false to "
+            "decline. If they're just asking what's pending or whether an update is available, answer "
+            "from this directly rather than guessing."
         )
     if relationship_state:
         # Grace-exclusive (see get_relationship_state) -- this is what makes
@@ -9878,21 +9956,40 @@ def update_cmd():
 
 def auto_update_cmd():
     """
-    Invoked unattended by com.curant.autoupdate.plist, once nightly at a
-    quiet off-peak hour -- deliberately NOT mid-conversation or on a
-    tight polling interval, to avoid ever restarting the watcher while a
-    real exchange with the customer is in progress. Opt-out, not opt-in
-    (config["auto_update_enabled"] defaults True) -- for a beta
-    specifically, getting fixes out reliably matters more than requiring
-    every tester to remember to run `curant-cli update` by hand; toggle
-    with `curant-cli set-auto-update off` if that's the wrong default
-    for a given install.
+    Invoked unattended by com.curant.autoupdate.plist, every 30 minutes --
+    deliberately NOT mid-conversation, so this never fires WHILE a real
+    exchange with the customer is in progress (see the plist's own comment
+    on that tradeoff). Opt-out, not opt-in (config["auto_update_enabled"]
+    defaults True) -- toggle with `curant-cli set-auto-update off` if
+    that's the wrong default for a given install.
+
+    CONSENT CHANGE (this version): this used to download AND apply an
+    update the moment one was found, purely unattended, then just texted
+    the customer afterward saying it had already happened. That's no
+    longer how this works -- an update is never applied without the
+    customer explicitly saying yes first. This function's job now is only
+    to detect a newer version and ASK, via a text the watcher delivers
+    (see below); the actual download+install only happens later, when the
+    customer replies and the model calls the apply_pending_update tool
+    (see get_all_available_tools/execute_tool_call) -- the same
+    confirm-before-real-effect pattern this codebase already uses for
+    fill_and_submit_form and send_message_to_person, applied here too.
+
+    State lives in config["pending_auto_update"] (version/download_url/
+    changelog) so the pending offer survives across the many separate
+    processes involved (this check, then whichever later `relay()` call
+    handles the customer's "yes"). config["auto_update_declined_version"]
+    remembers a version the customer already said no to, so this doesn't
+    re-ask about the SAME version every 30 minutes -- declining is real
+    and respected, not just skipped once. A genuinely newer version
+    arriving later still gets offered normally, since it won't match the
+    declined version.
 
     Prints a single JSON line either way so curant-watcher.py's
-    --auto-update-check entry point can text the customer what happened
-    -- success AND failure are both reported, never silent, so a failed
-    auto-update doesn't leave a customer confused about why nothing
-    changed with no explanation at all.
+    --auto-update-check entry point can text the customer -- a new offer,
+    or nothing at all if there's nothing new to report. Failure to even
+    check (unreachable manifest, disabled) is silent by design, same as
+    before -- only a genuine new-version detection is worth a text.
     """
     config = load_config()
     if not config.get("auto_update_enabled", True):
@@ -9906,24 +10003,52 @@ def auto_update_cmd():
 
     remote = manifest.get("version", "")
     if not _version_is_newer(remote, CURANT_VERSION):
+        # Nothing newer than what's installed -- clear out any stale
+        # pending offer / declined-version memory referencing an old
+        # manifest state, so a rolled-back or re-pinned manifest doesn't
+        # leave confusing stale state sitting around.
+        changed = False
+        if config.get("pending_auto_update"):
+            config.pop("pending_auto_update", None)
+            changed = True
+        if config.get("auto_update_declined_version"):
+            config.pop("auto_update_declined_version", None)
+            changed = True
+        if changed:
+            save_config(config)
         print(json.dumps({"notify_text": None}))
         return
 
-    success, detail = _download_and_apply_update(manifest["download_url"])
-    if success:
-        changelog = manifest.get("changelog", "")
-        text = f"Curant just updated itself to version {remote}."
-        if changelog:
-            text += f" What's new: {changelog}"
-        print(json.dumps({"notify_text": text}))
-    else:
-        print(json.dumps({
-            "notify_text": (
-                f"Tried to auto-update to version {remote} but it failed ({detail}). "
-                f"Nothing changed -- still running {CURANT_VERSION}. Run `curant-cli update` "
-                f"to try again by hand, or let us know if it keeps failing."
-            )
-        }))
+    if config.get("auto_update_declined_version") == remote:
+        # Already asked, customer already said no to this exact version --
+        # don't nag again every 30 minutes. They can still ask directly
+        # ("is there an update") or run `curant-cli check-update` by hand
+        # anytime to be re-offered it.
+        print(json.dumps({"notify_text": None}))
+        return
+
+    pending = config.get("pending_auto_update")
+    if pending and pending.get("version") == remote:
+        # Already offered this exact version and still waiting on a reply
+        # -- don't re-text every 30 minutes while it's pending.
+        print(json.dumps({"notify_text": None}))
+        return
+
+    config["pending_auto_update"] = {
+        "version": remote,
+        "download_url": manifest["download_url"],
+        "changelog": manifest.get("changelog", ""),
+    }
+    save_config(config)
+
+    changelog = manifest.get("changelog", "")
+    text = f"An update to Curant is available -- version {remote} (currently running {CURANT_VERSION})."
+    if changelog:
+        text += f" What's new: {changelog}"
+    text += (" Want me to install it now? Just reply yes and I'll take care of it -- the background "
+             "watcher restarts briefly as part of that. Say no and I won't ask again about this "
+             "specific version.")
+    print(json.dumps({"notify_text": text}))
 
 
 def set_auto_update_cmd(enabled_str):
