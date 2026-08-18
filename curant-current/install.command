@@ -300,9 +300,13 @@ write_plist "irisinbox" "--iris-inbox-check" \
 # beyond one small network check on nights with nothing to do. On by
 # default (config["auto_update_enabled"] defaults to True); a tester can
 # turn it off with `curant-cli set-auto-update off`.
+# Checks every 30 minutes (2026-08-18 change -- previously a fixed 4am
+# off-peak slot). See com.curant.autoupdate.plist's own comment for the
+# full tradeoff: most checks are a no-op network call, but an update
+# CAN now apply at any time of day, not just off-peak.
 write_plist "autoupdate" "--auto-update-check" \
-"    <key>StartCalendarInterval</key>
-    <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+"    <key>StartInterval</key>
+    <integer>1800</integer>
     <key>RunAtLoad</key>
     <false/>" \
 ""

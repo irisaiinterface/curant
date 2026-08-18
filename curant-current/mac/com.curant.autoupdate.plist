@@ -20,20 +20,24 @@
         <string>--auto-update-check</string>
     </array>
 
-    <!-- Runs once a night at an off-peak hour, so an update (which
-         restarts the watcher service) never lands mid-conversation.
-         curant-cli auto-update itself is a no-op unless
+    <!-- Checks every 30 minutes (explicit "check every 30 minutes"
+         request, 2026-08-18) - previously a fixed 4am off-peak slot.
+         Real tradeoff, not hidden: curant-cli auto-update is a no-op
+         unless a genuinely newer version is actually available AND
          config["auto_update_enabled"] is true (default on - see
-         `curant-cli set-auto-update`) and a genuinely newer version is
-         actually available, so this firing nightly costs nothing beyond
-         one small network check on nights with nothing to do. -->
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>4</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+         `curant-cli set-auto-update`), so most of these firings cost
+         nothing beyond one small network check - but on the rare
+         occasion an update IS applied, it can now land at any time of
+         day, including mid-conversation, rather than only at a chosen
+         off-peak hour. Low real risk in practice: conversation state
+         lives in chat.db/local sqlite, not in the watcher process's
+         memory, so a restart between poll cycles doesn't lose anything
+         - but it's still a real behavior change from the original
+         design, worth knowing. Same pattern already used elsewhere in
+         this file (see com.curant.meetingprep.plist's 900s / 15-minute
+         StartInterval, com.curant.irisinbox.plist's 3600s / hourly). -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
 
     <key>RunAtLoad</key>
     <false/>
