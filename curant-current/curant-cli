@@ -7455,7 +7455,12 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
         _current_time_context_str(config) + " Use this as your ground truth for the current date/time "
         "-- when the customer says something time-relative (\"in 2 hours\", \"tomorrow morning\", "
         "\"7pm tonight\", \"what time is it\"), compute it from this, don't guess or say you don't "
-        "know what time it is."
+        "know what time it is. Use it silently for that math -- don't recite today's date/time back "
+        "in your reply unless the customer specifically asked what time or day it is. Real bug found "
+        "in the persona regression suite (2026-08-19): asked \"what's on my calendar tomorrow\", the "
+        "model opened with \"It is Wednesday, August 19, 2026, 12:17 PM\" before ever answering the "
+        "actual question -- wasted words nobody asked for, and it hit especially hard on terser "
+        "personas (Miles, Aaron) with tight reply-length expectations. Just answer what was asked."
     )
     pending_sends = get_pending_email_sends(status="pending")
     if pending_sends:
