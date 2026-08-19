@@ -882,6 +882,45 @@ def init_local_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             decided_at TEXT
         );
+
+        -- Real bug found live (2026-08-19): Curant asked "reply UPDATE or
+        -- SKIP" about a pending software update while an unrelated freeform
+        -- question ("what's Anna's contact info?") was also open in the
+        -- same conversation -- a bare "yes" got attributed to the wrong one,
+        -- because the LLM was left to guess which open thread a short reply
+        -- belonged to, and it guessed based on recency instead of intent.
+        --
+        -- This table is a deterministic, code-level fix for that whole bug
+        -- class, not just this one instance: any time Curant asks something
+        -- with a SPECIFIC, KNOWN set of expected answers (not open-ended
+        -- conversation), it registers a row here instead of just hoping the
+        -- next reply gets matched correctly by the model. Incoming messages
+        -- get checked against unresolved rows here BEFORE the LLM ever sees
+        -- them (see match_open_question_cmd / curant-watcher.py's
+        -- handle_message) -- if a message clearly matches one, it's resolved
+        -- in code, with zero ambiguity, and the LLM is never asked to guess.
+        --
+        -- Deliberately narrow: this is only for structured, code-issued
+        -- asks with a small known answer set (approve/decline, a number,
+        -- etc.) -- NOT a general replacement for the model's own judgment
+        -- in open-ended conversation. A row here always wins over whatever
+        -- else is being discussed, by design (see `priority`).
+        CREATE TABLE IF NOT EXISTS open_questions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT,                 -- e.g. 'auto_update_offer' -- identifies which feature asked
+            prompt_text TEXT,          -- the actual question text sent to the customer, for reference
+            patterns_json TEXT,        -- {"<intent>": ["keyword", "keyword", ...], ...} -- case-
+                                        -- insensitive substring match against the incoming reply
+            resolver TEXT,             -- name of the resolver function to call once matched (see
+                                        -- OPEN_QUESTION_RESOLVERS)
+            resolver_args_json TEXT,   -- extra args (JSON object) passed to the resolver alongside
+                                        -- the matched intent
+            priority INTEGER DEFAULT 10,  -- higher wins when multiple open_questions are unresolved
+                                           -- at once and more than one could plausibly match
+            status TEXT DEFAULT 'open',   -- 'open' | 'resolved' | 'expired'
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            resolved_at TEXT
+        );
         """)
         conn.commit()
     # Lightweight migration: installs that created messages/local.db before
@@ -1839,6 +1878,155 @@ def set_pending_email_send_status(send_id, status):
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+# --- open_questions: deterministic reply routing (see the table's own
+# comment in init_local_db for the bug this exists to fix) -----------------
+
+def register_open_question(kind, prompt_text, patterns, resolver, resolver_args=None, priority=10):
+    """Call this right after sending the customer a message that expects
+    one of a SMALL KNOWN SET of replies (approve/decline, a specific
+    keyword, etc.) -- not for open-ended conversational questions, which
+    the model should keep handling exactly as before.
+
+    `patterns` is {"<intent>": ["keyword", ...], ...}, e.g.
+    {"approve": ["update", "yes", "install"], "decline": ["skip", "no"]}.
+    `resolver` must be a key in OPEN_QUESTION_RESOLVERS. `resolver_args`
+    is any extra JSON-serializable context the resolver needs beyond the
+    matched intent (e.g. which version to install)."""
+    with closing(get_local_db()) as conn:
+        cur = conn.execute(
+            "INSERT INTO open_questions (kind, prompt_text, patterns_json, resolver, resolver_args_json, priority) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (kind, prompt_text, json.dumps(patterns), resolver, json.dumps(resolver_args or {}), priority),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_open_unresolved_questions():
+    """Highest priority first, then most recently asked first -- see
+    match_incoming_reply for how ties/multiple matches are handled."""
+    with closing(get_local_db()) as conn:
+        rows = conn.execute(
+            "SELECT id, kind, prompt_text, patterns_json, resolver, resolver_args_json, priority, created_at "
+            "FROM open_questions WHERE status = 'open' ORDER BY priority DESC, id DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def resolve_open_question(question_id):
+    with closing(get_local_db()) as conn:
+        conn.execute(
+            "UPDATE open_questions SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (question_id,),
+        )
+        conn.commit()
+
+
+def expire_open_questions(kind):
+    """Call when a pending thing a question was about no longer exists
+    for some OTHER reason (e.g. the customer already declined via a
+    different path) -- avoids a stale open_questions row matching a
+    future unrelated reply."""
+    with closing(get_local_db()) as conn:
+        conn.execute(
+            "UPDATE open_questions SET status = 'expired', resolved_at = CURRENT_TIMESTAMP "
+            "WHERE status = 'open' AND kind = ?",
+            (kind,),
+        )
+        conn.commit()
+
+
+def _match_question_intent(question, incoming_text):
+    """Case-insensitive substring match of incoming_text against each
+    intent's keyword list. Returns the matched intent string, or None.
+    Deliberately simple (no regex/NLP) -- the whole point is that this
+    is dumb, predictable, and auditable, unlike asking an LLM to guess."""
+    try:
+        patterns = json.loads(question["patterns_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    lowered = (incoming_text or "").strip().lower()
+    if not lowered:
+        return None
+    for intent, keywords in patterns.items():
+        for kw in keywords or []:
+            kw = str(kw).strip().lower()
+            if kw and kw in lowered:
+                return intent
+    return None
+
+
+# Resolvers take (intent: str, resolver_args: dict) and return a
+# customer-facing reply string. Each one is responsible for actually
+# doing the thing (calling the real tool logic) AND for phrasing the
+# confirmation -- match_incoming_reply just wires the plumbing.
+OPEN_QUESTION_RESOLVERS = {}
+
+
+def _register_resolver(name):
+    def deco(fn):
+        OPEN_QUESTION_RESOLVERS[name] = fn
+        return fn
+    return deco
+
+
+@_register_resolver("apply_pending_update")
+def _resolve_apply_pending_update(intent, resolver_args):
+    config = load_config()
+    pending = config.get("pending_auto_update")
+    if not pending:
+        # Already applied/declined via some other path -- nothing left
+        # to do, and importantly: don't claim success or failure either
+        # way since there's genuinely nothing pending anymore.
+        return "Looks like that update isn't pending anymore -- nothing to do here."
+    if intent == "decline":
+        config.pop("pending_auto_update", None)
+        config["auto_update_declined_version"] = pending["version"]
+        save_config(config)
+        return (f"Okay, skipping version {pending['version']} for now. I won't ask about this "
+                f"specific version again, but let me know if you change your mind or a newer "
+                f"version comes out.")
+    # intent == "approve"
+    _notify_task_starting("installing the update (I'll be back in a moment)")
+    success, detail = _download_and_apply_update(pending["download_url"])
+    config = load_config()
+    config.pop("pending_auto_update", None)
+    if success:
+        config.pop("auto_update_declined_version", None)
+        save_config(config)
+        return f"Updated to version {pending['version']} and restarted the background watcher."
+    save_config(config)
+    return (f"Update to version {pending['version']} failed: {detail}. Nothing changed -- still "
+            f"running {CURANT_VERSION}. Say the word to try again, or run `curant-cli update` by hand.")
+
+
+def match_incoming_reply(incoming_text):
+    """The deterministic pre-check curant-watcher.py runs BEFORE handing
+    a message to the LLM at all (see match_open_question_cmd below).
+    Checks unresolved open_questions highest-priority-first; the first
+    one whose patterns match wins outright -- no ambiguity, no guessing,
+    and critically, a structured question always beats whatever else is
+    being discussed in the conversation, which is exactly the bug this
+    exists to fix. Returns (reply_text, question_id) or (None, None) if
+    nothing matched (caller should fall through to the normal LLM path
+    unchanged)."""
+    for question in get_open_unresolved_questions():
+        intent = _match_question_intent(question, incoming_text)
+        if not intent:
+            continue
+        resolver = OPEN_QUESTION_RESOLVERS.get(question["resolver"])
+        if not resolver:
+            continue
+        try:
+            resolver_args = json.loads(question["resolver_args_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            resolver_args = {}
+        reply_text = resolver(intent, resolver_args)
+        resolve_open_question(question["id"])
+        return reply_text, question["id"]
+    return None, None
 
 
 SEND_TO_PARAM_HINTS = ("to", "recipients", "recipient")
@@ -5227,11 +5415,17 @@ def execute_tool_call(tool_name, arguments, available_tools):
         pending = config.get("pending_auto_update")
         if not pending:
             return "[No pending update to respond to -- nothing changed.]"
+        # Reached via the LLM tool-call path (e.g. an image message, or
+        # phrasing that didn't hit any keyword in match_incoming_reply) --
+        # the deterministic pre-check in curant-watcher.py normally beats
+        # this to it for plain-text replies. Either way, clear the
+        # open_questions row too so it doesn't linger as stale/unresolved.
         approved = bool(arguments.get("approved", False))
         if not approved:
             config.pop("pending_auto_update", None)
             config["auto_update_declined_version"] = pending["version"]
             save_config(config)
+            expire_open_questions("auto_update_offer")
             return (f"Okay, skipping version {pending['version']} for now. I won't ask about this "
                     f"specific version again, but let me know if you change your mind or a newer "
                     f"version comes out.")
@@ -5241,6 +5435,7 @@ def execute_tool_call(tool_name, arguments, available_tools):
                                   # doesn't touch config, but reloading fresh here avoids clobbering
                                   # any change written by another process in the meantime
         config.pop("pending_auto_update", None)
+        expire_open_questions("auto_update_offer")
         if success:
             config.pop("auto_update_declined_version", None)  # a fresh accepted version supersedes any old decline
             save_config(config)
@@ -10028,6 +10223,7 @@ def auto_update_cmd():
             changed = True
         if changed:
             save_config(config)
+            expire_open_questions("auto_update_offer")
         print(json.dumps({"notify_text": None}))
         return
 
@@ -10065,7 +10261,46 @@ def auto_update_cmd():
     # plain yes/no as a fallback for customers who don't read closely.
     text += (" Reply UPDATE and I'll install it now -- the background watcher restarts briefly as "
              "part of that. Reply SKIP and I won't ask again about this specific version.")
+
+    # Deterministic reply routing (see open_questions' table comment):
+    # register this as a structured open question so a bare UPDATE/SKIP
+    # (or yes/no) gets resolved in code, correctly, even if something
+    # else is being discussed in the same conversation. Priority 100 --
+    # high enough to always beat a freeform conversational question,
+    # which is the exact scenario that caused the real bug this exists
+    # to fix (see match_incoming_reply's docstring).
+    expire_open_questions("auto_update_offer")  # any stale prior offer, just in case
+    register_open_question(
+        kind="auto_update_offer",
+        prompt_text=text,
+        patterns={
+            "approve": ["update", "yes", "install", "go ahead", "do it"],
+            "decline": ["skip", "no", "not now", "nah"],
+        },
+        resolver="apply_pending_update",
+        resolver_args={"version": remote},
+        priority=100,
+    )
     print(json.dumps({"notify_text": text}))
+
+
+def match_open_question_cmd(incoming_text):
+    """`curant-cli match-open-question "<text>"` -- called by
+    curant-watcher.py's handle_message() on every incoming message,
+    BEFORE relay_to_curant() (the normal LLM path). Prints a single JSON
+    line: {"matched": true, "reply": "..."} if a structured open
+    question resolved it deterministically (the caller should send
+    `reply` directly and skip the LLM entirely for this turn), or
+    {"matched": false} if nothing matched (caller proceeds exactly as
+    before -- this never blocks or delays normal conversation)."""
+    init_local_db()  # defensive -- same pattern as every other command that
+                      # touches local.db; matters on a genuinely fresh install
+                      # where this could be the very first DB access
+    reply_text, question_id = match_incoming_reply(incoming_text)
+    if reply_text is None:
+        print(json.dumps({"matched": False}))
+        return
+    print(json.dumps({"matched": True, "reply": reply_text, "question_id": question_id}))
 
 
 def set_auto_update_cmd(enabled_str):
@@ -11427,6 +11662,12 @@ def main():
     sub.add_parser("check-update", help="Check whether a newer version of Curant is available (read-only)")
     sub.add_parser("update", help="Check for and apply a Curant update now")
     sub.add_parser("auto-update", help="Internal — runs the unattended nightly update check (see com.curant.autoupdate.plist)")
+    p_match_open_question = sub.add_parser(
+        "match-open-question",
+        help="Internal — deterministic pre-check curant-watcher.py runs on every incoming message "
+             "before the LLM sees it (see match_incoming_reply / open_questions table)",
+    )
+    p_match_open_question.add_argument("text", help="The customer's raw incoming message text")
     p_auto_update_toggle = sub.add_parser("set-auto-update", help="Turn unattended nightly auto-update on or off (default: on)")
     p_auto_update_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
 
@@ -11655,6 +11896,8 @@ def main():
         update_cmd()
     elif args.command == "auto-update":
         auto_update_cmd()
+    elif args.command == "match-open-question":
+        match_open_question_cmd(args.text)
     elif args.command == "set-auto-update":
         set_auto_update_cmd(args.enabled)
     elif args.command == "mark-vip":

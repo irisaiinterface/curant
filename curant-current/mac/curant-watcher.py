@@ -1359,6 +1359,33 @@ def handle_message(msg):
     contact_name = resolve_contact_name(msg['sender'])
     who = f"{contact_name} ({msg['sender']})" if contact_name else f"unresolved handle {msg['sender']}"
     print(f"Incoming message, rowid {msg['rowid']}, from {who}" + (" (with image)" if image_path else ""))
+
+    # Deterministic pre-check (see open_questions' table comment in
+    # curant-cli): if Curant is waiting on a specific reply to something
+    # structured (right now: the auto-update UPDATE/SKIP offer), match it
+    # in code BEFORE the LLM ever sees this message, so a bare reply can't
+    # get misattributed to whatever ELSE is being discussed in the same
+    # conversation -- the exact bug this exists to fix (real incident,
+    # 2026-08-19: "yes" meant for a pending update got attached to an
+    # unrelated question about a contact instead). Text-only (an image
+    # attachment isn't something these patterns are meant to match
+    # against) -- falls through to the normal LLM path unchanged if
+    # nothing matches, so this never blocks or delays regular conversation.
+    if not image_path and text.strip():
+        match_result = subprocess.run(
+            ["curant-cli", "match-open-question", text],
+            capture_output=True, text=True,
+        )
+        try:
+            match_data = json.loads(match_result.stdout.strip())
+        except (json.JSONDecodeError, TypeError):
+            match_data = {"matched": False}
+        if match_data.get("matched") and match_data.get("reply"):
+            send_text_reply(msg["sender"], match_data["reply"])
+            print(f"Sent deterministic reply for message {msg['rowid']} "
+                  f"(open_questions id {match_data.get('question_id')}) -- LLM not invoked this turn.")
+            return
+
     live_context = get_calendar_and_reminders_context()
     reply_json = relay_to_curant(text, context=live_context, image_path=image_path)
 
