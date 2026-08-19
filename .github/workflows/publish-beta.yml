@@ -47,7 +47,18 @@ jobs:
             echo "ERROR: expected zip not found at $ZIP_PATH" >&2
             exit 1
           fi
+          # Customer-facing v1.0-style version, separate from the internal
+          # date-based VERSION above (see CURANT_DISPLAY_VERSION's comment
+          # in curant-cli) -- read straight out of the source being built,
+          # not auto-generated, since it's only meant to change when a
+          # human deliberately bumps it for a real milestone.
+          DISPLAY_VERSION="$(grep -m1 '^CURANT_DISPLAY_VERSION = ' curant-current/curant-cli | sed -E 's/^CURANT_DISPLAY_VERSION = "(.*)"$/\1/')"
+          if [ -z "$DISPLAY_VERSION" ]; then
+            echo "ERROR: couldn't find CURANT_DISPLAY_VERSION in curant-current/curant-cli" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "display_version=$DISPLAY_VERSION" >> "$GITHUB_OUTPUT"
           echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
           echo "changelog=$CHANGELOG" >> "$GITHUB_OUTPUT"
 
@@ -55,6 +66,7 @@ jobs:
         env:
           GIST_TOKEN: ${{ secrets.GIST_PUSH_TOKEN }}
           VERSION: ${{ steps.build.outputs.version }}
+          DISPLAY_VERSION: ${{ steps.build.outputs.display_version }}
           ZIP_PATH: ${{ steps.build.outputs.zip_path }}
           CHANGELOG: ${{ steps.build.outputs.changelog }}
         run: |
@@ -77,11 +89,16 @@ jobs:
           SHA="$(git rev-parse HEAD)"
           DOWNLOAD_URL="https://gist.github.com/${GIST_OWNER}/${GIST_ID}/raw/${SHA}/${ZIP_NAME}"
 
-          python3 - "$VERSION" "$DOWNLOAD_URL" "$CHANGELOG" <<'PY'
+          python3 - "$VERSION" "$DOWNLOAD_URL" "$CHANGELOG" "$DISPLAY_VERSION" <<'PY'
           import json, sys
-          version, url, changelog = sys.argv[1:4]
+          version, url, changelog, display_version = sys.argv[1:5]
           with open("manifest.json", "w") as f:
-              json.dump({"version": version, "download_url": url, "changelog": changelog}, f, indent=2)
+              json.dump({
+                  "version": version,
+                  "display_version": display_version,
+                  "download_url": url,
+                  "changelog": changelog,
+              }, f, indent=2)
               f.write("\n")
           PY
           git add manifest.json

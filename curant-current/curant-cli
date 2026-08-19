@@ -72,6 +72,19 @@ SERVER_BASE = os.environ.get("CURANT_SERVER_BASE", "https://api.curant.app").rst
 # strings, so don't hand-edit this to anything else.
 CURANT_VERSION = "2026-08-17.1"
 
+# Customer-facing version, separate from CURANT_VERSION above on purpose.
+# CURANT_VERSION exists to make the update-detection machinery work (it
+# HAS to be a build-unique, correctly-sortable string, hence the ugly
+# date format) -- it was never meant to be shown to an actual customer.
+# CURANT_DISPLAY_VERSION is what a customer actually sees in an update
+# text, and it's simple semver (MAJOR.MINOR), bumped by hand only for
+# real milestones -- NOT automatically per build/commit like
+# CURANT_VERSION is. Comparison/update-detection logic never reads this;
+# it's purely cosmetic. Bump it (and the matching value the GitHub Actions
+# workflow reads out of this file) when a release is actually worth
+# calling a new minor/major version to a customer -- not on every commit.
+CURANT_DISPLAY_VERSION = "1.0"
+
 # Where curant-cli checks for updates. NOT a real access-controlled
 # channel -- see the honest note below -- deliberately kept as free,
 # unlisted hosting (e.g. a secret GitHub Gist) rather than a real
@@ -10305,7 +10318,17 @@ def auto_update_cmd():
     save_config(config)
 
     changelog = manifest.get("changelog", "")
-    text = f"An update to Curant is available -- version {remote} (currently running {CURANT_VERSION})."
+    # Customer-facing wording uses CURANT_DISPLAY_VERSION (simple v1.0-style
+    # semver), never the internal date-based CURANT_VERSION -- see that
+    # constant's own comment for why the two are deliberately separate.
+    # manifest.get("display_version") may be absent on an older manifest
+    # or a build where the display version wasn't bumped -- fall back to
+    # the locally known display version rather than showing nothing.
+    remote_display = manifest.get("display_version") or CURANT_DISPLAY_VERSION
+    if remote_display != CURANT_DISPLAY_VERSION:
+        text = f"An update to Curant is available -- v{remote_display} (you're on v{CURANT_DISPLAY_VERSION})."
+    else:
+        text = "An update to Curant is available."
     if changelog:
         text += f" What's new: {changelog}"
     # Real bug found live (2026-08-19): a customer with any other open thread

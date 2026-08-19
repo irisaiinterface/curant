@@ -38,6 +38,10 @@ fi
 VERSION="$(git -C "$SCRIPT_DIR" log -1 --date=format:'%Y-%m-%d.%H%M%S' --format=%cd)"
 COMMIT_SUBJECT="$(git -C "$SCRIPT_DIR" log -1 --format=%s)"
 COMMIT_HASH="$(git -C "$SCRIPT_DIR" log -1 --format=%h)"
+# Customer-facing v1.0-style version -- see CURANT_DISPLAY_VERSION's own
+# comment in curant-cli. Read straight from source, not auto-generated;
+# only changes when a human bumps it for a real milestone.
+DISPLAY_VERSION="$(grep -m1 '^CURANT_DISPLAY_VERSION = ' "$SCRIPT_DIR/curant-cli" | sed -E 's/^CURANT_DISPLAY_VERSION = "(.*)"$/\1/')"
 
 STAGE_DIR="$(mktemp -d)/curant-current"
 # Lands in ~/Downloads rather than next to this script -- matches where a
@@ -134,6 +138,7 @@ echo ""
 cat <<MANIFEST
 {
   "version": "$VERSION",
+  "display_version": "$DISPLAY_VERSION",
   "download_url": "PASTE_RAW_GIST_URL_HERE",
   "changelog": "$COMMIT_SUBJECT"
 }
