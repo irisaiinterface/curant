@@ -10328,7 +10328,10 @@ def auto_update_cmd():
     if remote_display != CURANT_DISPLAY_VERSION:
         text = f"An update to Curant is available -- v{remote_display} (you're on v{CURANT_DISPLAY_VERSION})."
     else:
-        text = "An update to Curant is available."
+        # No new customer-facing milestone this build, but the customer
+        # should still see what they're currently on rather than a
+        # version-less message.
+        text = f"An update to Curant is available (you're currently on v{CURANT_DISPLAY_VERSION})."
     if changelog:
         text += f" What's new: {changelog}"
     # Real bug found live (2026-08-19): a customer with any other open thread
