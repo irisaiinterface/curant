@@ -2,6 +2,8 @@
 
 *This is a plain-English draft of what our policies should say, written to guide a lawyer in drafting the real legal documents. This is not itself a legal document.*
 
+**Current beta reality, stated plainly:** Curant is currently a free, invite-only beta (Curant Home, Mac-only) -- there is no billing, no subscription, and no paid signup right now. License keys are issued manually by the team, not purchased. The "Payment and Subscriptions" section below describes the intended future paid product, not what's happening today -- it's kept in this draft so a lawyer has the full intended shape to work from, not because it's active now.
+
 ---
 
 ## Terms of Service (Plain-Language Draft)
@@ -14,10 +16,10 @@ Curant gives you a personal AI secretary ("your Curant") that you can reach by c
 - You're responsible for keeping your account and license key secure. If you believe your account has been compromised, contact us immediately.
 - Curant is for one person's personal or professional use. It is not a shared or multi-user tool.
 
-### Your Claude API Key
-- Every Curant account requires you to connect your own API key from a supported AI provider (currently Anthropic/Claude or OpenAI/GPT — you choose, and can switch at any time without losing your Curant's persona, instructions, or memory).
+### Your AI Provider API Key
+- Every Curant account requires you to connect your own API key from a supported AI provider (Anthropic/Claude, OpenAI/GPT, or Google/Gemini — you choose, and can switch at any time without losing your Curant's persona, instructions, or memory). For the current free beta, Gemini is the recommended option since Google offers a free API tier -- no payment method needed to get started.
 - Your usage bills directly to your own account with that provider, based on your own usage. Curant does not mark up, resell, or profit from your API usage.
-- You are responsible for keeping that provider account in good standing and funded. If your key stops working, your Curant will stop working until it's resolved.
+- You are responsible for keeping that provider account in good standing and funded (or, on Gemini's free tier, within its free usage limits). If your key stops working, your Curant will stop working until it's resolved.
 
 ### What Your Curant Can and Cannot Do
 - Your Curant can draft emails, documents, and messages on your behalf. **It will not send anything on your behalf without your explicit confirmation**, unless you specifically opt in to autonomous sending for a defined, recurring task.
@@ -25,9 +27,11 @@ Curant gives you a personal AI secretary ("your Curant") that you can reach by c
 - Your Curant will ask for your confirmation before taking any action that is difficult or impossible to undo.
 
 ### Payment and Subscriptions
-- Curant is billed on a subscription basis, with optional add-ons priced individually and shown clearly before you purchase them.
-- If your subscription payment fails or lapses, your Curant will stop responding until payment is resolved. We will make a reasonable effort to notify you before this happens.
-- You can cancel your subscription at any time. Cancelling stops future billing; it does not retroactively refund the current billing period unless required by law.
+- **Right now, during the free beta: there is no payment of any kind.** Curant does not charge you anything, has no subscription, and has no paid add-ons -- your only cost is whatever you spend directly with your own AI provider (see above), which Curant never sees or profits from.
+- The paragraphs below describe how payment is intended to work once Curant leaves beta and becomes a paid product -- not a current feature.
+- *(Future, not active today)* Curant is billed on a subscription basis, with optional add-ons priced individually and shown clearly before you purchase them.
+- *(Future, not active today)* If your subscription payment fails or lapses, your Curant will stop responding until payment is resolved. We will make a reasonable effort to notify you before this happens.
+- *(Future, not active today)* You can cancel your subscription at any time. Cancelling stops future billing; it does not retroactively refund the current billing period unless required by law.
 
 ### Acceptable Use
 - You may not use Curant to harass, deceive, impersonate, or harm others.

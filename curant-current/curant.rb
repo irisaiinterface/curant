@@ -40,26 +40,33 @@ class Curant < Formula
     <<~EOS
       Curant is installed but not yet activated.
 
+      NOTE: Curant is currently a free, invite-only beta -- there is no
+      public signup or payment yet. If you're seeing this, you should
+      already have a license key from whoever gave you access.
+
       1) Connect it to your account:
            curant-cli activate YOUR-LICENSE-KEY
 
       2) Give it your own API key — this stays on your Mac only, it is
-         never sent to Curant's server. Anthropic (Claude) is the default
-         provider:
-           curant-cli set-api-key sk-ant-...
+         never sent to Curant's server. For the beta, Gemini is the
+         recommended option (Google offers a free API tier, no payment
+         method needed):
+           curant-cli set-provider gemini
+           curant-cli set-api-key AIzaSy...
 
-         Prefer OpenAI instead? Switch providers first, then set that
-         key — your persona, instructions, and memories carry over
-         unchanged either way:
-           curant-cli set-provider openai
-           curant-cli set-api-key sk-...
+         Prefer Anthropic or OpenAI instead? Same idea — your persona,
+         instructions, and memories carry over unchanged whichever you
+         pick:
+           curant-cli set-provider anthropic   # or: openai
+           curant-cli set-api-key sk-ant-...    # or: sk-...
 
-      Don't have a license key? Get one after signing up at:
-        https://curant.app/signup
+      Don't have a license key? This beta isn't self-serve yet — ask
+      whoever pointed you here to issue one.
 
       Don't have an API key?
-        Anthropic: https://console.anthropic.com/settings/keys
-        OpenAI:    https://platform.openai.com/api-keys
+        Gemini (free tier): https://aistudio.google.com/apikey
+        Anthropic:          https://console.anthropic.com/settings/keys
+        OpenAI:             https://platform.openai.com/api-keys
 
       Curant won't respond to anything until both steps above are done —
       this install alone doesn't do anything on its own.
