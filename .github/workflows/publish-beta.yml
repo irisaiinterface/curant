@@ -1,0 +1,94 @@
+name: Publish beta build
+
+# Runs on every push to main that touches curant-current/, plus a manual
+# "Run workflow" button in the Actions tab for testing without needing a
+# throwaway commit.
+#
+# What it does, with zero manual steps once GIST_PUSH_TOKEN is set:
+#   1. Builds the beta zip via package-for-beta.sh (version is derived
+#      from the commit being built, same as a local run).
+#   2. Pushes that zip into the update Gist.
+#   3. Rewrites manifest.json in the Gist to point at the new version and
+#      the exact commit-pinned raw URL for the zip that was just pushed.
+#
+# One-time setup required (can't be automated -- see repo docs):
+#   Settings -> Secrets and variables -> Actions -> New repository secret
+#   Name:  GIST_PUSH_TOKEN
+#   Value: a classic GitHub PAT (fine-grained tokens can't touch Gists)
+#          scoped to *only* the "gist" checkbox, nothing else.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "curant-current/**"
+  workflow_dispatch: {}
+
+env:
+  GIST_ID: d7f1f4bcc7b709472766af3dff814a66
+  GIST_OWNER: irisaiinterface
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout curant
+        uses: actions/checkout@v4
+
+      - name: Build beta zip
+        id: build
+        run: |
+          set -euo pipefail
+          bash curant-current/package-for-beta.sh
+          VERSION="$(git log -1 --date=format:'%Y-%m-%d.%H%M%S' --format=%cd)"
+          CHANGELOG="$(git log -1 --format=%s)"
+          ZIP_PATH="$HOME/Downloads/curant-current-beta-${VERSION}.zip"
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "ERROR: expected zip not found at $ZIP_PATH" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "changelog=$CHANGELOG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish zip + manifest.json to the update Gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_PUSH_TOKEN }}
+          VERSION: ${{ steps.build.outputs.version }}
+          ZIP_PATH: ${{ steps.build.outputs.zip_path }}
+          CHANGELOG: ${{ steps.build.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GIST_TOKEN:-}" ]; then
+            echo "ERROR: GIST_PUSH_TOKEN repo secret is not set. See the comment" >&2
+            echo "at the top of this workflow file for how to add it." >&2
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${GIST_TOKEN}@gist.github.com/${GIST_ID}.git" gist-clone
+          cd gist-clone
+          git config user.email "actions@github.com"
+          git config user.name "Curant Release Bot"
+
+          ZIP_NAME="curant-current-beta-${VERSION}.zip"
+          cp "$ZIP_PATH" "$ZIP_NAME"
+          git add "$ZIP_NAME"
+          git commit -m "beta zip ${VERSION}"
+          SHA="$(git rev-parse HEAD)"
+          DOWNLOAD_URL="https://gist.github.com/${GIST_OWNER}/${GIST_ID}/raw/${SHA}/${ZIP_NAME}"
+
+          python3 - "$VERSION" "$DOWNLOAD_URL" "$CHANGELOG" <<'PY'
+          import json, sys
+          version, url, changelog = sys.argv[1:4]
+          with open("manifest.json", "w") as f:
+              json.dump({"version": version, "download_url": url, "changelog": changelog}, f, indent=2)
+              f.write("\n")
+          PY
+          git add manifest.json
+          git commit -m "manifest: bump to ${VERSION}"
+
+          # Strip the token from anything that might leak into logs.
+          git push 2>&1 | sed "s/${GIST_TOKEN}/[TOKEN REDACTED]/g"
+
+          echo "Published version ${VERSION}"
+          echo "download_url: ${DOWNLOAD_URL}"

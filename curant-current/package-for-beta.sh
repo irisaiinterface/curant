@@ -110,6 +110,7 @@ fi
 echo "    Clean."
 
 echo "==> Building $OUT_ZIP..."
+mkdir -p "$(dirname "$OUT_ZIP")"
 rm -f "$OUT_ZIP"
 (cd "$(dirname "$STAGE_DIR")" && zip -rq "$OUT_ZIP" "curant-current")
 rm -rf "$(dirname "$STAGE_DIR")"
