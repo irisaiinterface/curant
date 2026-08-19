@@ -67,7 +67,27 @@ def _load_module_from_path(module_name, file_path):
 
 
 def load_home():
-    return _load_module_from_path("curant_cli_under_test", os.path.join(REPO_ROOT, "curant-current", "curant-cli"))
+    """
+    REAL BUG FOUND running this suite fresh (2026-08-19): build_home_prompt
+    calls home_module.build_system_prompt(), which reads several local.db
+    tables directly (get_pending_email_sends among them) -- but nothing in
+    this harness ever called init_local_db() first. On a machine/HOME
+    where ~/.curant/local.db either doesn't exist yet, or predates a table
+    added since it was last created, this crashes immediately with
+    "sqlite3.OperationalError: no such table" before a single test case
+    runs. It happened to work before only because whatever HOME this was
+    run in already had an up-to-date local.db sitting around from earlier
+    manual testing -- not because the harness was actually
+    self-contained. Fixed by calling the module's own init_local_db()
+    right after loading it, same as every real entry point (activate,
+    relay, etc.) already does -- it's idempotent (CREATE TABLE IF NOT
+    EXISTS + additive migrations throughout), so this is safe to call
+    regardless of whether local.db already exists, is missing, or is
+    older than the current schema.
+    """
+    module = _load_module_from_path("curant_cli_under_test", os.path.join(REPO_ROOT, "curant-current", "curant-cli"))
+    module.init_local_db()
+    return module
 
 
 def load_cloud():
