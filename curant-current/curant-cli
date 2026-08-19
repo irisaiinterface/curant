@@ -7485,10 +7485,13 @@ def build_system_prompt(config, memories, people, live_context, extra_instructio
             f"There's a Curant software update waiting on the customer's approval: version "
             f"{pending_update['version']} (currently running {CURANT_VERSION})"
             + (f" -- {pending_update['changelog']}" if pending_update.get("changelog") else "") +
-            ". If the customer's message is responding to this offer (yes/no/go ahead/not now/install "
-            "it/skip it/etc.), use apply_pending_update with their answer -- true to install, false to "
-            "decline. If they're just asking what's pending or whether an update is available, answer "
-            "from this directly rather than guessing."
+            ". The offer specifically asked the customer to reply UPDATE or SKIP, precisely so a "
+            "bare reply about this doesn't get confused with anything else being discussed -- if their "
+            "message is UPDATE/install it/go ahead/yes (or SKIP/not now/no), use apply_pending_update "
+            "with their answer (true to install, false to decline) EVEN IF another topic was just being "
+            "discussed; this offer is a separate thread from whatever else is going on. If they're just "
+            "asking what's pending or whether an update is available, answer from this directly rather "
+            "than guessing."
         )
     if relationship_state:
         # Grace-exclusive (see get_relationship_state) -- this is what makes
@@ -10054,9 +10057,14 @@ def auto_update_cmd():
     text = f"An update to Curant is available -- version {remote} (currently running {CURANT_VERSION})."
     if changelog:
         text += f" What's new: {changelog}"
-    text += (" Want me to install it now? Just reply yes and I'll take care of it -- the background "
-             "watcher restarts briefly as part of that. Say no and I won't ask again about this "
-             "specific version.")
+    # Real bug found live (2026-08-19): a customer with any other open thread
+    # can have a bare "yes"/"no" misattributed to that unrelated topic instead
+    # of this offer -- the model has to guess which "yes" is which. Asking for
+    # a distinct word (UPDATE / SKIP) instead of generic yes/no makes that
+    # collision far less likely, while the system prompt below still accepts
+    # plain yes/no as a fallback for customers who don't read closely.
+    text += (" Reply UPDATE and I'll install it now -- the background watcher restarts briefly as "
+             "part of that. Reply SKIP and I won't ask again about this specific version.")
     print(json.dumps({"notify_text": text}))
 
 
