@@ -60,12 +60,16 @@ SERVER_BASE = os.environ.get("CURANT_SERVER_BASE", "https://api.curant.app").rst
 #   CURANT_SERVER_BASE=http://127.0.0.1:5000 to point at a locally-run
 #   curant-current/server/app.py for development/self-hosted testing.
 
-# Bump this by hand every time a new beta build is cut with
-# package-for-beta.sh, and update the manifest at UPDATE_MANIFEST_URL to
-# match. Format MUST stay "YYYY-MM-DD.N" (zero-padded ISO date + a plain
-# sequence number for same-day releases) -- version comparison in
-# _version_is_newer() is a plain string comparison, which only sorts
-# correctly for this exact format, not arbitrary version strings.
+# package-for-beta.sh overwrites this line automatically at build time,
+# computing the version from the git commit being packaged (committer
+# timestamp, "YYYY-MM-DD.HHMMSS") -- so every commit that gets packaged
+# gets its own distinct, correctly-ordered version with no manual editing.
+# The literal below only matters when running straight from source (dev
+# mode, not a packaged beta build). Format MUST stay "YYYY-MM-DD.<digits>"
+# (zero-padded ISO date + a fixed-width numeric suffix) -- version
+# comparison in _version_is_newer() is a plain string comparison, which
+# only sorts correctly for this exact format, not arbitrary version
+# strings, so don't hand-edit this to anything else.
 CURANT_VERSION = "2026-08-17.1"
 
 # Where curant-cli checks for updates. NOT a real access-controlled
