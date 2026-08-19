@@ -1996,7 +1996,13 @@ def _resolve_apply_pending_update(intent, resolver_args):
     if success:
         config.pop("auto_update_declined_version", None)
         save_config(config)
-        return f"Updated to version {pending['version']} and restarted the background watcher."
+        if detail == "applied":
+            return f"Updated to version {pending['version']} and restarted the background watcher."
+        return (f"Updated to version {pending['version']}, but there was a hiccup restarting the "
+                f"background watcher ({detail}). The update itself is real -- run `curant-cli "
+                f"check-update` to confirm -- but if I've gone quiet after this, that's why: run "
+                f"`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.watcher.plist` "
+                f"by hand to bring it back.")
     save_config(config)
     return (f"Update to version {pending['version']} failed: {detail}. Nothing changed -- still "
             f"running {CURANT_VERSION}. Say the word to try again, or run `curant-cli update` by hand.")
@@ -5439,7 +5445,13 @@ def execute_tool_call(tool_name, arguments, available_tools):
         if success:
             config.pop("auto_update_declined_version", None)  # a fresh accepted version supersedes any old decline
             save_config(config)
-            return f"Updated to version {pending['version']} and restarted the background watcher."
+            if detail == "applied":
+                return f"Updated to version {pending['version']} and restarted the background watcher."
+            return (f"Updated to version {pending['version']}, but there was a hiccup restarting the "
+                    f"background watcher ({detail}). The update itself is real -- run `curant-cli "
+                    f"check-update` to confirm -- but if I've gone quiet after this, that's why: run "
+                    f"`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.watcher.plist` "
+                    f"by hand to bring it back.")
         save_config(config)
         return (f"Update to version {pending['version']} failed: {detail}. Nothing changed -- still "
                 f"running {CURANT_VERSION}. Say the word to try again, or run `curant-cli update` by hand.")
@@ -10049,6 +10061,36 @@ def _version_is_newer(remote_version, local_version):
     return isinstance(remote_version, str) and remote_version > local_version
 
 
+def _restart_watcher_verified(gui_domain, plist_path, max_attempts=3, settle_seconds=1.5):
+    """bootout + bootstrap the persistent watcher, but -- unlike the old
+    version of this code -- actually VERIFY it came back up before
+    claiming success, retrying on failure. `launchctl bootstrap` firing
+    before a preceding `bootout` has fully released the service label is
+    a real, observed launchd race (not hypothetical): it can fail
+    outright, or "succeed" while the service never actually starts.
+    Returns (restarted: bool, detail: str)."""
+    label = "app.curant.watcher"
+    subprocess.run(["launchctl", "bootout", f"{gui_domain}/{label}"], capture_output=True)
+    if not os.path.exists(plist_path):
+        return False, "no com.curant.watcher.plist found to bootstrap"
+
+    last_err = ""
+    for attempt in range(1, max_attempts + 1):
+        result = subprocess.run(["launchctl", "bootstrap", gui_domain, plist_path],
+                                 capture_output=True, text=True)
+        time.sleep(settle_seconds)  # give launchd a moment to actually spawn it
+        check = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+        if label in (check.stdout or ""):
+            return True, "restarted cleanly" if attempt == 1 else f"restarted on attempt {attempt}"
+        last_err = (result.stderr or result.stdout or "").strip() or (
+            "bootstrap reported no error, but the service isn't listed as running")
+        # Most likely transient cause: bootout hadn't fully released the
+        # label yet. Bootout again defensively before the next attempt.
+        subprocess.run(["launchctl", "bootout", f"{gui_domain}/{label}"], capture_output=True)
+
+    return False, f"didn't come back after {max_attempts} attempts -- last error: {last_err}"
+
+
 def _download_and_apply_update(download_url):
     """
     Downloads the zip at download_url (the same shape package-for-beta.sh
@@ -10104,12 +10146,20 @@ def _download_and_apply_update(download_url):
         # just sitting on disk until some unrelated future restart.
         gui_domain = f"gui/{os.getuid()}"
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.curant.watcher.plist")
-        subprocess.run(["launchctl", "bootout", f"{gui_domain}/app.curant.watcher"],
-                        capture_output=True)
-        if os.path.exists(plist_path):
-            subprocess.run(["launchctl", "bootstrap", gui_domain, plist_path], capture_output=True)
-
-        return True, "applied"
+        restarted, restart_detail = _restart_watcher_verified(gui_domain, plist_path)
+        if restarted:
+            return True, "applied"
+        # Real bug found live (2026-08-19): this used to fire bootout+bootstrap
+        # with zero verification and unconditionally return success -- a
+        # launchd race (bootstrap firing before bootout fully released the
+        # label, which happens in practice, not just in theory) silently left
+        # a customer with NO watcher running at all after an otherwise-
+        # successful update, while still being told "restarted the background
+        # watcher." The files DID update correctly (that part's not a lie --
+        # check-update will show the new version) so this still returns
+        # success=True, but detail now flags the restart problem so the
+        # customer-facing message can be honest about it instead of silent.
+        return True, f"applied, but the watcher didn't restart cleanly ({restart_detail})"
     except Exception as e:
         return False, str(e)
     finally:
@@ -10155,7 +10205,12 @@ def update_cmd():
         print(f"What's new: {manifest['changelog']}")
     success, detail = _download_and_apply_update(manifest["download_url"])
     if success:
-        print(f"Updated to {remote}. The background watcher has been restarted.")
+        if detail == "applied":
+            print(f"Updated to {remote}. The background watcher has been restarted.")
+        else:
+            print(f"Updated to {remote}, but the watcher had trouble restarting ({detail}). "
+                  f"Run `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.watcher.plist` "
+                  f"by hand to bring it back up.")
     else:
         print(f"Update failed: {detail}")
         sys.exit(1)
