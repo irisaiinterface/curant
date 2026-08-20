@@ -1218,6 +1218,156 @@ def _get_current_device(device_type):
         return None
 
 
+def _list_output_devices():
+    """All output device names known to CoreAudio, via SwitchAudioSource.
+    Returns [] on failure -- callers treat an empty list as "couldn't
+    check", never as "there are no devices"."""
+    try:
+        r = subprocess.run(["SwitchAudioSource", "-a", "-t", "output"],
+                           capture_output=True, text=True, timeout=10)
+        return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    except Exception as e:
+        print(f"  Could not enumerate output devices: {e}", file=sys.stderr)
+        return None
+
+
+def audit_output_devices():
+    """Diagnoses the single most damaging misconfiguration this whole
+    feature has: FaceTime rendering call audio into a DIFFERENT output
+    device than the one this script captures from.
+
+    REAL EVIDENCE (2026-08-21, user screenshot of a live call): the
+    FaceTime call window's own audio-route control read "Multi-Output
+    Device" with an active level meter, while `SwitchAudioSource -t
+    output -c` simultaneously reported "Curant Call Output" as the
+    system default. Those are two different devices. FaceTime was
+    happily playing the caller into one of them; this script was
+    capturing BlackHole 16ch, which is only fed by the OTHER one. That
+    is exactly consistent with the symptom that resisted every other
+    fix attempted that night: RMS reading EXACTLY 0.0 (not a low noise
+    floor -- literally no signal at all) on every turn of several
+    consecutive calls, on a setup where a plain `say` test captured
+    through the very same BlackHole 16ch worked perfectly moments
+    before and after.
+
+    "Multi-Output Device" is also the DEFAULT NAME macOS assigns a
+    newly-created Multi-Output Device in Audio MIDI Setup. Rebuilding
+    that device (done several times while debugging) creates a fresh
+    one under that default name, and a rename that doesn't take -- or
+    an old device left behind -- leaves the Mac with two similar
+    devices where FaceTime remembers the wrong one.
+
+    This function doesn't try to fix that automatically (silently
+    reassigning a customer's audio devices mid-call is exactly the kind
+    of surprise this file has been burned by before). It reports,
+    loudly and specifically, so the failure is diagnosable in one
+    glance at the log instead of another night of guessing."""
+    devices = _list_output_devices()
+    if not devices:
+        return
+    stray = [d for d in devices
+             if d != SYSTEM_OUTPUT_DEVICE and "multi-output" in d.lower()]
+    if SYSTEM_OUTPUT_DEVICE not in devices:
+        print(f"  AUDIO CONFIG WARNING: the configured capture output device "
+              f"{SYSTEM_OUTPUT_DEVICE!r} does not exist on this Mac. Available output "
+              f"devices: {devices}. Calls will be silent until this matches a real "
+              f"Multi-Output Device that includes {CALLER_AUDIO_DEVICE!r}.", file=sys.stderr)
+    if stray:
+        print(f"  AUDIO CONFIG WARNING: found {len(stray)} other Multi-Output device(s) "
+              f"besides {SYSTEM_OUTPUT_DEVICE!r}: {stray}. FaceTime picks its own audio "
+              f"route and does NOT always follow the system default -- if a call is "
+              f"silent (RMS exactly 0.0 every turn), open the FaceTime call window's "
+              f"audio control and check which device it names. If it names one of "
+              f"{stray}, either delete that device in Audio MIDI Setup so FaceTime "
+              f"can't choose it, or switch the call's route to "
+              f"{SYSTEM_OUTPUT_DEVICE!r}.", file=sys.stderr)
+
+
+AUDIO_SELFTEST_TONE_SECONDS = 0.6
+AUDIO_SELFTEST_ENV = "CURANT_FACETIME_SKIP_AUDIO_SELFTEST"
+
+
+def audio_capture_selftest():
+    """Proves -- before the call depends on it -- whether audio played
+    into the system output actually reaches CALLER_AUDIO_DEVICE, by
+    playing a real tone and capturing it back.
+
+    Why this exists: every silent-call failure this feature has hit
+    looks IDENTICAL from the logs (turn after turn of "Clip looked
+    silent") whether the cause is (a) the caller genuinely saying
+    nothing, (b) the Multi-Output Device being misconfigured, (c)
+    FaceTime routing to a different device entirely, or (d) the system
+    default having been changed out from under us by some other process
+    opening the device. Those need completely different fixes and the
+    logs alone have never distinguished them -- which is precisely why
+    debugging this burned an entire night of live test calls, each one
+    testing one guess.
+
+    This collapses all of that into a single yes/no answer, logged once
+    per call, before the caller has said anything: if the tone comes
+    back, the capture path is proven working end to end and any later
+    silence is genuinely the caller being quiet. If it doesn't, the
+    path is broken and the log says so explicitly instead of
+    accumulating misleading "looked silent" lines.
+
+    Returns (ok: bool, detail: str). Never raises -- a self-test that
+    itself fails must not stop a real call from being answered, so any
+    internal error returns ok=True with an explanatory detail (fail
+    OPEN: an inconclusive test is not evidence of breakage)."""
+    if os.environ.get(AUDIO_SELFTEST_ENV) == "1":
+        return True, "skipped (CURANT_FACETIME_SKIP_AUDIO_SELFTEST=1)"
+    device_index = None
+    tmp_wav = None
+    try:
+        device_index = _find_avfoundation_audio_device_index(CALLER_AUDIO_DEVICE)
+        if device_index is None:
+            return True, f"skipped ({CALLER_AUDIO_DEVICE} not found as a capture device)"
+        fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        # Capture first, tone second -- the capture process needs to be
+        # live before the tone plays or the tone is simply missed. sox's
+        # synth generates the tone directly into the system output
+        # device (same path speak() uses for real replies), so this
+        # exercises the ACTUAL production audio route, not a simulation
+        # of it.
+        cap = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "avfoundation", "-i", f":{device_index}",
+             "-t", str(AUDIO_SELFTEST_TONE_SECONDS + 0.9), "-ar", "16000", tmp_wav],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.45)  # let avfoundation actually open the device before the tone starts
+        if _sox_available():
+            subprocess.run(
+                ["sox", "-n", "-t", "coreaudio", SYSTEM_OUTPUT_DEVICE,
+                 "synth", str(AUDIO_SELFTEST_TONE_SECONDS), "sine", "440", "vol", "0.35"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        else:
+            subprocess.run(["afplay", "/System/Library/Sounds/Ping.aiff"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        try:
+            cap.wait(timeout=8)
+        except Exception:
+            cap.kill()
+        mono = _extract_loudest_channel_mono(tmp_wav)
+        try:
+            _has, rms = _wav_has_speech(mono, threshold=SILENCE_RMS_THRESHOLD)
+        finally:
+            if mono != tmp_wav and os.path.exists(mono):
+                os.remove(mono)
+        if rms is None:
+            return True, "inconclusive (could not measure the captured tone)"
+        if rms <= TRUE_SILENCE_RMS_THRESHOLD:
+            return False, (f"NO SIGNAL (captured RMS {rms:.1f}) -- a tone played into "
+                           f"{SYSTEM_OUTPUT_DEVICE!r} did not reach {CALLER_AUDIO_DEVICE!r} at all")
+        return True, f"OK (captured tone at RMS {rms:.1f})"
+    except Exception as e:
+        return True, f"inconclusive (self-test error: {e})"
+    finally:
+        if tmp_wav and os.path.exists(tmp_wav):
+            os.remove(tmp_wav)
+
+
 TTS_VOICE = "Samantha"  # explicit `say` voice -- see speak()'s docstring for why this is required,
                         # not optional. CHANGED from "Alex" (2026-08-21): live-checked via
                         # `say -v '?'` and "Alex" is not actually in the list of voices
@@ -1730,6 +1880,177 @@ def _is_quota_error(e):
             or "rate limit" in msg or "quota" in msg)
 
 
+MAX_UTTERANCE_SECONDS = 15.0   # hard cap: flush and transcribe even if the caller hasn't paused
+UTTERANCE_TRAILING_SILENCE_SEGMENTS = 1  # how many silent segments end an utterance
+
+
+def _concat_wavs(paths, out_path):
+    """Joins same-format mono WAVs end to end into one file. Pure
+    stdlib (wave module) -- no ffmpeg subprocess, because this runs on
+    the critical path of every single turn and spawning another process
+    per turn is exactly the kind of churn this file has repeatedly
+    traced call instability back to."""
+    import wave
+    with wave.open(paths[0], "rb") as first:
+        params = first.getparams()
+    with wave.open(out_path, "wb") as out:
+        out.setparams(params)
+        for p in paths:
+            with wave.open(p, "rb") as w:
+                out.writeframes(w.readframes(w.getnframes()))
+    return out_path
+
+
+class _UtteranceBuffer:
+    """Accumulates consecutive speech segments into ONE utterance and
+    only transcribes when the caller actually stops talking.
+
+    THE PROBLEM THIS SOLVES, confirmed live across several nights of
+    real calls: caller audio is chopped into fixed TURN_RECORD_SECONDS
+    windows by ffmpeg's segment muxer, with no relationship whatsoever
+    to where sentences begin and end. Every turn was transcribed in
+    isolation, so a sentence spanning a boundary arrived as two partial
+    fragments and Gemini -- correctly, per its own prompt -- returned an
+    empty string for each rather than hallucinating. Observed
+    repeatedly: turns with unmistakably real speech (RMS 694, 120, 57,
+    35, all far above threshold) producing no transcript at all. Raising
+    the window from 2s to 3s reduced but did NOT eliminate this, because
+    no fixed window can align with natural speech -- it just moves where
+    the cut lands.
+
+    The fix is to stop treating a fixed window as a turn boundary at
+    all. Segments with speech are buffered; the utterance is only
+    considered complete (and sent for transcription as a single
+    concatenated clip) once a segment comes back silent -- i.e. the
+    caller actually paused -- or MAX_UTTERANCE_SECONDS is reached, which
+    bounds worst-case latency for someone who talks without pausing.
+
+    Segments are COPIED into the buffer's own temp files rather than
+    borrowing the loop's paths, so the existing per-turn cleanup can go
+    on deleting its files exactly as before -- a buffered utterance can
+    never be left holding a path someone else already removed. A ~3s
+    16kHz mono segment is under 100KB, so the copy is cheap next to the
+    API round trip it protects."""
+
+    def __init__(self):
+        self.dir = tempfile.mkdtemp(prefix="curant_utterance_")
+        self.paths = []
+        self.silent_run = 0
+        self.seconds = 0.0
+
+    def add_speech(self, wav_path, seconds):
+        try:
+            dest = os.path.join(self.dir, f"part_{len(self.paths):05d}.wav")
+            shutil.copy2(wav_path, dest)
+            self.paths.append(dest)
+            self.seconds += seconds or 0.0
+            self.silent_run = 0
+        except Exception as e:
+            print(f"  [{_ts()}] Could not buffer utterance segment ({e}) -- "
+                  f"transcribing this segment alone instead.", file=sys.stderr)
+            self.paths.append(wav_path)  # degrade gracefully rather than lose the audio
+
+    def note_silence(self):
+        self.silent_run += 1
+
+    def has_audio(self):
+        return bool(self.paths)
+
+    def should_flush(self):
+        """Flush when the caller has paused, or when they've been going
+        long enough that waiting for a pause would itself feel broken."""
+        if not self.paths:
+            return False
+        return (self.silent_run >= UTTERANCE_TRAILING_SILENCE_SEGMENTS
+                or self.seconds >= MAX_UTTERANCE_SECONDS)
+
+    def build(self):
+        """Returns a single WAV path for everything buffered, or None."""
+        if not self.paths:
+            return None
+        if len(self.paths) == 1:
+            return self.paths[0]
+        out = os.path.join(self.dir, "utterance.wav")
+        try:
+            return _concat_wavs(self.paths, out)
+        except Exception as e:
+            print(f"  [{_ts()}] Could not join {len(self.paths)} utterance parts ({e}) -- "
+                  f"falling back to the longest single part.", file=sys.stderr)
+            return max(self.paths, key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0)
+
+    def reset(self):
+        try:
+            shutil.rmtree(self.dir, ignore_errors=True)
+        except Exception:
+            pass
+        self.dir = tempfile.mkdtemp(prefix="curant_utterance_")
+        self.paths = []
+        self.silent_run = 0
+        self.seconds = 0.0
+
+    def cleanup(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _is_transient_api_error(e):
+    """Broader than _is_quota_error(): also catches the SERVER-side
+    overload/availability failures that aren't about this account's
+    quota at all.
+
+    REAL BUG (2026-08-21): a live call with genuinely captured speech
+    (RMS 275.1 -- unambiguous, well above threshold) died on a Gemini
+    "503 UNAVAILABLE: This model is currently experiencing high demand"
+    response. 503 contains none of the substrings _is_quota_error()
+    looks for, so it wasn't retried against the model fallback chain
+    and wasn't recognised as transient anywhere -- it simply propagated
+    and took the whole call down. These are precisely the errors most
+    worth retrying: they're temporary by definition and usually clear
+    within seconds."""
+    msg = str(e).lower()
+    return (_is_quota_error(e)
+            or "503" in msg or "unavailable" in msg or "overloaded" in msg
+            or "500" in msg or "internal error" in msg
+            or "502" in msg or "504" in msg or "deadline" in msg
+            or "timed out" in msg or "timeout" in msg
+            or "connection" in msg or "temporarily" in msg)
+
+
+TRANSCRIBE_RETRY_ATTEMPTS = 3
+TRANSCRIBE_RETRY_BASE_SECONDS = 0.6
+
+
+def transcribe_with_retry(wav_path, cfg):
+    """transcribe() plus bounded retry-with-backoff on transient errors.
+
+    A live caller is waiting, so this is deliberately impatient: a small
+    number of attempts with short exponential backoff (~0.6s, ~1.2s),
+    total added latency well under two seconds in the worst case. The
+    alternative -- what shipped before this -- was that a single
+    momentary 503 from Google's side lost the caller's sentence
+    entirely, and (before the surrounding try/except was added) killed
+    the whole call.
+
+    Non-transient errors (bad API key, malformed request) are NOT
+    retried -- they'd fail identically every time and retrying just
+    burns the caller's patience. They propagate to the caller's own
+    handler, which treats the turn as unheard and keeps the call
+    alive."""
+    last_err = None
+    for attempt in range(TRANSCRIBE_RETRY_ATTEMPTS):
+        try:
+            return transcribe(wav_path, cfg)
+        except Exception as e:
+            last_err = e
+            if not _is_transient_api_error(e) or attempt == TRANSCRIBE_RETRY_ATTEMPTS - 1:
+                raise
+            delay = TRANSCRIBE_RETRY_BASE_SECONDS * (2 ** attempt)
+            print(f"  [{_ts()}] Transcription hit a transient error ({e}) -- retrying in "
+                  f"{delay:.1f}s (attempt {attempt + 2}/{TRANSCRIBE_RETRY_ATTEMPTS}).",
+                  file=sys.stderr)
+            time.sleep(delay)
+    raise last_err  # unreachable in practice -- the loop either returns or raises above
+
+
 def _transcribe_gemini(wav_path, api_key):
     """Gemini's native audio understanding — no separate transcription
     service needed if you're already on Gemini for replies. Uses the
@@ -2240,6 +2561,22 @@ def handle_call(window_desc, apple_id, dry_run):
     speak("Hi, this is Curant. I'm listening.")
     print(f"  [{_ts()}] Greeting playback finished.")
 
+    # Per-call proof that the capture path works, run BEFORE the caller
+    # has had a real chance to say anything -- see
+    # audio_capture_selftest()'s docstring for why this exists at all
+    # (every distinct silent-call cause produces an identical-looking
+    # log without it). Deliberately re-run per call, not just once at
+    # startup: the system default output has been observed changing
+    # out from under this process mid-session, so a pass at startup is
+    # not a guarantee for a call minutes later.
+    _st_ok, _st_detail = audio_capture_selftest()
+    if _st_ok:
+        print(f"  [{_ts()}] Audio capture self-test: {_st_detail}")
+    else:
+        print(f"  [{_ts()}] AUDIO CAPTURE SELF-TEST FAILED: {_st_detail}. Every turn of this "
+              f"call will read as silent -- this is a routing/config problem, NOT the caller "
+              f"being quiet. See the startup log for the full checklist.", file=sys.stderr)
+
     # Fast, direct hangup detection (see _watch_for_call_end()'s docstring
     # for why this is a separate throttled thread, not an inline check).
     # call_ended_event is threaded through to _wait_for_next_turn_segment()
@@ -2300,6 +2637,8 @@ def handle_call(window_desc, apple_id, dry_run):
     # docstring for the full reasoning.
     capture_process = None
     segment_dir = None
+    utterance = None  # defined here, not just inside the try below, so the finally can always
+                      # clean it up even if _start_continuous_capture() itself raises first
     try:
         capture_process, segment_dir, pattern = _start_continuous_capture(TURN_RECORD_SECONDS)
         print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
@@ -2321,6 +2660,11 @@ def handle_call(window_desc, apple_id, dry_run):
         # back to polling for a genuinely new incoming call instead of
         # staying stuck babysitting a call that's already over.
         consecutive_true_silent_turns = 0
+        # Speech is accumulated here across segments and only sent for
+        # transcription once the caller pauses -- see _UtteranceBuffer's
+        # docstring for the (confirmed-live) empty-transcript bug that
+        # fixed-window-per-turn transcription caused.
+        utterance = _UtteranceBuffer()
         while True:
             # REMOVED per explicit direction: no more _call_is_still_
             # connected() check here at all -- not once per turn, not
@@ -2420,9 +2764,34 @@ def handle_call(window_desc, apple_id, dry_run):
                             return
                     else:
                         consecutive_true_silent_turns = 0
-                if not has_speech:
-                    print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
-                    continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
+                # UTTERANCE ENDPOINTING (see _UtteranceBuffer): a
+                # segment with speech is buffered, not transcribed on
+                # its own. Only a pause (or a very long monologue) ends
+                # the utterance and triggers one transcription of the
+                # whole thing, so a sentence that happens to straddle a
+                # segment boundary is no longer torn into two
+                # untranscribable fragments.
+                try:
+                    _seg_seconds = os.path.getsize(wav_path) / float(16000 * 2)
+                except Exception:
+                    _seg_seconds = TURN_RECORD_SECONDS
+                if has_speech:
+                    utterance.add_speech(wav_path, _seg_seconds)
+                    if not utterance.should_flush():
+                        print(f"  [{_ts()}] Speech detected -- buffering "
+                              f"({utterance.seconds:.1f}s so far), waiting for the caller to pause.")
+                        continue
+                    print(f"  [{_ts()}] Utterance hit the {MAX_UTTERANCE_SECONDS:.0f}s cap -- "
+                          f"transcribing what we have so far.")
+                else:
+                    utterance.note_silence()
+                    if not utterance.has_audio():
+                        print(f"  [{_ts()}] Clip looked silent -- nothing buffered, still listening.")
+                        continue
+                    if not utterance.should_flush():
+                        continue
+                    print(f"  [{_ts()}] Caller paused -- transcribing {utterance.seconds:.1f}s "
+                          f"of buffered speech ({len(utterance.paths)} segment(s)).")
                 # TIMED (2026-08-08, added per explicit request to make
                 # transcription/response faster): rather than guess at
                 # what's slow, measure the two real API round trips
@@ -2431,8 +2800,9 @@ def handle_call(window_desc, apple_id, dry_run):
                 # speculation. See get_reply() below for the matching
                 # timer on the reply side.
                 _transcribe_start = time.monotonic()
+                _utterance_wav = utterance.build() or wav_path
                 try:
-                    text = transcribe(wav_path, cfg)
+                    text = transcribe_with_retry(_utterance_wav, cfg)
                 except Exception as e:
                     # Real bug found live (2026-08-20): a transient
                     # Gemini "503 UNAVAILABLE -- high demand" error during
@@ -2471,7 +2841,7 @@ def handle_call(window_desc, apple_id, dry_run):
                         saved_path = os.path.join(
                             debug_dir, f"{_ts().replace(':', '-')}_{os.path.basename(wav_path)}"
                         )
-                        shutil.copy2(wav_path, saved_path)
+                        shutil.copy2(_utterance_wav, saved_path)
                         print(f"  [{_ts()}] Saved failing clip for inspection: {saved_path}",
                               file=sys.stderr)
                     except Exception as e:
@@ -2482,6 +2852,13 @@ def handle_call(window_desc, apple_id, dry_run):
                     os.remove(raw_wav_path)
                 if wav_path != raw_wav_path and os.path.exists(wav_path):
                     os.remove(wav_path)
+            # This utterance has now been transcribed (successfully or
+            # not) -- clear the buffer so the next one starts clean
+            # instead of re-sending audio that was already sent once.
+            # Deliberately AFTER the finally above: the failing-clip
+            # save inside the try still needs the joined utterance file,
+            # which lives in the buffer's own temp dir.
+            utterance.reset()
             if not text:
                 # Previously silent here -- indistinguishable in the logs
                 # from a turn that never had speech at all. Real bug found
@@ -2531,14 +2908,33 @@ def handle_call(window_desc, apple_id, dry_run):
                 if was_interrupted and watcher.found:
                     interrupted_holder[0] = True
 
+            # Three-layer fallback so a caller is never left in silence
+            # after Curant has already heard them:
+            #   1. streaming reply (fastest -- speaks sentence by sentence)
+            #   2. plain non-streaming reply, if streaming itself broke
+            #      (a bug in the stream plumbing shouldn't cost a reply
+            #      that the model can still perfectly well generate)
+            #   3. a spoken apology, so the turn still ENDS in speech
+            # Layer 2 is skipped when layer 1 already spoke something --
+            # re-answering a question the caller has partly heard
+            # answered would be worse than just moving on.
+            reply = None
             try:
                 reply = get_reply_streaming(text, apple_id, _speak_sentence)
             except Exception as e:
-                print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
-                reply = None
+                print(f"  [{_ts()}] Streaming reply failed: {e}", file=sys.stderr)
                 if not sentences_spoken:
-                    speak("Sorry, I ran into a problem there — could you say that again?",
-                          interrupt_check=watcher.check)
+                    try:
+                        print(f"  [{_ts()}] Falling back to non-streaming reply.", file=sys.stderr)
+                        reply = get_reply(text, apple_id)
+                        if reply:
+                            _speak_sentence(reply)
+                    except Exception as e2:
+                        print(f"  [{_ts()}] Non-streaming reply also failed: {e2}", file=sys.stderr)
+                        reply = None
+            if reply is None and not sentences_spoken:
+                speak("Sorry, I ran into a problem there — could you say that again?",
+                      interrupt_check=watcher.check)
 
             _reply_elapsed = time.monotonic() - _reply_start
             turn_index = watcher.resume_index()
@@ -2552,6 +2948,11 @@ def handle_call(window_desc, apple_id, dry_run):
             else:
                 print(f"  [{_ts()}] Reply playback finished.")
     finally:
+        if utterance is not None:
+            try:
+                utterance.cleanup()  # buffered utterance temp dir -- see _UtteranceBuffer
+            except Exception:
+                pass
         call_ended_event.set()  # stop the watcher thread regardless of how this function returns
         if capture_process is not None:
             _stop_continuous_capture(capture_process)
@@ -2622,6 +3023,25 @@ def main():
               f"input: {TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}. "
               f"(Will NOT revert until this process exits -- your Mac's normal mic/speakers "
               f"are unavailable for other things while this service is running.)")
+        # Report (never silently "fix") output-device configurations
+        # known to make calls silent -- see audit_output_devices().
+        audit_output_devices()
+        ok, detail = audio_capture_selftest()
+        if ok:
+            print(f"  Audio capture self-test: {detail}")
+        else:
+            print(f"  AUDIO CAPTURE SELF-TEST FAILED: {detail}.\n"
+                  f"    Calls will be answered and Curant will still speak, but it will not "
+                  f"hear ANYTHING the caller says until this is fixed.\n"
+                  f"    Check, in this order: (1) does a Multi-Output Device named "
+                  f"{SYSTEM_OUTPUT_DEVICE!r} exist in Audio MIDI Setup with "
+                  f"{CALLER_AUDIO_DEVICE!r} CHECKED as one of its outputs and Drift "
+                  f"Correction enabled on it; (2) is the system output still "
+                  f"{SYSTEM_OUTPUT_DEVICE!r} (another app opening an audio device can "
+                  f"silently steal it); (3) during a live call, does the FaceTime call "
+                  f"window's own audio control name {SYSTEM_OUTPUT_DEVICE!r} -- if it names "
+                  f"a different Multi-Output Device, FaceTime is routing elsewhere and this "
+                  f"script cannot hear it.", file=sys.stderr)
 
     while True:
         try:
