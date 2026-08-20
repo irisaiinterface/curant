@@ -1781,6 +1781,94 @@ def get_reply(text, apple_id):
     return data.get("reply") or ""
 
 
+def get_reply_streaming(text, apple_id, on_sentence):
+    """
+    Streaming counterpart to get_reply(), added per explicit request to
+    cut perceived call latency. get_reply() uses subprocess.run(), which
+    blocks until curant-cli's ENTIRE process exits -- meaning a caller
+    sat in dead silence for the full reply-generation round trip
+    (observed live: 2-20s) before speak() ever started. This calls
+    on_sentence(sentence) for each complete sentence AS SOON AS curant-
+    cli produces it, so handle_call() can start speak()ing the first
+    sentence while the rest is still being generated.
+
+    Protocol (see curant-cli relay's --stream flag docstring): zero or
+    more {"chunk": "..."} lines, flushed by curant-cli as generated,
+    followed by exactly one final {"reply": ..., "reply_format": ...,
+    "voice_tier": ..., "attachment_path": ...} line -- same shape as
+    the non-streaming response. If curant-cli never emits any chunk
+    lines at all (provider fallback, or a mid-turn tool call aborted
+    streaming -- see call_llm_with_tools_streaming /
+    _call_gemini_with_tools_streaming's docstrings), the final line's
+    full reply text is delivered as a single on_sentence() call instead
+    -- correct either way, just without the early-start benefit on
+    every path yet.
+
+    Sentence-splitting happens HERE (buffering raw text chunks until a
+    ., !, or ? is seen), not in curant-cli, so speak() gets whole
+    sentences to synthesize rather than word-by-word fragments, which
+    would sound choppy and add per-utterance TTS overhead for no
+    latency benefit (the win is starting sentence 1 early, not
+    minimizing sentence size).
+    """
+    args = ["curant-cli", "relay", text, "--apple-id", apple_id, "--tier", "fast", "--voice", "--stream"]
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    buffer = ""
+    full_text_parts = []
+    final_reply = None
+    saw_any_chunk = False
+
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue  # not a JSON line (shouldn't happen) -- skip rather than crash the whole call
+            if "chunk" in data:
+                saw_any_chunk = True
+                buffer += data["chunk"]
+                full_text_parts.append(data["chunk"])
+                while True:
+                    m = re.search(r"[.!?](\s|$)", buffer)
+                    if not m:
+                        break
+                    end = m.end()
+                    sentence = buffer[:end].strip()
+                    buffer = buffer[end:]
+                    if sentence:
+                        on_sentence(sentence)
+            elif "reply" in data:
+                final_reply = data
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        stderr_out = proc.stderr.read() if proc.stderr else ""
+        if stderr_out:
+            print(stderr_out, file=sys.stderr, end="")
+
+    if buffer.strip():
+        on_sentence(buffer.strip())
+
+    if final_reply is None:
+        raise RuntimeError("curant-cli relay --stream never printed a final reply line")
+    if final_reply.get("error"):
+        raise RuntimeError(f"relay error: {final_reply['error']}")
+
+    if not saw_any_chunk:
+        whole = final_reply.get("reply") or ""
+        if whole:
+            on_sentence(whole)
+        return whole
+
+    return "".join(full_text_parts)
+
+
 def _call_is_still_connected():
     """Read-only counterpart to hang_up() — checks whether the call is
     still connected, WITHOUT clicking anything. This is what
@@ -2301,27 +2389,50 @@ def handle_call(window_desc, apple_id, dry_run):
                     continue  # likely silence in this window — just listen again
                 print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
                 _reply_start = time.monotonic()
+
+                # STREAMING per explicit request to cut perceived call
+                # latency: sentences are spoken as they're generated,
+                # not after the whole reply is ready -- see
+                # get_reply_streaming()'s docstring. Barge-in (see
+                # _InterruptWatcher's docstring) uses ONE watcher shared
+                # across every sentence in this turn, same as before,
+                # just now potentially checked across several speak()
+                # calls instead of one.
+                watcher = _InterruptWatcher(pattern, turn_index)
+                sentences_spoken = []
+                first_chunk_time = [None]  # list, not a plain var -- mutated from the nested callback below
+                interrupted_holder = [False]
+
+                def _speak_sentence(sentence):
+                    if first_chunk_time[0] is None:
+                        first_chunk_time[0] = time.monotonic()
+                    if interrupted_holder[0]:
+                        return  # already interrupted this turn -- don't keep speaking later sentences
+                    sentences_spoken.append(sentence)
+                    was_interrupted = speak(sentence, interrupt_check=watcher.check)
+                    if was_interrupted and watcher.found:
+                        interrupted_holder[0] = True
+
                 try:
-                    reply = get_reply(text, apple_id)
+                    reply = get_reply_streaming(text, apple_id, _speak_sentence)
                 except Exception as e:
                     print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
-                    reply = "Sorry, I ran into a problem there — could you say that again?"
+                    reply = None
+                    if not sentences_spoken:
+                        speak("Sorry, I ran into a problem there — could you say that again?",
+                              interrupt_check=watcher.check)
+
                 _reply_elapsed = time.monotonic() - _reply_start
+                turn_index = watcher.resume_index()
                 if reply:
-                    print(f"  [{_ts()}] Curant says: {reply} (reply generation took {_reply_elapsed:.2f}s)")
-                    # Barge-in: watch for the caller starting to talk WHILE
-                    # this reply is still playing (see _InterruptWatcher's
-                    # docstring) and cut playback short if they do, instead
-                    # of making them wait out a reply they've already
-                    # started talking over.
-                    watcher = _InterruptWatcher(pattern, turn_index)
-                    interrupted = speak(reply, interrupt_check=watcher.check)
-                    turn_index = watcher.resume_index()
-                    if interrupted and watcher.found:
-                        print(f"  [{_ts()}] Reply playback interrupted by caller.")
-                        pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
-                    else:
-                        print(f"  [{_ts()}] Reply playback finished.")
+                    _first_word_elapsed = (first_chunk_time[0] - _reply_start) if first_chunk_time[0] else _reply_elapsed
+                    print(f"  [{_ts()}] Curant says: {reply} "
+                          f"(time to first words: {_first_word_elapsed:.2f}s, total: {_reply_elapsed:.2f}s)")
+                if interrupted_holder[0]:
+                    print(f"  [{_ts()}] Reply playback interrupted by caller.")
+                    pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
+                else:
+                    print(f"  [{_ts()}] Reply playback finished.")
         finally:
             call_ended_event.set()  # stop the watcher thread regardless of how this function returns
             if capture_process is not None:
