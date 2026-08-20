@@ -145,6 +145,11 @@ import tempfile
 import threading
 import time
 import re
+import shutil  # module-level now -- a later LOCAL 'import shutil' inside
+                     # handle_call() would make every 'shutil' reference in that whole function
+                     # resolve as local (Python scopes by static analysis of the function body),
+                     # breaking the EARLIER shutil.copy2 use added for saving failing
+                     # transcription clips with an UnboundLocalError.
 
 def _ts():
     """Wall-clock timestamp (local time, millisecond precision) prefixed
@@ -538,46 +543,80 @@ def _call_end_search_region_fraction():
     return (0.0, 1.0, 0.0, 0.12)  # wide top strip, first guess -- see comment above
 
 
-def _call_end_banner_detected():
+def _raw_call_end_region_text():
+    """Just the OCR read of the call-end region, no 'left' matching --
+    factored out so both the baseline capture and the live check use
+    the exact same code path. Returns (text_or_None, err_or_None)."""
+    screenshot_path = _capture_screenshot()
+    try:
+        return _ocr_text_from_screenshot(screenshot_path, _call_end_search_region_fraction())
+    finally:
+        if os.path.exists(screenshot_path):
+            os.remove(screenshot_path)
+
+
+def _call_end_banner_detected(baseline_text=None):
     """Fails safe: any error here (screenshot/OCR failure) returns False
     -- i.e. NOT ended -- same fail-safe direction as _accept_button_
     visible_now(), since a false "ended" here would mean silently
-    abandoning a caller who's still on the line."""
+    abandoning a caller who's still on the line.
+
+    BASELINE-EXCLUSION, added after a real, confirmed-live false
+    positive: the call-end region is a wide top strip of the whole
+    screen (see CALL_END_OCR_REGION_ENV's comment -- deliberately wide
+    since the exact banner position was never confirmed against a real
+    Mac before writing this). On a dev machine, that strip can easily
+    include a Terminal window with OLD "<number> left" text sitting in
+    its own scrollback from an earlier successful call -- confirmed
+    live: this matched stale Terminal text and hung up a real,
+    still-active call mid-conversation, nowhere near an actual FaceTime
+    hangup banner.
+
+    Fix: baseline_text is a snapshot of this exact region taken once,
+    right after a call is accepted (see handle_call()), before any real
+    hangup could possibly have happened yet. A later "left" match only
+    counts if the region's OCR text has actually CHANGED since that
+    baseline -- static stale text (like Terminal scrollback that never
+    scrolls during a silent call) stays byte-identical to the baseline
+    and is correctly ignored forever, while a real banner appearing
+    changes what's on screen and is still caught immediately. If no
+    baseline was captured (baseline_text=None), falls back to the old,
+    less careful behavior -- any "left" match counts -- rather than
+    silently never detecting real hangups."""
     try:
-        screenshot_path = _capture_screenshot()
-        try:
-            # Real bug found live: _ocr_text_from_screenshot() returns
-            # (text_or_None, error_or_None), not a plain string -- see
-            # its own docstring. Passing the raw tuple straight to
-            # re.search() below failed every single check during a real
-            # call ("expected string or bytes-like object, got 'tuple'"),
-            # meaning this never actually got a chance to detect anything
-            # yet. Unpack it properly.
-            text, err = _ocr_text_from_screenshot(screenshot_path, _call_end_search_region_fraction())
-        finally:
-            if os.path.exists(screenshot_path):
-                os.remove(screenshot_path)
+        text, err = _raw_call_end_region_text()
         if err:
             print(f"  [{_ts()}] [call-end OCR] {err} -- treating as not ended.", file=sys.stderr)
             return False
-        if text and re.search(r"\bleft\b", text, re.IGNORECASE):
-            print(f"  [{_ts()}] [call-end OCR] matched \"left\" in: {text!r}", file=sys.stderr)
-            return True
-        return False
+        if not text or not re.search(r"\bleft\b", text, re.IGNORECASE):
+            return False
+        if baseline_text is not None and text == baseline_text:
+            # Same "left" was already sitting on screen before this call
+            # even started (e.g. stale Terminal scrollback) -- nothing
+            # has actually changed, so this is not a real hangup event.
+            return False
+        print(f"  [{_ts()}] [call-end OCR] matched \"left\" in: {text!r}"
+              f"{' (baseline had no match)' if baseline_text is not None else ''}", file=sys.stderr)
+        return True
     except Exception as e:
         print(f"  [{_ts()}] [call-end OCR] check failed ({e}) -- treating as not ended.", file=sys.stderr)
         return False
 
 
-def _watch_for_call_end(stop_event):
+def _watch_for_call_end(stop_event, baseline_text=None):
     """Runs on its own daemon thread for the lifetime of one call (see
     handle_call()). Polls _call_end_banner_detected() every
     CALL_END_POLL_SECONDS and sets stop_event the moment it fires --
     handle_call()'s main loop and _wait_for_next_turn_segment() both
     check stop_event to react within about one poll tick, rather than
-    waiting for the old silence-timeout to build up over many turns."""
+    waiting for the old silence-timeout to build up over many turns.
+
+    baseline_text is threaded straight through to _call_end_banner_
+    detected() on every check -- see that function's docstring for why
+    this is needed (stale on-screen "left" text producing a false
+    hangup)."""
     while not stop_event.is_set():
-        if _call_end_banner_detected():
+        if _call_end_banner_detected(baseline_text=baseline_text):
             stop_event.set()
             return
         stop_event.wait(CALL_END_POLL_SECONDS)
@@ -2195,9 +2234,23 @@ def handle_call(window_desc, apple_id, dry_run):
     # below and checked at the top of the main loop, and is always set in
     # this function's own finally block so the watcher thread exits with
     # the call regardless of which path out of this function is taken.
+    #
+    # baseline_text: a snapshot of the call-end OCR region taken RIGHT
+    # NOW, before any real hangup could possibly have happened yet --
+    # see _call_end_banner_detected()'s docstring for the real, live bug
+    # this fixes (stale "<number> left" text sitting in a Terminal
+    # window within the OCR region matched and hung up a real, still-
+    # active call). Best-effort: if the snapshot itself fails, fall back
+    # to no baseline (old behavior) rather than blocking call handling
+    # on it.
+    try:
+        _call_end_baseline_text, _ = _raw_call_end_region_text()
+    except Exception:
+        _call_end_baseline_text = None
     call_ended_event = threading.Event()
     call_end_watcher = threading.Thread(
-        target=_watch_for_call_end, args=(call_ended_event,), daemon=True
+        target=_watch_for_call_end, args=(call_ended_event,),
+        kwargs={"baseline_text": _call_end_baseline_text}, daemon=True
     )
     call_end_watcher.start()
 
@@ -2368,6 +2421,27 @@ def handle_call(window_desc, apple_id, dry_run):
                 _transcribe_start = time.monotonic()
                 text = transcribe(wav_path, cfg)
                 _transcribe_elapsed = time.monotonic() - _transcribe_start
+                if not text:
+                    # Preserve the actual audio BEFORE the finally block
+                    # below deletes it -- added after two rounds of pure
+                    # guessing (segment-boundary theory, then a widened
+                    # TURN_RECORD_SECONDS) failed to fully explain repeat
+                    # empty transcripts on clips with real, well-above-
+                    # threshold RMS. Saved copies let this actually be
+                    # LISTENED to instead of guessed at blind. Best-effort
+                    # -- a failure to save must never break the call.
+                    try:
+                        debug_dir = os.path.expanduser("~/.curant/logs/empty_transcript_clips")
+                        os.makedirs(debug_dir, exist_ok=True)
+                        saved_path = os.path.join(
+                            debug_dir, f"{_ts().replace(':', '-')}_{os.path.basename(wav_path)}"
+                        )
+                        shutil.copy2(wav_path, saved_path)
+                        print(f"  [{_ts()}] Saved failing clip for inspection: {saved_path}",
+                              file=sys.stderr)
+                    except Exception as e:
+                        print(f"  [{_ts()}] Could not save failing clip (non-fatal): {e}",
+                              file=sys.stderr)
             finally:
                 if os.path.exists(raw_wav_path):
                     os.remove(raw_wav_path)
@@ -2387,13 +2461,14 @@ def handle_call(window_desc, apple_id, dry_run):
                 # boundary, leaving two partial/unclear fragments that
                 # Gemini's transcription correctly declines to guess at
                 # (it's explicitly instructed to return empty rather than
-                # hallucinate -- see _transcribe_gemini's prompt). Logging
-                # this now so the NEXT occurrence shows up instead of
-                # vanishing the same way.
+                # hallucinate -- see _transcribe_gemini's prompt). Raising
+                # TURN_RECORD_SECONDS to 3 did NOT fully fix this --
+                # confirmed live, still recurring -- so the clip is now
+                # also saved to disk (see above) for actual inspection
+                # instead of further guessing.
                 print(f"  [{_ts()}] Had speech (RMS above threshold) but got an empty "
                       f"transcript back (transcription took {_transcribe_elapsed:.2f}s) -- "
-                      f"possibly a sentence cut across the {TURN_RECORD_SECONDS}s segment "
-                      f"boundary. Listening for the next segment.")
+                      f"clip saved for inspection, see stderr log for the path.")
                 continue  # likely silence in this window — just listen again
             print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
             _reply_start = time.monotonic()
@@ -2446,8 +2521,7 @@ def handle_call(window_desc, apple_id, dry_run):
         if capture_process is not None:
             _stop_continuous_capture(capture_process)
         if segment_dir is not None:
-            import shutil
-            shutil.rmtree(segment_dir, ignore_errors=True)
+            shutil.rmtree(segment_dir, ignore_errors=True)  # shutil is module-level now, see top of file
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
