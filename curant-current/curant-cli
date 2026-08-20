@@ -6985,7 +6985,18 @@ def _normalize_handle(h):
     if not h or "@" in h:
         return h
     if h.startswith("+"):
-        return h
+        # Real bug found live: a "+"-prefixed number typed with normal
+        # human formatting (e.g. "+1 (240) 839-0687", straight off an
+        # iPhone Contacts card) used to be returned as-is here, spaces
+        # and parens included, because this early-return only checked
+        # for the leading "+" and skipped digit-stripping entirely.
+        # chat.db stores everything as clean E.164 ("+12408390687"),
+        # and matching is a plain exact-string comparison -- so the
+        # unstripped value never matched a single incoming text, with
+        # no error surfaced anywhere. Strip to digits and re-add the
+        # "+" so a "+"-prefixed number gets the same cleanup as a bare
+        # one below.
+        return "+" + re.sub(r"\D", "", h)
     digits = re.sub(r"\D", "", h)
     if len(digits) == 10:
         return "+1" + digits
