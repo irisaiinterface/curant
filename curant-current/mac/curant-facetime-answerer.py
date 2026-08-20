@@ -2431,7 +2431,30 @@ def handle_call(window_desc, apple_id, dry_run):
                 # speculation. See get_reply() below for the matching
                 # timer on the reply side.
                 _transcribe_start = time.monotonic()
-                text = transcribe(wav_path, cfg)
+                try:
+                    text = transcribe(wav_path, cfg)
+                except Exception as e:
+                    # Real bug found live (2026-08-20): a transient
+                    # Gemini "503 UNAVAILABLE -- high demand" error during
+                    # transcribe() was completely uncaught here. It
+                    # propagated out of this whole function, past
+                    # handle_call()'s own try/finally blocks (none of
+                    # which have an `except`, only cleanup `finally`s),
+                    # all the way up to main()'s poll-loop catch-all --
+                    # which printed "Unexpected error in poll loop
+                    # (continuing)" and went back to LISTENING FOR A NEW
+                    # CALL, silently abandoning the real, still-connected
+                    # one. Confirmed live: that exact call had genuine
+                    # captured speech (RMS 275.1, clearly real, well
+                    # above threshold) that never got a chance to
+                    # generate a reply at all -- not an audio problem,
+                    # a single transient API error killing the entire
+                    # call. A quota/overload error on ONE turn's
+                    # transcription should cost that turn, not the
+                    # whole conversation.
+                    print(f"  [{_ts()}] Transcription failed this turn ({e}) -- "
+                          f"treating as no speech and continuing to listen.", file=sys.stderr)
+                    text = None
                 _transcribe_elapsed = time.monotonic() - _transcribe_start
                 if not text:
                     # Preserve the actual audio BEFORE the finally block
