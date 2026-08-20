@@ -1218,7 +1218,19 @@ def _get_current_device(device_type):
         return None
 
 
-TTS_VOICE = "Alex"  # explicit `say` voice -- see speak()'s docstring for why this is required, not optional
+TTS_VOICE = "Samantha"  # explicit `say` voice -- see speak()'s docstring for why this is required,
+                        # not optional. CHANGED from "Alex" (2026-08-21): live-checked via
+                        # `say -v '?'` and "Alex" is not actually in the list of voices
+                        # installed on this Mac at all -- it may have been removed/never
+                        # downloaded since the original bug report that picked it (Alex was a
+                        # known-good, explicitly-tested voice AT THE TIME, not a permanent
+                        # guarantee). Switched to Samantha -- confirmed present in the same
+                        # `say -v '?'` listing, and matches what a live no-flag `say` test
+                        # sounded like (no explicit SelectedVoiceName is set on this Mac in
+                        # either com.apple.speech.voice.prefs or
+                        # com.apple.speech.synthesis.general.prefs, so Samantha is almost
+                        # certainly macOS's own built-in fallback here). Still explicit, not a
+                        # bare `say` call -- see the docstring below for why that matters.
 
 _SOX_AVAILABLE = None  # cached shutil.which("sox") result
 
