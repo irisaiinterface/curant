@@ -10,9 +10,10 @@
 # What this does NOT do, on purpose:
 #   - Does not touch FaceTime call-answering. That needs manual macOS
 #     permission grants (Accessibility, Screen Recording) and an audio
-#     driver (BlackHole) that can't be silently installed -- see
-#     mac/SETUP_FACETIME_CALLS.md if you want that later. Texting works
-#     fully without it.
+#     driver (BlackHole) that can't be silently installed -- run
+#     setup-facetime.command (in this same folder) separately if you
+#     want that, after this script finishes. Texting works fully
+#     without it.
 #   - Does not install com.curant.server.plist. That's the developer's own
 #     local billing/license dashboard, not something a tester's Mac needs.
 #   - Does not require a real license key. Curant's hosted license server

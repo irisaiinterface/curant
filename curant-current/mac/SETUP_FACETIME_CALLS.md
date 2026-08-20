@@ -1,5 +1,21 @@
 # Setting up FaceTime auto-answer calls (EXPERIMENTAL)
 
+**Most testers should run `setup-facetime.command`** (in the folder above
+this one, next to `install.command`) instead of following this by hand --
+it automates steps 1-3 and 7 below, generates a correct per-user
+`com.curant.facetime.plist` (the copy checked into this `mac/` folder is
+hardcoded to the original developer's username and Apple Silicon path --
+copying it as-is to another Mac will silently fail to run), and defaults
+to the safer `approved` access mode described in step 7 below (this
+document previously said `approved` mode refuses every call outright --
+that was true when this was first written, but OCR-based caller-ID
+verification was added since, and `approved` now works and is the
+recommended default; `open` mode, which answers literally anyone, should
+only be used if OCR verification isn't available). Come back to this
+document for anything the script can't do for you -- granting
+permissions, creating the Multi-Output audio device, live troubleshooting,
+and the full technical background.
+
 This feature is fundamentally different from everything else in Curant. Text-in/text-back (`curant-watcher.py`) is built on documented, verifiable APIs — a readable SQLite database and AppleScript's Messages support. FaceTime has none of that. Live testing on the real Mac this was built for found:
 
 - FaceTime.app never actually runs for an incoming call — it's handled by background daemons plus a system call banner.
