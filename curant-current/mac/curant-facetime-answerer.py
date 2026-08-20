@@ -158,7 +158,15 @@ def _ts():
 CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
-TURN_RECORD_SECONDS = 3          # length of each caller-audio recording chunk -- LOWERED from 5
+TURN_RECORD_SECONDS = 2          # length of each caller-audio recording chunk -- LOWERED from 5,
+                                  # then to 2 (from 3) per explicit request to cut latency further.
+                                  # This is a fixed-window chunk boundary, not real VAD endpointing --
+                                  # the dominant cost in a turn is still transcription + reply-generation
+                                  # API round trips (observed 2-20s each live, highly variable — that's
+                                  # model/API latency, not something this constant controls), so this
+                                  # only shaves the fixed floor before a chunk is even sent off, and a
+                                  # shorter window risks splitting a slow talker's sentence across two
+                                  # chunks more often than at 3s.
 # (2026-08-08, latency pass): this is the single biggest structural
 # latency source in the whole call loop -- turns are fixed-length
 # windows, not silence-triggered, so the caller waits up to this many
@@ -1150,6 +1158,23 @@ def set_system_input_device(device_name):
         return False
 
 
+def _get_current_device(device_type):
+    """Read-only counterpart to set_system_{input,output}_device() --
+    returns the current default device name for device_type ('input' or
+    'output'), or None on failure. Used to remember what the Mac's
+    devices were BEFORE Curant ever touched them, so they can be
+    restored after a call ends rather than guessing at a hardcoded
+    'MacBook speakers' name that might not match every Mac."""
+    try:
+        r = subprocess.run(["SwitchAudioSource", "-t", device_type, "-c"],
+                            capture_output=True, text=True, timeout=10)
+        name = (r.stdout or "").strip()
+        return name or None
+    except Exception as e:
+        print(f"Could not read current system {device_type} device: {e}", file=sys.stderr)
+        return None
+
+
 TTS_VOICE = "Alex"  # explicit `say` voice -- see speak()'s docstring for why this is required, not optional
 
 _SOX_AVAILABLE = None  # cached shutil.which("sox") result
@@ -2023,6 +2048,15 @@ class _InterruptWatcher:
         return self.next_check_index + (1 if self.found else 0)
 
 
+# Set once in main(), before Curant ever touches system audio -- what
+# to restore to after each call (see handle_call()'s own finally block).
+# Module-level (not local to main()) since handle_call() needs to read
+# it too and this file's functions aren't otherwise wired for passing
+# extra state through poll_for_incoming_call() -> handle_call().
+_ORIGINAL_INPUT_DEVICE = None
+_ORIGINAL_OUTPUT_DEVICE = None
+
+
 def handle_call(window_desc, apple_id, dry_run):
     print(f"[{_ts()}] Incoming call detected: {window_desc!r}")
     cfg = _load_config()
@@ -2035,250 +2069,277 @@ def handle_call(window_desc, apple_id, dry_run):
         print("  [dry-run] would click Accept now. Stopping here.")
         return
 
-    # System input/output are set ONCE at startup, in main(), and never
-    # touched again for the rest of this process's life — NOT per-call,
-    # NOT per-turn. Two real bugs found live got us here, in order:
-    #   1. Switching input AFTER accept_call() dropped every call at a
-    #      fixed ~4 seconds in (FaceTime locks its mic in at connect
-    #      time; changing it after looks like the mic vanished).
-    #   2. Even after fixing #1 (input set before accept), switching
-    #      OUTPUT per-turn (to CALLER_AUDIO_DEVICE for listening, back
-    #      to TTS_OUTPUT_DEVICE for speaking) ALSO dropped the call —
-    #      same class of problem, just for the other direction and
-    #      later in the flow.
-    # Fix: output now stays fixed at CALLER_AUDIO_DEVICE (BlackHole
-    # 16ch) for the ENTIRE time this script runs, same as input at
-    # TTS_OUTPUT_DEVICE (BlackHole 2ch) — see main(). Nothing left to
-    # hot-swap mid-call, in either direction. speak() plays Curant's own
-    # voice into BlackHole 2ch directly via SoX (device-targeted,
-    # bypassing the system default entirely) instead of relying on
-    # system output ever pointing there — see speak()'s docstring.
+    # CHANGED per explicit request (2026-08-20): switch audio devices to
+    # BlackHole right here, at accept time, and back to whatever this
+    # Mac's own defaults were once the call is confirmed over -- instead
+    # of holding BlackHole permanently for the whole life of the process
+    # (see main(), which used to do this at startup and never touch it
+    # again).
+    #
+    # REAL, EXPLICITLY-ACKNOWLEDGED RISK, not hidden: this is the same
+    # general shape as an approach already tried and found broken --
+    # switching per-call, even before accept_call(), previously produced
+    # calls where the caller heard nothing at all, because FaceTime
+    # appears to negotiate its audio session the moment a call starts
+    # RINGING, before this script's poll loop (and thus this switch) can
+    # possibly react. That finding was NOT re-verified on this specific
+    # macOS version before this change -- it's being tried again, live,
+    # per explicit direction, not because the earlier finding was proven
+    # wrong. If calls go silent again after this, that's the same bug
+    # resurfacing, not a new one, and the fix is reverting to the
+    # startup-only switch main() used to do.
+    #
+    # Devices are switched to BlackHole as the very last thing before
+    # accept_call() (as close to "the second it picks up" as this
+    # script's own control flow allows -- there's no earlier point
+    # where Curant itself decides to answer), and back to
+    # _ORIGINAL_INPUT_DEVICE/_ORIGINAL_OUTPUT_DEVICE (captured once in
+    # main(), before Curant ever touched anything) in this function's
+    # own finally block below, once the call is confirmed over.
+    if not set_system_input_device(TTS_OUTPUT_DEVICE):
+        print("  System input device switch failed right before accepting -- "
+              "the caller will likely hear nothing.", file=sys.stderr)
+    if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
+        print("  System output device switch failed right before accepting -- "
+              "recording the caller's voice will likely fail.", file=sys.stderr)
 
-    ok, detail = accept_call()
-    if not ok:
-        print(f"  [{_ts()}] Failed to accept call: {detail}", file=sys.stderr)
-        return
-    print(f"  [{_ts()}] Accepted: {detail}")
-
-    speak("Hi, this is Curant. I'm listening.")
-    print(f"  [{_ts()}] Greeting playback finished.")
-
-    # Fast, direct hangup detection (see _watch_for_call_end()'s docstring
-    # for why this is a separate throttled thread, not an inline check).
-    # call_ended_event is threaded through to _wait_for_next_turn_segment()
-    # below and checked at the top of the main loop, and is always set in
-    # this function's own finally block so the watcher thread exits with
-    # the call regardless of which path out of this function is taken.
-    call_ended_event = threading.Event()
-    call_end_watcher = threading.Thread(
-        target=_watch_for_call_end, args=(call_ended_event,), daemon=True
-    )
-    call_end_watcher.start()
-
-    # CURANT NEVER ENDS THE CALL — only the human can, by hanging up on
-    # their own end. Per explicit direction. Two things changed to make
-    # that true, not just claimed:
-    #   1. No more keyword-triggered hangup. The old code broke out of
-    #      the loop (and then called hang_up()) the moment the caller's
-    #      transcribed speech contained "bye"/"goodbye"/"hang up"/"that's
-    #      all" — but a misheard or hallucinated word (see _wav_has_speech
-    #      and the silence-gate history above) could trigger that
-    #      wrongly, and even a correct transcript is still Curant
-    #      deciding to end a call a human didn't actually ask it to end.
-    #      Gone entirely — nothing the caller says can end the call now.
-    #   2. No more MAX_CALL_TURNS hangup. The old loop ran for a bounded
-    #      number of turns and then called hang_up() unconditionally when
-    #      it ran out — that's still Curant ending the call, just on a
-    #      timer instead of a keyword. Loop is unbounded now (while True)
-    #      — the ONLY way this function returns is detecting the human
-    #      has already ended the call themselves (see below), never by
-    #      actively hanging up itself. hang_up() (still defined above)
-    #      is intentionally never called from anywhere in this file
-    #      anymore — kept only in case a future, explicit, human-
-    #      initiated hangup control is added.
-    # Caller audio is now captured by ONE persistent ffmpeg process for
-    # the entire call, split into rolling per-turn segments by ffmpeg's
-    # own segment muxer -- NOT one fresh ffmpeg invocation per turn (the
-    # old record_caller_audio() approach). Real suspicion behind this
-    # change: live testing showed a call still dropping at an
-    # unpredictable point despite every previously-fixed device-timing
-    # bug being genuinely fixed, and repeatedly opening/closing a capture
-    # session on the SAME device FaceTime is actively rendering into,
-    # mid-call, is the same class of problem per-turn device SWITCHING
-    # already turned out to be. See _start_continuous_capture()'s
-    # docstring for the full reasoning.
-    capture_process = None
-    segment_dir = None
     try:
-        capture_process, segment_dir, pattern = _start_continuous_capture(TURN_RECORD_SECONDS)
-        print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
+        ok, detail = accept_call()
+        if not ok:
+            print(f"  [{_ts()}] Failed to accept call: {detail}", file=sys.stderr)
+            return
+        print(f"  [{_ts()}] Accepted: {detail}")
 
-        turn_index = 0
-        # pending_wav, when set, is caller audio that's ALREADY been
-        # captured and confirmed to have speech on it -- specifically,
-        # the segment that triggered an _InterruptWatcher barge-in
-        # during the previous reply's playback. When set, the top of
-        # the loop processes it immediately instead of calling
-        # _wait_for_next_turn_segment() again (which would otherwise
-        # just re-wait for a segment we already have in hand).
-        pending_wav = None
-        # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring above --
-        # counts consecutive turns with true (not just below-speech-
-        # threshold) silence. Reset to 0 by ANY real signal (speech, or
-        # even just nonzero ambient room noise); once it reaches the
-        # limit, this function returns so main()'s outer loop can go
-        # back to polling for a genuinely new incoming call instead of
-        # staying stuck babysitting a call that's already over.
-        consecutive_true_silent_turns = 0
-        while True:
-            # REMOVED per explicit direction: no more _call_is_still_
-            # connected() check here at all -- not once per turn, not
-            # ever, during the live-call loop. A call still dropped on
-            # its own even after cutting this down to once per turn (see
-            # _wait_for_next_turn_segment's docstring for that earlier
-            # step), and every remaining osascript invocation is a
-            # remaining suspect for whatever's triggering FaceTime's own
-            # auto-disconnect behavior. Real, accepted tradeoff: this
-            # loop can no longer detect a real hangup at all and will
-            # keep running (recording, transcribing on real speech,
-            # replying) into a dead call until the process is killed
-            # manually -- deliberately preferred over any chance of an
-            # AppleScript check itself contributing to a drop. Curant
-            # still never hangs up itself either way.
+        speak("Hi, this is Curant. I'm listening.")
+        print(f"  [{_ts()}] Greeting playback finished.")
 
-            if call_ended_event.is_set():
-                print(f"  [{_ts()}] Call end detected (OCR banner match) -- "
-                      f"returning to listen for a new incoming call.")
-                return
+        # Fast, direct hangup detection (see _watch_for_call_end()'s docstring
+        # for why this is a separate throttled thread, not an inline check).
+        # call_ended_event is threaded through to _wait_for_next_turn_segment()
+        # below and checked at the top of the main loop, and is always set in
+        # this function's own finally block so the watcher thread exits with
+        # the call regardless of which path out of this function is taken.
+        call_ended_event = threading.Event()
+        call_end_watcher = threading.Thread(
+            target=_watch_for_call_end, args=(call_ended_event,), daemon=True
+        )
+        call_end_watcher.start()
 
-            if pending_wav is not None:
-                raw_wav_path, wav_path = pending_wav
-                pending_wav = None
-                print(f"  [{_ts()}] Processing caller audio that interrupted the last reply: "
-                      f"{os.path.basename(raw_wav_path)}")
-            else:
-                raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index, stop_event=call_ended_event)
+        # CURANT NEVER ENDS THE CALL — only the human can, by hanging up on
+        # their own end. Per explicit direction. Two things changed to make
+        # that true, not just claimed:
+        #   1. No more keyword-triggered hangup. The old code broke out of
+        #      the loop (and then called hang_up()) the moment the caller's
+        #      transcribed speech contained "bye"/"goodbye"/"hang up"/"that's
+        #      all" — but a misheard or hallucinated word (see _wav_has_speech
+        #      and the silence-gate history above) could trigger that
+        #      wrongly, and even a correct transcript is still Curant
+        #      deciding to end a call a human didn't actually ask it to end.
+        #      Gone entirely — nothing the caller says can end the call now.
+        #   2. No more MAX_CALL_TURNS hangup. The old loop ran for a bounded
+        #      number of turns and then called hang_up() unconditionally when
+        #      it ran out — that's still Curant ending the call, just on a
+        #      timer instead of a keyword. Loop is unbounded now (while True)
+        #      — the ONLY way this function returns is detecting the human
+        #      has already ended the call themselves (see below), never by
+        #      actively hanging up itself. hang_up() (still defined above)
+        #      is intentionally never called from anywhere in this file
+        #      anymore — kept only in case a future, explicit, human-
+        #      initiated hangup control is added.
+        # Caller audio is now captured by ONE persistent ffmpeg process for
+        # the entire call, split into rolling per-turn segments by ffmpeg's
+        # own segment muxer -- NOT one fresh ffmpeg invocation per turn (the
+        # old record_caller_audio() approach). Real suspicion behind this
+        # change: live testing showed a call still dropping at an
+        # unpredictable point despite every previously-fixed device-timing
+        # bug being genuinely fixed, and repeatedly opening/closing a capture
+        # session on the SAME device FaceTime is actively rendering into,
+        # mid-call, is the same class of problem per-turn device SWITCHING
+        # already turned out to be. See _start_continuous_capture()'s
+        # docstring for the full reasoning.
+        capture_process = None
+        segment_dir = None
+        try:
+            capture_process, segment_dir, pattern = _start_continuous_capture(TURN_RECORD_SECONDS)
+            print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
+
+            turn_index = 0
+            # pending_wav, when set, is caller audio that's ALREADY been
+            # captured and confirmed to have speech on it -- specifically,
+            # the segment that triggered an _InterruptWatcher barge-in
+            # during the previous reply's playback. When set, the top of
+            # the loop processes it immediately instead of calling
+            # _wait_for_next_turn_segment() again (which would otherwise
+            # just re-wait for a segment we already have in hand).
+            pending_wav = None
+            # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring above --
+            # counts consecutive turns with true (not just below-speech-
+            # threshold) silence. Reset to 0 by ANY real signal (speech, or
+            # even just nonzero ambient room noise); once it reaches the
+            # limit, this function returns so main()'s outer loop can go
+            # back to polling for a genuinely new incoming call instead of
+            # staying stuck babysitting a call that's already over.
+            consecutive_true_silent_turns = 0
+            while True:
+                # REMOVED per explicit direction: no more _call_is_still_
+                # connected() check here at all -- not once per turn, not
+                # ever, during the live-call loop. A call still dropped on
+                # its own even after cutting this down to once per turn (see
+                # _wait_for_next_turn_segment's docstring for that earlier
+                # step), and every remaining osascript invocation is a
+                # remaining suspect for whatever's triggering FaceTime's own
+                # auto-disconnect behavior. Real, accepted tradeoff: this
+                # loop can no longer detect a real hangup at all and will
+                # keep running (recording, transcribing on real speech,
+                # replying) into a dead call until the process is killed
+                # manually -- deliberately preferred over any chance of an
+                # AppleScript check itself contributing to a drop. Curant
+                # still never hangs up itself either way.
+
                 if call_ended_event.is_set():
                     print(f"  [{_ts()}] Call end detected (OCR banner match) -- "
                           f"returning to listen for a new incoming call.")
                     return
-                if raw_wav_path is None:
-                    # This specific segment timed out or never got written
-                    # (e.g. the capture process died, which itself often
-                    # means the call ended and the audio device vanished)
-                    # -- counts toward the same hangup counter as true
-                    # silence, since it's the same underlying signal: no
-                    # real audio coming through anymore.
-                    consecutive_true_silent_turns += 1
-                    if consecutive_true_silent_turns >= HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS:
-                        print(f"  [{_ts()}] Assuming the call has ended -- "
-                              f"{consecutive_true_silent_turns} consecutive turns with no real audio "
-                              f"(segments timing out / true silence). Returning to listen for a new call.")
+
+                if pending_wav is not None:
+                    raw_wav_path, wav_path = pending_wav
+                    pending_wav = None
+                    print(f"  [{_ts()}] Processing caller audio that interrupted the last reply: "
+                          f"{os.path.basename(raw_wav_path)}")
+                else:
+                    raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index, stop_event=call_ended_event)
+                    if call_ended_event.is_set():
+                        print(f"  [{_ts()}] Call end detected (OCR banner match) -- "
+                              f"returning to listen for a new incoming call.")
                         return
-                    time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
-                    turn_index += 1  # don't get stuck waiting on the same missing segment forever
-                    continue
-                turn_index += 1
-                print(f"  [{_ts()}] Turn segment ready: {os.path.basename(raw_wav_path)}")
-
-                try:
-                    wav_path = _extract_loudest_channel_mono(raw_wav_path)
-                except Exception as e:
-                    print(f"  [{_ts()}] Could not extract a channel from {raw_wav_path} ({e}) -- "
-                          f"using it as-is.", file=sys.stderr)
-                    wav_path = raw_wav_path
-
-            # DEBUG AID: if CURANT_FACETIME_DEBUG_KEEP_AUDIO is set, copy
-            # every turn's segment to that directory instead of just
-            # deleting it after the silence check -- added live after
-            # every turn of a real call kept reading "silent" and there
-            # was no way to actually listen to what was captured to tell
-            # whether that was really true. Off by default (adds disk
-            # I/O and leaves files behind) -- only meant to be turned on
-            # for a single diagnostic test call. Copies BOTH the raw
-            # 16-channel capture and the extracted mono channel so a
-            # bad extraction can be told apart from genuinely no signal
-            # anywhere in the raw capture.
-            debug_keep_dir = os.environ.get("CURANT_FACETIME_DEBUG_KEEP_AUDIO")
-            if debug_keep_dir:
-                try:
-                    os.makedirs(debug_keep_dir, exist_ok=True)
-                    import shutil as _shutil
-                    _shutil.copy2(raw_wav_path, os.path.join(debug_keep_dir, os.path.basename(raw_wav_path)))
-                    if wav_path != raw_wav_path:
-                        _shutil.copy2(wav_path, os.path.join(debug_keep_dir, os.path.basename(wav_path)))
-                except Exception as e:
-                    print(f"  [{_ts()}] Could not copy debug audio: {e}", file=sys.stderr)
-
-            try:
-                has_speech, rms = _wav_has_speech(wav_path)
-                # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring --
-                # rms is None only when the file couldn't be read at all
-                # (inconclusive, don't touch the counter either way).
-                # Real nonzero ambient noise (a connected-but-quiet call)
-                # resets it; sustained true-zero RMS builds toward
-                # assuming the call has actually ended.
-                if rms is not None:
-                    if rms <= TRUE_SILENCE_RMS_THRESHOLD:
+                    if raw_wav_path is None:
+                        # This specific segment timed out or never got written
+                        # (e.g. the capture process died, which itself often
+                        # means the call ended and the audio device vanished)
+                        # -- counts toward the same hangup counter as true
+                        # silence, since it's the same underlying signal: no
+                        # real audio coming through anymore.
                         consecutive_true_silent_turns += 1
                         if consecutive_true_silent_turns >= HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS:
                             print(f"  [{_ts()}] Assuming the call has ended -- "
-                                  f"{consecutive_true_silent_turns} consecutive turns of true digital "
-                                  f"silence (RMS <= {TRUE_SILENCE_RMS_THRESHOLD}), no real audio source "
-                                  f"detected. Returning to listen for a new incoming call.")
+                                  f"{consecutive_true_silent_turns} consecutive turns with no real audio "
+                                  f"(segments timing out / true silence). Returning to listen for a new call.")
                             return
+                        time.sleep(RECORDING_FAILURE_RETRY_SECONDS)
+                        turn_index += 1  # don't get stuck waiting on the same missing segment forever
+                        continue
+                    turn_index += 1
+                    print(f"  [{_ts()}] Turn segment ready: {os.path.basename(raw_wav_path)}")
+
+                    try:
+                        wav_path = _extract_loudest_channel_mono(raw_wav_path)
+                    except Exception as e:
+                        print(f"  [{_ts()}] Could not extract a channel from {raw_wav_path} ({e}) -- "
+                              f"using it as-is.", file=sys.stderr)
+                        wav_path = raw_wav_path
+
+                # DEBUG AID: if CURANT_FACETIME_DEBUG_KEEP_AUDIO is set, copy
+                # every turn's segment to that directory instead of just
+                # deleting it after the silence check -- added live after
+                # every turn of a real call kept reading "silent" and there
+                # was no way to actually listen to what was captured to tell
+                # whether that was really true. Off by default (adds disk
+                # I/O and leaves files behind) -- only meant to be turned on
+                # for a single diagnostic test call. Copies BOTH the raw
+                # 16-channel capture and the extracted mono channel so a
+                # bad extraction can be told apart from genuinely no signal
+                # anywhere in the raw capture.
+                debug_keep_dir = os.environ.get("CURANT_FACETIME_DEBUG_KEEP_AUDIO")
+                if debug_keep_dir:
+                    try:
+                        os.makedirs(debug_keep_dir, exist_ok=True)
+                        import shutil as _shutil
+                        _shutil.copy2(raw_wav_path, os.path.join(debug_keep_dir, os.path.basename(raw_wav_path)))
+                        if wav_path != raw_wav_path:
+                            _shutil.copy2(wav_path, os.path.join(debug_keep_dir, os.path.basename(wav_path)))
+                    except Exception as e:
+                        print(f"  [{_ts()}] Could not copy debug audio: {e}", file=sys.stderr)
+
+                try:
+                    has_speech, rms = _wav_has_speech(wav_path)
+                    # See HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS's docstring --
+                    # rms is None only when the file couldn't be read at all
+                    # (inconclusive, don't touch the counter either way).
+                    # Real nonzero ambient noise (a connected-but-quiet call)
+                    # resets it; sustained true-zero RMS builds toward
+                    # assuming the call has actually ended.
+                    if rms is not None:
+                        if rms <= TRUE_SILENCE_RMS_THRESHOLD:
+                            consecutive_true_silent_turns += 1
+                            if consecutive_true_silent_turns >= HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS:
+                                print(f"  [{_ts()}] Assuming the call has ended -- "
+                                      f"{consecutive_true_silent_turns} consecutive turns of true digital "
+                                      f"silence (RMS <= {TRUE_SILENCE_RMS_THRESHOLD}), no real audio source "
+                                      f"detected. Returning to listen for a new incoming call.")
+                                return
+                        else:
+                            consecutive_true_silent_turns = 0
+                    if not has_speech:
+                        print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
+                        continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
+                    # TIMED (2026-08-08, added per explicit request to make
+                    # transcription/response faster): rather than guess at
+                    # what's slow, measure the two real API round trips
+                    # directly so the NEXT live test shows exactly where
+                    # the time is going instead of another round of
+                    # speculation. See get_reply() below for the matching
+                    # timer on the reply side.
+                    _transcribe_start = time.monotonic()
+                    text = transcribe(wav_path, cfg)
+                    _transcribe_elapsed = time.monotonic() - _transcribe_start
+                finally:
+                    if os.path.exists(raw_wav_path):
+                        os.remove(raw_wav_path)
+                    if wav_path != raw_wav_path and os.path.exists(wav_path):
+                        os.remove(wav_path)
+                if not text:
+                    continue  # likely silence in this window — just listen again
+                print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
+                _reply_start = time.monotonic()
+                try:
+                    reply = get_reply(text, apple_id)
+                except Exception as e:
+                    print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
+                    reply = "Sorry, I ran into a problem there — could you say that again?"
+                _reply_elapsed = time.monotonic() - _reply_start
+                if reply:
+                    print(f"  [{_ts()}] Curant says: {reply} (reply generation took {_reply_elapsed:.2f}s)")
+                    # Barge-in: watch for the caller starting to talk WHILE
+                    # this reply is still playing (see _InterruptWatcher's
+                    # docstring) and cut playback short if they do, instead
+                    # of making them wait out a reply they've already
+                    # started talking over.
+                    watcher = _InterruptWatcher(pattern, turn_index)
+                    interrupted = speak(reply, interrupt_check=watcher.check)
+                    turn_index = watcher.resume_index()
+                    if interrupted and watcher.found:
+                        print(f"  [{_ts()}] Reply playback interrupted by caller.")
+                        pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
                     else:
-                        consecutive_true_silent_turns = 0
-                if not has_speech:
-                    print(f"  [{_ts()}] Clip looked silent -- skipping transcription this turn.")
-                    continue  # near-silent clip — skip the API call, don't risk a hallucinated transcript
-                # TIMED (2026-08-08, added per explicit request to make
-                # transcription/response faster): rather than guess at
-                # what's slow, measure the two real API round trips
-                # directly so the NEXT live test shows exactly where
-                # the time is going instead of another round of
-                # speculation. See get_reply() below for the matching
-                # timer on the reply side.
-                _transcribe_start = time.monotonic()
-                text = transcribe(wav_path, cfg)
-                _transcribe_elapsed = time.monotonic() - _transcribe_start
-            finally:
-                if os.path.exists(raw_wav_path):
-                    os.remove(raw_wav_path)
-                if wav_path != raw_wav_path and os.path.exists(wav_path):
-                    os.remove(wav_path)
-            if not text:
-                continue  # likely silence in this window — just listen again
-            print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
-            _reply_start = time.monotonic()
-            try:
-                reply = get_reply(text, apple_id)
-            except Exception as e:
-                print(f"  [{_ts()}] Reply failed: {e}", file=sys.stderr)
-                reply = "Sorry, I ran into a problem there — could you say that again?"
-            _reply_elapsed = time.monotonic() - _reply_start
-            if reply:
-                print(f"  [{_ts()}] Curant says: {reply} (reply generation took {_reply_elapsed:.2f}s)")
-                # Barge-in: watch for the caller starting to talk WHILE
-                # this reply is still playing (see _InterruptWatcher's
-                # docstring) and cut playback short if they do, instead
-                # of making them wait out a reply they've already
-                # started talking over.
-                watcher = _InterruptWatcher(pattern, turn_index)
-                interrupted = speak(reply, interrupt_check=watcher.check)
-                turn_index = watcher.resume_index()
-                if interrupted and watcher.found:
-                    print(f"  [{_ts()}] Reply playback interrupted by caller.")
-                    pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
-                else:
-                    print(f"  [{_ts()}] Reply playback finished.")
+                        print(f"  [{_ts()}] Reply playback finished.")
+        finally:
+            call_ended_event.set()  # stop the watcher thread regardless of how this function returns
+            if capture_process is not None:
+                _stop_continuous_capture(capture_process)
+            if segment_dir is not None:
+                import shutil
+                shutil.rmtree(segment_dir, ignore_errors=True)
     finally:
-        call_ended_event.set()  # stop the watcher thread regardless of how this function returns
-        if capture_process is not None:
-            _stop_continuous_capture(capture_process)
-        if segment_dir is not None:
-            import shutil
-            shutil.rmtree(segment_dir, ignore_errors=True)
+        # Switch back to whatever this Mac's devices were before Curant
+        # ever touched them (captured once in main(), never guessed at) --
+        # runs no matter which path this function returns/raises through,
+        # including accept_call() itself failing, so a failed accept never
+        # leaves the Mac stuck on BlackHole with no call to show for it.
+        if _ORIGINAL_INPUT_DEVICE:
+            set_system_input_device(_ORIGINAL_INPUT_DEVICE)
+        if _ORIGINAL_OUTPUT_DEVICE:
+            set_system_output_device(_ORIGINAL_OUTPUT_DEVICE)
+        print(f"  [{_ts()}] Restored system audio devices (input: {_ORIGINAL_INPUT_DEVICE}, output: {_ORIGINAL_OUTPUT_DEVICE}).")
 
 
 def main():
@@ -2306,57 +2367,39 @@ def main():
     print(f"  apple_id for replies: {apple_id}")
     print(f"  call access mode: {_read_call_access_mode(cfg)}")
 
+    global _ORIGINAL_INPUT_DEVICE, _ORIGINAL_OUTPUT_DEVICE
+
     if not args.dry_run:
         _preflight_check_apis(cfg)
 
-        # Set BlackHole as the SYSTEM default input/output BEFORE the poll
-        # loop even starts, and NEVER touch either again for the rest of
-        # this process's life — not per-call, not per-turn. Two real bugs
-        # found live, in order, got us here:
-        #   1. Switching devices per-call, even before accept_call(),
-        #      wasn't early enough — the caller heard nothing, despite
-        #      `SwitchAudioSource -c` confirming correct devices by
-        #      accept time. FaceTime most likely negotiates its audio
-        #      session the moment a call starts RINGING, before this
-        #      script's poll loop even reacts. Moving the switch to
-        #      startup closes that timing window entirely.
-        #   2. Per-turn OUTPUT switching (input was already fixed, but
-        #      output still flipped between TTS_OUTPUT_DEVICE and
-        #      CALLER_AUDIO_DEVICE each turn) dropped every call anyway —
-        #      turns out hot-swapping output mid-call is just as
-        #      disruptive to FaceTime as hot-swapping input was. So
-        #      output is now ALSO fixed here, permanently, at
-        #      CALLER_AUDIO_DEVICE (not TTS_OUTPUT_DEVICE) — Curant's own
-        #      speech instead goes directly to TTS_OUTPUT_DEVICE via SoX
-        #      in speak(), bypassing the system default output so it
-        #      never needs to change.
+        # CHANGED per explicit request (2026-08-20): audio devices are no
+        # longer switched to BlackHole here at startup and held for the
+        # process's whole life -- see handle_call(), which now switches
+        # at accept time and reverts once a call is confirmed over. This
+        # is a deliberate re-test of an approach already found broken
+        # once before (see handle_call()'s own docstring for the full
+        # risk disclosure) -- not a settled-safe design.
         #
-        # REAL TRADEOFF, not hidden: while this script is running, this
-        # Mac's system microphone input is BlackHole 2ch and its output
-        # is BlackHole 16ch — both silent/dead as far as anything else on
-        # this Mac (Zoom, Voice Memos, actually hearing your own speakers)
-        # is concerned, until you stop the script. Acceptable for a
-        # dedicated always-on answering Mac; worth knowing if this Mac is
-        # also used for other calls or everyday audio.
-        print("  Setting system audio devices at startup — input: "
-              f"{TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}. Both stay "
-              "fixed for as long as this process runs (see comment above).")
+        # What THIS still does: reads and remembers whatever this Mac's
+        # actual default input/output devices are RIGHT NOW, before
+        # Curant ever touches anything, so handle_call() can restore the
+        # real originals after each call instead of guessing a hardcoded
+        # device name that might not match every Mac.
+        _ORIGINAL_INPUT_DEVICE = _get_current_device("input")
+        _ORIGINAL_OUTPUT_DEVICE = _get_current_device("output")
+        print(f"  Current system audio devices (will be restored after each call) — "
+              f"input: {_ORIGINAL_INPUT_DEVICE}, output: {_ORIGINAL_OUTPUT_DEVICE}")
+        if not _ORIGINAL_INPUT_DEVICE or not _ORIGINAL_OUTPUT_DEVICE:
+            print("  WARNING: couldn't read current device name(s) -- devices won't be "
+                  "restored after a call ends (nothing to revert to). Calls will still be "
+                  "answered, but your Mac may stay on BlackHole after the first one until "
+                  "you switch back by hand in System Settings > Sound.", file=sys.stderr)
         if SYSTEM_OUTPUT_DEVICE == CALLER_AUDIO_DEVICE:
             print(f"  NOTE: system output is bare '{CALLER_AUDIO_DEVICE}', not a Multi-Output "
                   f"Device — confirmed live this produces total digital silence for FaceTime call "
                   f"audio (RMS=0.0 across all 16 channels during a real connected call). Set "
                   f"CURANT_FACETIME_SYSTEM_OUTPUT_DEVICE to a Multi-Output Device name (Audio MIDI "
                   f"Setup) that includes {CALLER_AUDIO_DEVICE!r} before expecting hearing to work.",
-                  file=sys.stderr)
-        if not set_system_input_device(TTS_OUTPUT_DEVICE):
-            print("  System input device switch failed at startup — calls "
-                  "will likely answer but the caller won't hear anything "
-                  "until this is fixed. See SETUP_FACETIME_CALLS.md.",
-                  file=sys.stderr)
-        if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
-            print("  System output device switch failed at startup — "
-                  "recording the caller's voice likely won't work until "
-                  "this is fixed. See SETUP_FACETIME_CALLS.md.",
                   file=sys.stderr)
 
     while True:
