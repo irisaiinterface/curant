@@ -10288,9 +10288,11 @@ def _version_is_newer(remote_version, local_version):
     return isinstance(remote_version, str) and remote_version > local_version
 
 
-def _schedule_watcher_restart(gui_domain, plist_path, delay_seconds=2):
-    """Kicks off the watcher restart in a fully DETACHED background
-    process instead of doing bootout/bootstrap synchronously in-process.
+def _schedule_service_restart(gui_domain, label, plist_path, delay_seconds=2):
+    """Kicks off a launchd service restart (bootout + bootstrap) in a
+    fully DETACHED background process instead of doing it synchronously
+    in-process. Generalized from the original watcher-only version --
+    see below for why, and why the detach matters for EITHER service.
 
     REAL BUG FOUND LIVE (2026-08-20), the reason this replaced the
     previous synchronous _restart_watcher_verified: when an update is
@@ -10307,11 +10309,14 @@ def _schedule_watcher_restart(gui_domain, plist_path, delay_seconds=2):
     crash loop that eventually exhausts launchd's respawn throttling
     entirely, leaving the customer with no watcher running at all and no
     visible error (confirmed live: rowid 3353 reprocessed repeatedly in
-    /tmp/curant-watcher.log, then nothing).
+    /tmp/curant-watcher.log, then nothing). The facetime service isn't
+    itself the caller of an update, but it's restarted from the same
+    detached script for consistency and so one slow/hung bootout can't
+    block the other service's restart.
 
     Fix: detach the actual bootout/bootstrap into an independent process
-    (start_new_session=True, no inherited stdio) that isn't part of the
-    watcher's process tree -- a `launchctl bootout` on the watcher can't
+    (start_new_session=True, no inherited stdio) that isn't part of
+    either service's process tree -- a `launchctl bootout` on one can't
     take this down with it. A short delay lets the calling process
     finish and return its own result FIRST. This is fire-and-forget by
     necessity: there's no way to synchronously confirm the restart
@@ -10319,22 +10324,22 @@ def _schedule_watcher_restart(gui_domain, plist_path, delay_seconds=2):
     exists to avoid -- see restart_log_path for where to check the
     actual outcome after the fact (a customer-facing message can only
     honestly say the restart was kicked off, not verified)."""
-    label = "app.curant.watcher"
     log_dir = os.path.expanduser("~/.curant/logs")
     os.makedirs(log_dir, exist_ok=True)
-    restart_log_path = os.path.join(log_dir, "last_watcher_restart.log")
+    safe_label = label.replace("/", "_")
+    restart_log_path = os.path.join(log_dir, f"last_{safe_label}_restart.log")
     script_lines = [
         f"sleep {delay_seconds}",
         "{",
-        f'  echo "$(date \'+%Y-%m-%d %H:%M:%S\'): restart requested"',
+        f'  echo "$(date \'+%Y-%m-%d %H:%M:%S\'): restart requested for {label}"',
         f'  launchctl bootout "{gui_domain}/{label}" 2>&1',
         "  sleep 1",
         f'  launchctl bootstrap "{gui_domain}" "{plist_path}" 2>&1',
         "  sleep 1.5",
         f'  if launchctl list | grep -q "{label}"; then',
-        f'    echo "$(date \'+%Y-%m-%d %H:%M:%S\'): watcher confirmed running"',
+        f'    echo "$(date \'+%Y-%m-%d %H:%M:%S\'): {label} confirmed running"',
         "  else",
-        f'    echo "$(date \'+%Y-%m-%d %H:%M:%S\'): watcher NOT running after restart attempt"',
+        f'    echo "$(date \'+%Y-%m-%d %H:%M:%S\'): {label} NOT running after restart attempt"',
         "  fi",
         f'}} >> "{restart_log_path}" 2>&1',
     ]
@@ -10345,6 +10350,44 @@ def _schedule_watcher_restart(gui_domain, plist_path, delay_seconds=2):
         start_new_session=True,
     )
     return restart_log_path
+
+
+def _schedule_watcher_restart(gui_domain, plist_path, delay_seconds=2):
+    """Thin back-compat wrapper -- see _schedule_service_restart, which this
+    now delegates to (kept as a separate name since callers/comments
+    elsewhere still refer to "the watcher restart" specifically)."""
+    return _schedule_service_restart(gui_domain, "app.curant.watcher", plist_path, delay_seconds=delay_seconds)
+
+
+def _schedule_facetime_restart_if_configured(gui_domain, delay_seconds=2):
+    """Restarts the FaceTime call-answering service too, if this Mac has
+    one set up (mac/SETUP_FACETIME_CALLS.md / setup-facetime.command).
+
+    Why this exists: auto_update_cmd/update_cmd only ever replace
+    curant-cli and curant-watcher.py on disk (see
+    _download_and_apply_update's docstring -- deliberately narrow
+    scope), and historically only restarted app.curant.watcher. The
+    FaceTime answerer (app.curant.facetime) runs as its own separate
+    launchd service and was never told to restart as part of an update
+    -- on a Mac where it had crashed, hung, or simply wasn't loaded yet
+    (setup-facetime.command prints the bootstrap command for the
+    customer to run by hand rather than loading it automatically), an
+    update to curant-cli/curant-watcher.py would silently leave calls
+    unanswered with no error visible anywhere, since nothing checked or
+    touched app.curant.facetime at all.
+
+    This does not modify any FaceTime-related files on disk (the update
+    package never contains curant-facetime-answerer.py -- see
+    _download_and_apply_update) -- it only makes sure the ALREADY
+    installed answerer, plist, and assets are actually loaded and
+    running after every update, same as the watcher. If the plist
+    doesn't exist (FaceTime was never set up on this Mac), this is a
+    silent no-op -- there's nothing to restart.
+    """
+    plist_path = os.path.expanduser("~/Library/LaunchAgents/com.curant.facetime.plist")
+    if not os.path.isfile(plist_path):
+        return None
+    return _schedule_service_restart(gui_domain, "app.curant.facetime", plist_path, delay_seconds=delay_seconds)
 
 
 def _download_and_apply_update(download_url):
@@ -10408,6 +10451,12 @@ def _download_and_apply_update(download_url):
         gui_domain = f"gui/{os.getuid()}"
         plist_path = os.path.expanduser("~/Library/LaunchAgents/com.curant.watcher.plist")
         _schedule_watcher_restart(gui_domain, plist_path)
+        # Also (re)start the FaceTime call-answering service, if this Mac
+        # has one set up -- see _schedule_facetime_restart_if_configured's
+        # docstring. Without this, an update could leave the watcher
+        # (texting) working while calls go silently unanswered, with
+        # nothing ever checking or restarting app.curant.facetime.
+        _schedule_facetime_restart_if_configured(gui_domain)
         return True, "applied"
     except Exception as e:
         return False, str(e)
