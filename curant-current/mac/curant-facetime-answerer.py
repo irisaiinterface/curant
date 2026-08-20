@@ -158,15 +158,19 @@ def _ts():
 CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
-TURN_RECORD_SECONDS = 2          # length of each caller-audio recording chunk -- LOWERED from 5,
-                                  # then to 2 (from 3) per explicit request to cut latency further.
-                                  # This is a fixed-window chunk boundary, not real VAD endpointing --
-                                  # the dominant cost in a turn is still transcription + reply-generation
-                                  # API round trips (observed 2-20s each live, highly variable — that's
-                                  # model/API latency, not something this constant controls), so this
-                                  # only shaves the fixed floor before a chunk is even sent off, and a
-                                  # shorter window risks splitting a slow talker's sentence across two
-                                  # chunks more often than at 3s.
+TURN_RECORD_SECONDS = 3          # length of each caller-audio recording chunk -- RAISED back from 2
+                                  # to 3 (2026-08-20), reverting the latency-pass drop to 2. Real bug
+                                  # found live the moment audio capture actually started working (the
+                                  # Multi-Output Device fix): a single spoken word ("hello") landed in
+                                  # one 2s segment with RMS well above the silence threshold -- genuine,
+                                  # audible speech -- and still came back with an empty transcript.
+                                  # This is a fixed-window chunk boundary, not real VAD endpointing, so
+                                  # a short utterance starting or ending close to either edge of a 2s
+                                  # window has very little margin left for Gemini to work with. 3s was
+                                  # the last confirmed-working value before the latency pass touched
+                                  # this; going back to it trades a bit of the fixed per-turn floor for
+                                  # actually hearing short utterances reliably, which matters more than
+                                  # shaving ~1s once every turn was silently failing to transcribe.
 # (2026-08-08, latency pass): this is the single biggest structural
 # latency source in the whole call loop -- turns are fixed-length
 # windows, not silence-triggered, so the caller waits up to this many
