@@ -376,6 +376,33 @@ echo "======================================================"
 echo ""
 "$BIN_DIR/curant-cli" setup
 
+# ---------------------------------------------------------------------------
+# 7b. Restart the watcher now that setup has written the real
+#     customer_apple_id/customer_handles to config.json.
+#
+#     Real bug found live: the watcher was bootstrapped back in step 6,
+#     with RunAtLoad, *before* this wizard ever ran -- so it read an
+#     empty customer_apple_id at process startup (curant-watcher.py only
+#     reads config once, at import time, into a module-level constant).
+#     Every install hits this, not just re-installs: the watcher comes
+#     up first, then the wizard writes the real identity afterward, and
+#     the already-running process never sees it. Without this restart,
+#     `curant-cli status` looks fine but the watcher silently refuses
+#     every incoming message ("No customer identity configured ...
+#     Refusing to run with no one to listen to.") until something else
+#     happens to bounce it (e.g. the first auto-update).
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> Restarting the watcher so it picks up what you just entered..."
+launchctl bootout "$GUI_DOMAIN/app.curant.watcher" >/dev/null 2>&1 || true
+launchctl bootstrap "$GUI_DOMAIN" "$LAUNCH_AGENTS/com.curant.watcher.plist"
+sleep 1
+if launchctl list | grep -q app.curant.watcher; then
+    echo "    Watcher restarted."
+else
+    echo "    WARNING: watcher didn't come back up -- run 'curant-cli status' to check." >&2
+fi
+
 echo ""
 echo "======================================================"
 echo " Done. Try texting the phone number/Apple ID you just"
