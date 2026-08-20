@@ -351,7 +351,31 @@ def poll_for_incoming_call(dry_run):
     (_find_accept_button_visually) must ALSO find the real green Accept
     button on screen right now. A Messages banner (or any other
     notification) will never match that template, regardless of
-    whatever FaceTime-adjacent processes happen to still be resident."""
+    whatever FaceTime-adjacent processes happen to still be resident.
+
+    REMOVED (real bug, confirmed live on a newer macOS release than
+    this was originally built against): the second gate used to also
+    require _facetime_call_daemon_active() (pgrep -f
+    "FTConversationService"). On this Mac, that process -- and every
+    other FaceTime-notification-adjacent process (FaceTimeNotification
+    Extension, FaceTimeNotificationViewBridgeService,
+    FaceTimeNotificationService, facetimemessagestored) -- is resident
+    in the background AT ALL TIMES, confirmed by comparing `ps aux`
+    output taken during a real ringing call against a quiet baseline
+    with no call at all: identical process list both times. So on this
+    macOS version the daemon check is permanently true regardless of
+    call state, which made it a no-op at best and, since it was a
+    required AND condition, a permanent hard block on ever detecting a
+    real call at worst -- every single poll returned None even with the
+    Accept button genuinely visible on screen. Dropped rather than
+    replaced with a guess at a "new correct" process name, since
+    everything observed resident here is equally unreliable as a
+    call-specific signal on this OS version. The visual Accept-button
+    match below is left as the sole discriminating signal beyond the
+    window check -- it's the one that's actually been confirmed to only
+    go true when a real call banner is on screen (see its own
+    docstring), so the false-positive protection this whole function
+    exists for is still intact without the daemon check."""
     r = _run_osascript(
         'tell application "System Events" to tell process "NotificationCenter" to get name of every window'
     )
@@ -360,11 +384,9 @@ def poll_for_incoming_call(dry_run):
     names = [n.strip() for n in (r.stdout or "").split(",")]
     if "Notification Center" not in names:
         return None
-    if not _facetime_call_daemon_active():
-        return None  # a banner is up, but not a FaceTime call specifically
     if not _accept_button_visible_now():
-        return None  # a banner is up and the daemon's resident, but no real Accept button on screen
-    return "FaceTime call banner active (NotificationCenter window + FaceTime daemon + visible Accept button)"
+        return None  # a banner is up, but no real Accept button on screen -- not a call
+    return "FaceTime call banner active (NotificationCenter window + visible Accept button)"
 
 
 def _accept_button_visible_now():
