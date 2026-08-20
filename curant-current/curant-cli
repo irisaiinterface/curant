@@ -10365,7 +10365,7 @@ def auto_update_cmd():
     print(json.dumps({"notify_text": text}))
 
 
-def match_open_question_cmd(incoming_text):
+def match_open_question_cmd(incoming_text, apple_id=None):
     """`curant-cli match-open-question "<text>"` -- called by
     curant-watcher.py's handle_message() on every incoming message,
     BEFORE relay_to_curant() (the normal LLM path). Prints a single JSON
@@ -10373,7 +10373,21 @@ def match_open_question_cmd(incoming_text):
     question resolved it deterministically (the caller should send
     `reply` directly and skip the LLM entirely for this turn), or
     {"matched": false} if nothing matched (caller proceeds exactly as
-    before -- this never blocks or delays normal conversation)."""
+    before -- this never blocks or delays normal conversation).
+
+    Real gap found live (2026-08-19): _notify_task_starting (the
+    immediate "On it, starting now" text a slow resolver like
+    apply_pending_update sends BEFORE the real work happens) reads a
+    global, _current_apple_id, that's normally only ever set inside
+    relay(). This command never calls relay() -- it's a separate
+    curant-cli invocation entirely -- so without this, that global stays
+    None and the "starting now" notice silently never sends for anything
+    resolved via this deterministic path. Setting it here from the
+    --apple-id argument (same convention as relay's own --apple-id) is
+    what makes it actually fire."""
+    global _current_apple_id
+    if apple_id:
+        _current_apple_id = apple_id
     init_local_db()  # defensive -- same pattern as every other command that
                       # touches local.db; matters on a genuinely fresh install
                       # where this could be the very first DB access
@@ -11749,6 +11763,9 @@ def main():
              "before the LLM sees it (see match_incoming_reply / open_questions table)",
     )
     p_match_open_question.add_argument("text", help="The customer's raw incoming message text")
+    p_match_open_question.add_argument("--apple-id", default=None, dest="apple_id",
+                          help="Who to send an immediate 'starting now' notice to if the matched "
+                               "resolver kicks off slow work (e.g. installing an update), internal use")
     p_auto_update_toggle = sub.add_parser("set-auto-update", help="Turn unattended nightly auto-update on or off (default: on)")
     p_auto_update_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
 
@@ -11978,7 +11995,7 @@ def main():
     elif args.command == "auto-update":
         auto_update_cmd()
     elif args.command == "match-open-question":
-        match_open_question_cmd(args.text)
+        match_open_question_cmd(args.text, apple_id=args.apple_id)
     elif args.command == "set-auto-update":
         set_auto_update_cmd(args.enabled)
     elif args.command == "mark-vip":

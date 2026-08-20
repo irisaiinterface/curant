@@ -1372,8 +1372,14 @@ def handle_message(msg):
     # against) -- falls through to the normal LLM path unchanged if
     # nothing matches, so this never blocks or delays regular conversation.
     if not image_path and text.strip():
+        # Real gap found live (2026-08-19): without --apple-id, the
+        # resolver's "On it, starting now" text (see _notify_task_starting
+        # in curant-cli) silently never sends, since that global is
+        # normally only set inside relay() -- this command never calls
+        # relay() at all. Same recipient relay_to_curant already uses
+        # below, for consistency.
         match_result = subprocess.run(
-            ["curant-cli", "match-open-question", text],
+            ["curant-cli", "match-open-question", text, "--apple-id", CUSTOMER_APPLE_ID],
             capture_output=True, text=True,
         )
         try:
