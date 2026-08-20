@@ -3052,6 +3052,36 @@ def get_all_available_tools(config):
         "builtin": True,
     })
 
+    # Lets a customer flip auto-update mode conversationally ("just install
+    # updates automatically", "go back to asking me first") instead of
+    # needing to know the `curant-cli set-auto-update-mode` command exists.
+    # Always available (unconditional), same as manage_auto_reply_contact
+    # above -- this is a preference toggle, not something tied to a
+    # specific pending state like apply_pending_update is.
+    tools.append({
+        "qualified_name": "set_auto_update_mode",
+        "description": (
+            "Changes HOW a detected Curant software update gets applied -- not whether updates are "
+            "checked for at all (that's a separate, rarely-used setting). 'ask' (the default) texts "
+            "an offer and waits for the customer to reply UPDATE or SKIP before installing anything. "
+            "'auto' skips asking entirely -- once a genuinely newer version is found, it's installed "
+            "immediately and unattended, with just a heads-up text afterward instead of a question "
+            "beforehand. Use this when the customer says something like 'just auto-update from now "
+            "on', 'stop asking me about updates, just install them', 'go back to asking me first "
+            "about updates', or similar."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["ask", "auto"], "description": "'ask' to require confirmation each time, 'auto' to install without asking"},
+            },
+            "required": ["mode"],
+        },
+        "server_command": None,
+        "raw_name": "set_auto_update_mode",
+        "builtin": True,
+    })
+
     # Pending software-update approval -- only registered when there's
     # actually something waiting (config["pending_auto_update"], set by
     # auto_update_cmd when a newer version is found -- see that
@@ -5578,6 +5608,20 @@ def execute_tool_call(tool_name, arguments, available_tools):
             conn.execute("DELETE FROM auto_reply_contacts WHERE handle = ?", (handle,))
             conn.commit()
         return f"{handle} removed from auto-reply contacts — back to drafting suggestions and asking first."
+
+    if match["builtin"] and tool_name == "set_auto_update_mode":
+        mode = (arguments.get("mode") or "").strip().lower()
+        if mode not in ("ask", "auto"):
+            return "[Refused: mode must be 'ask' or 'auto'.]"
+        config = load_config()
+        config["auto_update_mode"] = mode
+        save_config(config)
+        if mode == "auto":
+            return ("Auto-update is now on -- from here on, a genuinely newer version installs "
+                    "automatically, no confirmation needed. Still get a text either way, just after "
+                    "it happens instead of before.")
+        return ("Auto-update mode is back to asking first -- I'll text an offer and wait for "
+                "UPDATE or SKIP before installing anything.")
 
     if match["builtin"] and tool_name == "set_quiet_hours":
         config = load_config()
@@ -10303,6 +10347,60 @@ def auto_update_cmd():
         print(json.dumps({"notify_text": None}))
         return
 
+    if config.get("auto_update_mode", "ask") == "auto":
+        # Opt-in (see set_auto_update_mode_cmd): skip the whole ask/wait
+        # flow entirely and just install it -- built on top of everything
+        # hardened earlier today (verified watcher restart with retry,
+        # v1.0-style customer wording), unlike the original pre-consent
+        # behavior this is conceptually reviving. A cooldown on repeat
+        # attempts for the SAME version matters here specifically because
+        # nothing here sets pending_auto_update/declined_version (those
+        # only exist for the "ask" flow) -- without it, a transient
+        # download failure would retry and re-text EVERY single check
+        # (every 60 seconds per the plist) instead of backing off.
+        last_attempt = config.get("auto_update_auto_last_attempt") or {}
+        if last_attempt.get("version") == remote:
+            try:
+                last_at = datetime.strptime(last_attempt["at"], "%Y-%m-%d %H:%M:%S")
+                if datetime.utcnow() - last_at < timedelta(minutes=15):
+                    print(json.dumps({"notify_text": None}))
+                    return
+            except (KeyError, ValueError, TypeError):
+                pass
+        config["auto_update_auto_last_attempt"] = {
+            "version": remote, "at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        save_config(config)
+
+        remote_display = manifest.get("display_version") or CURANT_DISPLAY_VERSION
+        changelog = manifest.get("changelog", "")
+        success, detail = _download_and_apply_update(manifest["download_url"])
+        if success:
+            config = load_config()
+            config.pop("pending_auto_update", None)
+            config.pop("auto_update_declined_version", None)
+            config.pop("auto_update_auto_last_attempt", None)
+            save_config(config)
+            expire_open_questions("auto_update_offer")
+            if remote_display != CURANT_DISPLAY_VERSION:
+                text = (f"Curant just updated itself to v{remote_display} (from v{CURANT_DISPLAY_VERSION}) "
+                        f"-- auto-update is on, so this happened without asking first.")
+            else:
+                text = "Curant just installed a background update -- auto-update is on, so this happened without asking first."
+            if changelog:
+                text += f" What's new: {changelog}"
+            if detail != "applied":
+                text += (f" One hiccup: the background watcher had trouble restarting ({detail}) -- "
+                          f"if I've gone quiet, run `launchctl bootstrap gui/$(id -u) "
+                          f"~/Library/LaunchAgents/com.curant.watcher.plist` by hand.")
+            print(json.dumps({"notify_text": text}))
+            return
+        text = (f"Tried to auto-update to v{remote_display} but it failed: {detail}. Nothing changed "
+                f"-- still running v{CURANT_DISPLAY_VERSION}. I'll try again in a bit, or say the word "
+                f"to retry now.")
+        print(json.dumps({"notify_text": text}))
+        return
+
     pending = config.get("pending_auto_update")
     if pending and pending.get("version") == remote:
         # Already offered this exact version and still waiting on a reply
@@ -10407,6 +10505,36 @@ def set_auto_update_cmd(enabled_str):
     config["auto_update_enabled"] = enabled_str.strip().lower() == "on"
     save_config(config)
     print(f"Auto-update is now {'ON' if config['auto_update_enabled'] else 'OFF'}.")
+
+
+def set_auto_update_mode_cmd(mode_str):
+    """`curant-cli set-auto-update-mode ask|auto` -- controls HOW a
+    detected update gets applied, separate from set-auto-update above
+    (which controls whether checking happens at all). Default is "ask"
+    (the consent-first behavior built 2026-08-18/19 -- see
+    auto_update_cmd's docstring): detect, text an offer, wait for an
+    explicit reply. "auto" skips the ask entirely -- once a genuinely
+    newer version is found, it's downloaded, installed, and the watcher
+    restarted immediately and unattended, same as the OLD pre-consent
+    behavior, except now built on top of everything hardened today
+    (verified watcher restart with retry, v1.0-style customer wording)
+    instead of the original unverified version. Customer still gets a
+    text either way -- just AFTER the fact in "auto" mode instead of
+    BEFORE, and without anything to reply to."""
+    config = load_config()
+    if mode_str is None:
+        current = config.get("auto_update_mode", "ask")
+        print(f"Auto-update mode is currently '{current}' (default: 'ask').")
+        print("'ask' = text an offer and wait for UPDATE/SKIP. 'auto' = install newer "
+              "versions immediately, no confirmation needed, just a heads-up text after.")
+        return
+    mode = mode_str.strip().lower()
+    if mode not in ("ask", "auto"):
+        print(f"Invalid mode '{mode_str}' -- must be 'ask' or 'auto'.")
+        sys.exit(1)
+    config["auto_update_mode"] = mode
+    save_config(config)
+    print(f"Auto-update mode is now '{mode}'.")
 
 
 def run_automated_backup():
@@ -11768,6 +11896,9 @@ def main():
                                "resolver kicks off slow work (e.g. installing an update), internal use")
     p_auto_update_toggle = sub.add_parser("set-auto-update", help="Turn unattended nightly auto-update on or off (default: on)")
     p_auto_update_toggle.add_argument("enabled", nargs="?", default=None, choices=["on", "off"], help="Omit to view the current setting.")
+    p_auto_update_mode = sub.add_parser("set-auto-update-mode",
+        help="'ask' (default) = text an offer and wait for UPDATE/SKIP. 'auto' = install immediately, no confirmation, heads-up text after.")
+    p_auto_update_mode.add_argument("mode", nargs="?", default=None, choices=["ask", "auto"], help="Omit to view the current setting.")
 
     p_mark_vip = sub.add_parser("mark-vip", help="Grace-exclusive: mark a contact as VIP -- their texts reach you even in 'approved' access mode")
     p_mark_vip.add_argument("handle", help="Phone number or email, as it appears in Messages")
@@ -11998,6 +12129,8 @@ def main():
         match_open_question_cmd(args.text, apple_id=args.apple_id)
     elif args.command == "set-auto-update":
         set_auto_update_cmd(args.enabled)
+    elif args.command == "set-auto-update-mode":
+        set_auto_update_mode_cmd(args.mode)
     elif args.command == "mark-vip":
         mark_vip_cmd(args.handle, args.enabled)
     elif args.command == "vip-handles":
