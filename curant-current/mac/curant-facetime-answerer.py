@@ -142,7 +142,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import re
 
 def _ts():
     """Wall-clock timestamp (local time, millisecond precision) prefixed
@@ -475,6 +477,88 @@ def _callerid_search_region_fraction():
             print(f"  {CALLERID_OCR_REGION_ENV} isn't valid 'x0,x1,y0,y1' — ignoring, using the default region.",
                   file=sys.stderr)
     return _SEARCH_REGION_FRACTION  # same region already confirmed to contain the Accept button/banner
+
+
+# Direct call-end detection via OCR, added per explicit request to replace
+# the previous ~18-27s silence-timeout-only detection with something much
+# faster (target: ~2s). macOS shows a system HUD banner reading "<name>
+# left" when the other party disconnects (visible top-of-screen, same
+# general area as the incoming-call banner/caller-ID) -- this reuses the
+# EXACT SAME technique already proven reliable for caller-ID matching
+# (screencapture + pytesseract), deliberately NOT AppleScript/Accessibility.
+#
+# WHY NOT AppleScript, stated plainly: an earlier, different attempt at
+# hangup detection (_call_is_still_connected(), see its own docstring)
+# used `osascript`/System Events queries AGAINST THE FACETIME PROCESS
+# ITSELF, repeatedly, during a live call -- and that specific pattern was
+# the prime suspect behind a real, confirmed call-dropping regression
+# (FaceTime's wantsCallDisconnectionOnInvalidation=YES behavior reacting
+# to rapid process churn touching it). This check is mechanistically
+# different: screencapture + tesseract never touch FaceTime's own process
+# or Accessibility tree at all, only raw screen pixels -- reducing but,
+# without a live call to confirm against, NOT proving that risk is zero.
+# Runs on its own throttled background thread (CALL_END_POLL_SECONDS),
+# not inline in the per-turn audio loop, specifically so it can't add
+# latency to the actual conversation even if a check takes a moment.
+#
+# UNVERIFIED, stated per this file's house rule: the default region below
+# is a first guess (a wide top strip) since there's no live Mac available
+# while writing this to confirm exactly where the "<name> left" banner
+# renders. Override with CURANT_FACETIME_CALLEND_REGION="x0,x1,y0,y1"
+# (same format as CURANT_FACETIME_CALLERID_REGION) if the default doesn't
+# actually catch it on a real call -- the raw OCR text is printed on every
+# check specifically so a bad region shows up immediately in the logs
+# instead of silently never firing.
+CALL_END_OCR_REGION_ENV = "CURANT_FACETIME_CALLEND_REGION"
+CALL_END_POLL_SECONDS = 2.0  # how often the background thread checks -- target end-to-end detection latency
+
+
+def _call_end_search_region_fraction():
+    override = os.environ.get(CALL_END_OCR_REGION_ENV)
+    if override:
+        try:
+            parts = tuple(float(x) for x in override.split(","))
+            if len(parts) == 4:
+                return parts
+        except Exception:
+            print(f"  {CALL_END_OCR_REGION_ENV} isn't valid 'x0,x1,y0,y1' — ignoring, using the default region.",
+                  file=sys.stderr)
+    return (0.0, 1.0, 0.0, 0.12)  # wide top strip, first guess -- see comment above
+
+
+def _call_end_banner_detected():
+    """Fails safe: any error here (screenshot/OCR failure) returns False
+    -- i.e. NOT ended -- same fail-safe direction as _accept_button_
+    visible_now(), since a false "ended" here would mean silently
+    abandoning a caller who's still on the line."""
+    try:
+        screenshot_path = _capture_screenshot()
+        try:
+            text = _ocr_text_from_screenshot(screenshot_path, _call_end_search_region_fraction())
+        finally:
+            if os.path.exists(screenshot_path):
+                os.remove(screenshot_path)
+        if text and re.search(r"\bleft\b", text, re.IGNORECASE):
+            print(f"  [{_ts()}] [call-end OCR] matched \"left\" in: {text.strip()!r}", file=sys.stderr)
+            return True
+        return False
+    except Exception as e:
+        print(f"  [{_ts()}] [call-end OCR] check failed ({e}) -- treating as not ended.", file=sys.stderr)
+        return False
+
+
+def _watch_for_call_end(stop_event):
+    """Runs on its own daemon thread for the lifetime of one call (see
+    handle_call()). Polls _call_end_banner_detected() every
+    CALL_END_POLL_SECONDS and sets stop_event the moment it fires --
+    handle_call()'s main loop and _wait_for_next_turn_segment() both
+    check stop_event to react within about one poll tick, rather than
+    waiting for the old silence-timeout to build up over many turns."""
+    while not stop_event.is_set():
+        if _call_end_banner_detected():
+            stop_event.set()
+            return
+        stop_event.wait(CALL_END_POLL_SECONDS)
 
 
 def _ocr_text_from_screenshot(screenshot_path, region_fraction):
@@ -1286,7 +1370,7 @@ def _stop_continuous_capture(process):
             pass
 
 
-def _wait_for_next_turn_segment(pattern, index):
+def _wait_for_next_turn_segment(pattern, index, stop_event=None):
     """Blocks until turn N's segment file is fully finalized, detected by
     the NEXT segment (N+1) appearing on disk -- ffmpeg's segment muxer
     only starts writing file N+1 once file N is closed out, so this is a
@@ -1318,11 +1402,18 @@ def _wait_for_next_turn_segment(pattern, index):
 
     Returns the path to turn N's now-finalized segment file, or None if
     this timed out waiting (the caller's own connectivity check, run
-    once per turn, is what actually detects a real hangup now)."""
+    once per turn, is what actually detects a real hangup now).
+
+    stop_event, if given (see _watch_for_call_end()), is checked on every
+    poll tick (SEGMENT_WAIT_POLL_SECONDS, already 0.2s) so a real hangup
+    detected via the call-end OCR watcher interrupts this wait almost
+    immediately instead of blocking up to SEGMENT_WAIT_TIMEOUT_SECONDS."""
     this_segment = pattern % index
     next_segment = pattern % (index + 1)
     deadline = time.monotonic() + SEGMENT_WAIT_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return None
         if os.path.exists(next_segment):
             return this_segment if os.path.exists(this_segment) else None
         time.sleep(SEGMENT_WAIT_POLL_SECONDS)
@@ -1962,6 +2053,18 @@ def handle_call(window_desc, apple_id, dry_run):
     speak("Hi, this is Curant. I'm listening.")
     print(f"  [{_ts()}] Greeting playback finished.")
 
+    # Fast, direct hangup detection (see _watch_for_call_end()'s docstring
+    # for why this is a separate throttled thread, not an inline check).
+    # call_ended_event is threaded through to _wait_for_next_turn_segment()
+    # below and checked at the top of the main loop, and is always set in
+    # this function's own finally block so the watcher thread exits with
+    # the call regardless of which path out of this function is taken.
+    call_ended_event = threading.Event()
+    call_end_watcher = threading.Thread(
+        target=_watch_for_call_end, args=(call_ended_event,), daemon=True
+    )
+    call_end_watcher.start()
+
     # CURANT NEVER ENDS THE CALL — only the human can, by hanging up on
     # their own end. Per explicit direction. Two things changed to make
     # that true, not just claimed:
@@ -2033,13 +2136,22 @@ def handle_call(window_desc, apple_id, dry_run):
             # AppleScript check itself contributing to a drop. Curant
             # still never hangs up itself either way.
 
+            if call_ended_event.is_set():
+                print(f"  [{_ts()}] Call end detected (OCR banner match) -- "
+                      f"returning to listen for a new incoming call.")
+                return
+
             if pending_wav is not None:
                 raw_wav_path, wav_path = pending_wav
                 pending_wav = None
                 print(f"  [{_ts()}] Processing caller audio that interrupted the last reply: "
                       f"{os.path.basename(raw_wav_path)}")
             else:
-                raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index)
+                raw_wav_path = _wait_for_next_turn_segment(pattern, turn_index, stop_event=call_ended_event)
+                if call_ended_event.is_set():
+                    print(f"  [{_ts()}] Call end detected (OCR banner match) -- "
+                          f"returning to listen for a new incoming call.")
+                    return
                 if raw_wav_path is None:
                     # This specific segment timed out or never got written
                     # (e.g. the capture process died, which itself often
@@ -2151,6 +2263,7 @@ def handle_call(window_desc, apple_id, dry_run):
                 else:
                     print(f"  [{_ts()}] Reply playback finished.")
     finally:
+        call_ended_event.set()  # stop the watcher thread regardless of how this function returns
         if capture_process is not None:
             _stop_continuous_capture(capture_process)
         if segment_dir is not None:
