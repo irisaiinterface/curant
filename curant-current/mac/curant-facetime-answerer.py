@@ -534,12 +534,22 @@ def _call_end_banner_detected():
     try:
         screenshot_path = _capture_screenshot()
         try:
-            text = _ocr_text_from_screenshot(screenshot_path, _call_end_search_region_fraction())
+            # Real bug found live: _ocr_text_from_screenshot() returns
+            # (text_or_None, error_or_None), not a plain string -- see
+            # its own docstring. Passing the raw tuple straight to
+            # re.search() below failed every single check during a real
+            # call ("expected string or bytes-like object, got 'tuple'"),
+            # meaning this never actually got a chance to detect anything
+            # yet. Unpack it properly.
+            text, err = _ocr_text_from_screenshot(screenshot_path, _call_end_search_region_fraction())
         finally:
             if os.path.exists(screenshot_path):
                 os.remove(screenshot_path)
+        if err:
+            print(f"  [{_ts()}] [call-end OCR] {err} -- treating as not ended.", file=sys.stderr)
+            return False
         if text and re.search(r"\bleft\b", text, re.IGNORECASE):
-            print(f"  [{_ts()}] [call-end OCR] matched \"left\" in: {text.strip()!r}", file=sys.stderr)
+            print(f"  [{_ts()}] [call-end OCR] matched \"left\" in: {text!r}", file=sys.stderr)
             return True
         return False
     except Exception as e:
