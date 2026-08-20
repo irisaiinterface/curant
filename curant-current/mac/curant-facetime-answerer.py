@@ -2184,12 +2184,22 @@ def handle_call(window_desc, apple_id, dry_run):
     # _ORIGINAL_INPUT_DEVICE/_ORIGINAL_OUTPUT_DEVICE (captured once in
     # main(), before Curant ever touched anything) in this function's
     # own finally block below, once the call is confirmed over.
-    if not set_system_input_device(TTS_OUTPUT_DEVICE):
+    input_switched = set_system_input_device(TTS_OUTPUT_DEVICE)
+    if not input_switched:
         print("  System input device switch failed right before accepting -- "
               "the caller will likely hear nothing.", file=sys.stderr)
-    if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
+    output_switched = set_system_output_device(SYSTEM_OUTPUT_DEVICE)
+    if not output_switched:
         print("  System output device switch failed right before accepting -- "
               "recording the caller's voice will likely fail.", file=sys.stderr)
+    if input_switched and output_switched:
+        # Explicit success confirmation -- previously silent on success,
+        # only printing on failure, which made a working switch
+        # indistinguishable from one that never ran (confirmed real user
+        # confusion: "why aren't you using blackhole?" when it actually
+        # was, just never said so).
+        print(f"  [{_ts()}] Switched to BlackHole for the call -- "
+              f"input: {TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}.")
 
     try:
         ok, detail = accept_call()
