@@ -2370,6 +2370,26 @@ def handle_call(window_desc, apple_id, dry_run):
                 if wav_path != raw_wav_path and os.path.exists(wav_path):
                     os.remove(wav_path)
             if not text:
+                # Previously silent here -- indistinguishable in the logs
+                # from a turn that never had speech at all. Real bug found
+                # live (2026-08-20): after the Multi-Output Device fix
+                # finally got real caller audio flowing, TWO consecutive
+                # turns both measured well above SILENCE_RMS_THRESHOLD
+                # (RMS 694 and 120) -- genuine speech, confirmed audible --
+                # yet neither produced a transcript, and this branch just
+                # silently moved on with zero trace of what happened.
+                # Suspected cause, not yet confirmed: TURN_RECORD_SECONDS
+                # (2s) slicing one continuous utterance across a segment
+                # boundary, leaving two partial/unclear fragments that
+                # Gemini's transcription correctly declines to guess at
+                # (it's explicitly instructed to return empty rather than
+                # hallucinate -- see _transcribe_gemini's prompt). Logging
+                # this now so the NEXT occurrence shows up instead of
+                # vanishing the same way.
+                print(f"  [{_ts()}] Had speech (RMS above threshold) but got an empty "
+                      f"transcript back (transcription took {_transcribe_elapsed:.2f}s) -- "
+                      f"possibly a sentence cut across the {TURN_RECORD_SECONDS}s segment "
+                      f"boundary. Listening for the next segment.")
                 continue  # likely silence in this window — just listen again
             print(f"  [{_ts()}] Caller said: {text} (transcription took {_transcribe_elapsed:.2f}s)")
             _reply_start = time.monotonic()
