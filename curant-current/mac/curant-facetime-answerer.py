@@ -1097,6 +1097,23 @@ def accept_call():
     )
 
 
+def _call_kind_from_ocr(ocr_text):
+    """"FaceTime Video" / "FaceTime Audio" / unknown, from banner OCR.
+
+    Not cosmetic: these two call types route audio through different
+    paths, and capture has been observed working on one while returning
+    exactly 0.0 RMS on the other. Logging it per call turns "it worked
+    earlier but not now" into a comparable data point instead of a
+    memory test.
+    """
+    text = (ocr_text or "").lower()
+    if "video" in text:
+        return "FaceTime VIDEO"
+    if "audio" in text:
+        return "FaceTime AUDIO"
+    return "call type unknown from OCR"
+
+
 def caller_is_approved(window_desc, cfg):
     """
     Real caller-ID verification for 'approved' mode, via screenshot +
@@ -1149,7 +1166,18 @@ def caller_is_approved(window_desc, cfg):
 
     matched, matched_handle = _ocr_caller_matches_customer(ocr_text, customer_handles)
     if matched:
-        return True, f"caller ID OCR matched configured handle {matched_handle}"
+        # The banner text we already have says "FaceTime Video" or
+        # "FaceTime Audio". Recording it costs nothing and settles a
+        # question that has otherwise required remembering which kind of
+        # call was placed twenty minutes ago -- capture works on some
+        # calls and returns exactly 0.0 RMS on others, and call type is
+        # the strongest remaining suspect for why. A VIDEO call exposes
+        # FaceTime's own per-app Microphone/Output picker; an AUDIO call
+        # does not (see set_system_output_device's comment), so the two
+        # route audio differently and only one of them is under this
+        # script's control.
+        kind = _call_kind_from_ocr(ocr_text)
+        return True, f"caller ID OCR matched configured handle {matched_handle} [{kind}]"
 
     return False, (
         f"approved mode requires verifying the caller — OCR read the call banner but found no digit "
