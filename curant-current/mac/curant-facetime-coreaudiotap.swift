@@ -413,16 +413,27 @@ if probeMode {
         log("--- PROBE RESULT ---")
         if !saw {
             log("VERDICT: Core Audio delivered ZERO buffers for \(bundleID).")
-            log("The tap was created successfully, so this is macOS declining to")
-            log("provide this process's audio -- the same answer ScreenCaptureKit gave.")
+            log("The tap was created successfully. Two possible causes, and they are")
+            log("NOT the same thing -- rule out the boring one first:")
+            log("  1. The app simply produced no audio during these 15s (paused,")
+            log("     muted, or no call audio yet). Retry with audio ACTUALLY playing.")
+            log("  2. macOS is declining to hand over this process's audio, which is")
+            log("     the answer ScreenCaptureKit already gave for FaceTime.")
         } else if peak <= 2 {
             log("VERDICT: \(count) buffers arrived but peak amplitude was \(peak) (silence).")
             log("The stream exists and is empty -- FaceTime call audio is being excluded")
             log("from the tap, same signature as the ScreenCaptureKit result.")
         } else {
             log("VERDICT: SUCCESS -- \(count) buffers, peak amplitude \(peak).")
-            log("Core Audio process taps DO expose FaceTime call audio. This is the")
-            log("capture backend to use; wire it into curant-facetime-answerer.py.")
+            log("Core Audio process taps DO expose \(bundleID)'s audio.")
+            if bundleID == "com.apple.FaceTime" {
+                log("This is the capture backend to use; wire it into")
+                log("curant-facetime-answerer.py.")
+            } else {
+                log("That was a CONTROL run, not the real test: it proves the tap,")
+                log("aggregate device, conversion and peak measurement all work.")
+                log("Now run it against a live FaceTime call (no --bundle-id).")
+            }
         }
         log("Control: run this against a music player to confirm the pipeline")
         log("itself works -- e.g. --bundle-id com.spotify.client --probe (Spotify)")
