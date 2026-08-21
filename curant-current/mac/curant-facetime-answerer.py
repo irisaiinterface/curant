@@ -1675,17 +1675,46 @@ def _start_continuous_capture(seconds_per_segment):
 
 AUDIOTAP_BIN = os.path.expanduser("~/bin/curant-facetime-audiotap")
 AUDIOTAP_DISABLE_ENV = "CURANT_FACETIME_DISABLE_AUDIOTAP"
+AUDIOTAP_ENABLE_ENV = "CURANT_FACETIME_ENABLE_AUDIOTAP"  # opt-in; see audiotap_available()
 AUDIOTAP_SYSTEM_AUDIO_ENV = "CURANT_FACETIME_SYSTEM_AUDIO"  # =1 -> capture the whole system mix
 AUDIOTAP_LOG_PATH = "/tmp/curant-facetime-audiotap.log"
 AUDIOTAP_READY_TIMEOUT_SECONDS = 12
 
 
 def audiotap_available():
-    """True when the ScreenCaptureKit tap is built and not disabled.
+    """OFF BY DEFAULT as of 2026-08-21. Opt in with
+    CURANT_FACETIME_ENABLE_AUDIOTAP=1.
 
-    Set CURANT_FACETIME_DISABLE_AUDIOTAP=1 to force the legacy
-    BlackHole/ffmpeg path (useful for A/B testing the two backends
-    against the same Mac)."""
+    WHY IT IS OFF -- measured, not assumed. Three capture routes were
+    tested against a live FaceTime call on this Mac:
+
+      1. Virtual output device (Multi-Output -> BlackHole 16ch, ffmpeg)
+         Tone played into the same device mid-call: RMS 5097.5.
+         FaceTime's call audio: EXACTLY 0.0.
+      2. ScreenCaptureKit scoped to the FaceTime application
+         Stream delivered 489 buffers at 48kHz/2ch -- so the OS was
+         actively handing us audio -- with peak amplitude 0 throughout.
+      3. ScreenCaptureKit capturing the ENTIRE system mix
+         During a call: peak 17 out of 32768 (~-65dB, dither/noise).
+         CONTROL, same binary, music playing, no call: peak 7614-8452.
+
+    The control is what makes this conclusive rather than another
+    guess: identical code, identical conversion path, real audio
+    captured at full amplitude. The capture pipeline is correct. macOS
+    simply does not expose FaceTime call audio to ScreenCaptureKit --
+    it is protected communications audio -- and does not reliably
+    render it into the system default output device either.
+
+    The tap is kept (not deleted) because it is correct code that
+    works for ordinary applications, and because Apple's treatment of
+    this may change. But defaulting it ON would guarantee silence on
+    every call, which is strictly worse than the BlackHole path -- that
+    one at least succeeded on several real calls tonight (RMS 275, 694,
+    57, 35), which is itself evidence that FaceTime DOES sometimes
+    render into the capturable device, depending on the audio route
+    FaceTime has chosen for that call."""
+    if os.environ.get(AUDIOTAP_ENABLE_ENV) != "1":
+        return False
     if os.environ.get(AUDIOTAP_DISABLE_ENV) == "1":
         return False
     return os.path.isfile(AUDIOTAP_BIN) and os.access(AUDIOTAP_BIN, os.X_OK)
@@ -3353,9 +3382,9 @@ def main():
                   "backend, which taps FaceTime's own audio directly.")
             ok, detail = True, "n/a (ScreenCaptureKit backend)"
         else:
-            print(f"  Capture backend: BlackHole/ffmpeg. The ScreenCaptureKit tap is not built at "
-                  f"{AUDIOTAP_BIN} -- build it (see setup-facetime.command) to stop depending on "
-                  f"FaceTime following the system default output device.")
+            print("  Capture backend: BlackHole/ffmpeg (the ScreenCaptureKit tap is disabled by "
+                  "default -- macOS was measured NOT to expose FaceTime call audio to it; see "
+                  "audiotap_available()'s docstring for the numbers).")
             ok, detail = audio_capture_selftest()
         if ok:
             print(f"  Audio capture self-test: {detail}")

@@ -1,10 +1,62 @@
-## How Curant hears the caller (updated 2026-08-21)
+## How Curant hears the caller — and the limits found (2026-08-21)
 
-Curant now captures FaceTime's audio with **ScreenCaptureKit**, tapping
-the FaceTime application directly. It does **not** depend on BlackHole,
-a Multi-Output Device, or the system default output device for hearing.
+**Current state: hearing the caller is UNRELIABLE on this macOS version.**
+Texting is unaffected. This section records what was measured so the
+next person doesn't repeat three nights of the same experiments.
 
-### Why this changed
+### What was tested, and what each attempt measured
+
+Three independent capture routes were tried against live FaceTime calls:
+
+| Route | Result during a live call | Control |
+|---|---|---|
+| Multi-Output Device → BlackHole 16ch → ffmpeg | FaceTime audio **RMS 0.0** | Tone into the same device, same moment: **RMS 5097.5** |
+| ScreenCaptureKit, scoped to FaceTime.app | 489 buffers delivered, **peak 0** | — |
+| ScreenCaptureKit, entire system mix | **peak 17** (~−65 dB, noise floor) | Same binary, music playing: **peak 7614–8452** |
+
+The controls are the important column. In every case the capture
+pipeline provably worked on non-FaceTime audio at the same moment,
+with the same code and the same conversion path.
+
+### Conclusion
+
+macOS does not expose FaceTime call audio to ScreenCaptureKit (it is
+treated as protected communications audio), and does not reliably
+render it into the system default output device either.
+
+That said, the BlackHole path **did** succeed on several real calls
+(RMS 275, 694, 57, 35) before failing on others with identical
+settings. So FaceTime *sometimes* renders into the capturable device.
+The most likely remaining explanation is FaceTime's own per-call audio
+route — it maintains its own output selection (seen in the call
+window's audio control, and observed naming a device different from
+the system default). When that route happens to be the Multi-Output
+Device, capture works; when it's Bluetooth headphones or another
+device, capture gets nothing.
+
+### What to check if a call is silent
+
+1. During the call, open the FaceTime call window's audio control (or
+   Control Centre → Sound) and see which output device the CALL is
+   using — not the system default, the call's own route.
+2. If it names anything other than `Curant Call Output`, switch it.
+3. Disconnect Bluetooth headphones before testing; they are a frequent
+   cause of FaceTime picking a different route mid-session.
+
+### The ScreenCaptureKit tap
+
+`mac/curant-facetime-audiotap.swift` is kept because it is correct,
+working code — the control test proves it captures real audio fine —
+and because Apple's handling of this may change. It is **disabled by
+default**, since enabling it guarantees silence on FaceTime calls.
+
+Opt in with `CURANT_FACETIME_ENABLE_AUDIOTAP=1` (and optionally
+`CURANT_FACETIME_SYSTEM_AUDIO=1` for the whole-system mix). Its
+diagnostics go to `/tmp/curant-facetime-audiotap.log`, including a
+heartbeat with running peak amplitude, which is the fastest way to
+tell "the OS is sending nothing" from "the OS is sending silence".
+
+## Why this changed
 
 The original design routed FaceTime's audio into a Multi-Output Device
 that fed BlackHole 16ch, and recorded that virtual device. That was

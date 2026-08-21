@@ -260,7 +260,11 @@ else
             "$SCRIPT_DIR/mac/curant-facetime-audiotap.swift" 2>/tmp/curant-audiotap-build.log; then
         chmod +x "$BIN_DIR/curant-facetime-audiotap"
         echo "    Built $BIN_DIR/curant-facetime-audiotap"
-        echo "    Hearing no longer depends on BlackHole or the Multi-Output Device."
+        echo "    NOTE: this tap is DISABLED by default. Measured on macOS 26: ScreenCaptureKit"
+        echo "    is not given FaceTime call audio (app-scoped: peak 0; whole-system: noise"
+        echo "    floor only -- while the same binary captures music at full amplitude)."
+        echo "    Built anyway because it is useful for diagnostics and may work on future"
+        echo "    macOS versions. Opt in with CURANT_FACETIME_ENABLE_AUDIOTAP=1."
     else
         echo "    Build FAILED -- see /tmp/curant-audiotap-build.log"
         echo "    Curant will still run and fall back to the BlackHole capture path."
