@@ -1384,6 +1384,14 @@ def audio_capture_selftest():
             os.remove(tmp_wav)
 
 
+TTS_RATE_WPM = 195
+# `say` defaults to about 175 words per minute. 195 is still comfortably
+# natural (well short of the chipmunk range that starts around 250) and
+# cuts roughly 10% off every reply's playback time. That matters more
+# than it sounds: playback is pure dead air for the caller, and a real
+# call measured a single reply taking 27.66 SECONDS to speak. Shortening
+# the replies themselves is the main fix (see curant-cli's
+# voice_instruction and reply_max_tokens); this compounds it for free.
 TTS_VOICE = "Samantha"  # explicit `say` voice -- see speak()'s docstring for why this is required,
                         # not optional. CHANGED from "Alex" (2026-08-21): live-checked via
                         # `say -v '?'` and "Alex" is not actually in the list of voices
@@ -1481,7 +1489,8 @@ def speak(text, device_name=None, interrupt_check=None, prerendered_aiff=None):
     interrupted = False
     try:
         if not reuse:
-            subprocess.run(["say", "-v", TTS_VOICE, "-o", aiff_path, text], check=True, timeout=30)
+            subprocess.run(["say", "-v", TTS_VOICE, "-r", str(TTS_RATE_WPM), "-o", aiff_path, text],
+                           check=True, timeout=30)
         # `say` exits 0 and produces a well-formed but near-empty AIFF on
         # this failure mode -- no exception to catch. Bytes-per-character
         # is a crude but effective tripwire: a real sentence runs roughly
@@ -1555,7 +1564,7 @@ def prerender_greeting():
     try:
         fd, path = tempfile.mkstemp(prefix="curant_greeting_", suffix=".aiff")
         os.close(fd)
-        subprocess.run(["say", "-v", TTS_VOICE, "-o", path, GREETING_TEXT],
+        subprocess.run(["say", "-v", TTS_VOICE, "-r", str(TTS_RATE_WPM), "-o", path, GREETING_TEXT],
                        check=True, timeout=30)
         size = os.path.getsize(path)
         if size < max(2000, len(GREETING_TEXT) * 200):
@@ -2223,6 +2232,19 @@ MAX_UTTERANCE_SECONDS = 15.0   # hard cap: flush and transcribe even if the call
 # long enough not to cut in on a brief mid-sentence breath, short
 # enough that Curant doesn't feel slow to start answering. At 1.0s
 # segments this rounds to a single silent segment.
+MIN_UTTERANCE_SECONDS = 0.7
+# Don't treat a very short burst as a finished turn. Real bug from a live
+# call: the first segment after capture started held only 0.4s of audio
+# (segments are aligned to when ffmpeg began, not to when the caller
+# started talking), the next segment read silent, and that 0.4s fragment
+# was flushed and transcribed on its own -- producing "Are you?" from
+# what was actually "Who are you?". Curant then answered the fragment.
+# Below this length, a single silent segment is treated as a pause
+# WITHIN speech rather than the end of it, and the buffer keeps
+# collecting. The MAX_UTTERANCE_SECONDS cap still bounds the wait, and
+# genuinely isolated short words ("yes", "stop") still flush once
+# UTTERANCE_TRAILING_SILENCE_SEGMENTS is exceeded twice over -- see
+# should_flush().
 UTTERANCE_TRAILING_SILENCE_SECONDS = 0.8
 UTTERANCE_TRAILING_SILENCE_SEGMENTS = max(
     1, int(round(UTTERANCE_TRAILING_SILENCE_SECONDS / TURN_RECORD_SECONDS)))
@@ -2346,8 +2368,17 @@ class _UtteranceBuffer:
         long enough that waiting for a pause would itself feel broken."""
         if not self.paths:
             return False
-        return (self.silent_run >= UTTERANCE_TRAILING_SILENCE_SEGMENTS
-                or self.seconds >= MAX_UTTERANCE_SECONDS)
+        if self.seconds >= MAX_UTTERANCE_SECONDS:
+            return True
+        # A too-short buffer needs MORE trailing silence before we accept
+        # it as a complete turn -- see MIN_UTTERANCE_SECONDS for the live
+        # bug this prevents (a 0.4s fragment transcribed as a whole
+        # sentence). Still flushes eventually, so a genuine one-word
+        # answer isn't stranded.
+        required = UTTERANCE_TRAILING_SILENCE_SEGMENTS
+        if self.seconds < MIN_UTTERANCE_SECONDS:
+            required = UTTERANCE_TRAILING_SILENCE_SEGMENTS * 2
+        return self.silent_run >= required
 
     def build(self):
         """Returns a single WAV path for everything buffered, or None."""

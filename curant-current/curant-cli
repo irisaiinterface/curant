@@ -8843,13 +8843,18 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
         tier = "fast"
 
     voice_instruction = (
-        "This message came in through a live FaceTime voice call, not a text -- your reply will be "
-        "read aloud by text-to-speech to someone waiting on the line right now, not read silently as "
-        "text. Talk the way a person actually talks on the phone: short sentences, contractions, no "
-        "markdown, no bullet points or numbered lists, no headers, nothing that only makes sense "
-        "written down. Keep it brief -- a couple of sentences, not a paragraph -- and get to the point "
-        "fast; you can always say more if they ask a follow-up. If you'd normally write a list, say the "
-        "items as a spoken sentence instead (\"a few options: X, Y, or Z\")."
+        "This message came in through a live FaceTime voice call. Your reply is read aloud by "
+        "text-to-speech to a person waiting in silence on the line RIGHT NOW.\n\n"
+        "HARD LIMIT: at most 2 sentences, under 25 words total. This is not a style preference, "
+        "it is a limit. Every word costs the caller real seconds of waiting -- a 45-word answer "
+        "takes nearly half a minute to speak, which was measured on a real call and is far too "
+        "long to sit through.\n\n"
+        "Never introduce yourself at length, never list your capabilities, never explain what you "
+        "could do -- answer the actual question and stop. If asked something open-ended like "
+        "\"what can you do\", give ONE short example and ask what they need, rather than "
+        "enumerating. If you'd normally write a list, name at most two items in a spoken sentence.\n\n"
+        "Talk like a person on the phone: contractions, short sentences, no markdown, no bullet "
+        "points, no headers. You can always say more if they ask a follow-up -- so say less now."
     ) if voice_mode else None
 
     # Grace-exclusive relationship-state tone shaping (Step 3 of the
@@ -8908,7 +8913,13 @@ def relay(message_text, context="", image_path=None, apple_id=None, tier="main",
     # needs more room gets cut off mid-thought instead of finishing --
     # raise this back up (100 -> 150 -> 300) if that starts happening in
     # real calls.
-    reply_max_tokens = 100 if voice_mode else 1000
+    # 60 tokens is roughly 45 spoken words -- already at the top of what a
+    # caller will tolerate. LOWERED from 100 after a live call produced a
+    # 45-word reply that took 27.66 SECONDS to speak aloud (measured, see
+    # the LATENCY line in curant-facetime-answerer.py's logs). The prompt
+    # above asks for brevity; this makes it structural, because a prompt
+    # asking for two sentences was observed producing four.
+    reply_max_tokens = 60 if voice_mode else 1000
     try:
         if available_tools:
             if voice_mode and on_stream_chunk is not None:
