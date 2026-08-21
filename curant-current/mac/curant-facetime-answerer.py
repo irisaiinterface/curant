@@ -144,6 +144,7 @@ import sys
 import tempfile
 import threading
 import time
+import math
 import re
 import shutil  # module-level now -- a later LOCAL 'import shutil' inside
                      # handle_call() would make every 'shutil' reference in that whole function
@@ -163,29 +164,35 @@ def _ts():
 CONFIG_PATH = os.path.expanduser("~/.curant/config.json")
 
 CALL_POLL_INTERVAL_SECONDS = 2
-TURN_RECORD_SECONDS = 3          # length of each caller-audio recording chunk -- RAISED back from 2
-                                  # to 3 (2026-08-20), reverting the latency-pass drop to 2. Real bug
-                                  # found live the moment audio capture actually started working (the
-                                  # Multi-Output Device fix): a single spoken word ("hello") landed in
-                                  # one 2s segment with RMS well above the silence threshold -- genuine,
-                                  # audible speech -- and still came back with an empty transcript.
-                                  # This is a fixed-window chunk boundary, not real VAD endpointing, so
-                                  # a short utterance starting or ending close to either edge of a 2s
-                                  # window has very little margin left for Gemini to work with. 3s was
-                                  # the last confirmed-working value before the latency pass touched
-                                  # this; going back to it trades a bit of the fixed per-turn floor for
-                                  # actually hearing short utterances reliably, which matters more than
-                                  # shaving ~1s once every turn was silently failing to transcribe.
-# (2026-08-08, latency pass): this is the single biggest structural
-# latency source in the whole call loop -- turns are fixed-length
-# windows, not silence-triggered, so the caller waits up to this many
-# seconds AFTER they finish talking before transcription even starts.
-# 3s still comfortably covers a normal short conversational turn (a
-# few words to a sentence -- the reply-brevity instruction in
-# curant-cli's voice_mode already pushes both sides toward short
-# turns); a genuinely long utterance still gets split across multiple
-# turns same as before, just at a shorter boundary. Real tradeoff, not
-# hidden: going lower than this risks cutting off mid-word more often.
+TURN_RECORD_SECONDS = 1.0
+# LOWERED 3.0 -> 1.0 (2026-08-21 latency pass). This is safe ONLY
+# because _UtteranceBuffer now exists, and it changes what this
+# constant even means.
+#
+# BEFORE endpointing, this was a TURN boundary: whatever landed in one
+# window was transcribed alone, so a short window sliced words in half
+# and produced empty transcripts (that's why it went 5 -> 3 -> 2 -> and
+# back to 3 over three separate sessions -- each move traded latency
+# against accuracy, and no value could win both).
+#
+# NOW it is only the ENDPOINTING GRANULARITY. Consecutive speech
+# segments are concatenated into one utterance before transcription
+# (see _UtteranceBuffer), so a word split across a boundary is
+# rejoined before Gemini ever sees it -- segment length no longer
+# affects transcription quality at all. What it DOES affect is how
+# fast a pause is noticed, and that was the single largest remaining
+# source of dead air in the whole call:
+#
+#   at 3.0s: caller stops -> up to 3s to close the in-flight segment
+#            -> another 3s for a silent segment to confirm the pause
+#            => ~4.5-6.0s of silence before transcription even starts
+#   at 1.0s: ~0.5s to close + 1.0s to confirm
+#            => ~1.5-2.0s
+#
+# ~3-4 seconds saved on every single turn, with no accuracy tradeoff,
+# which is why this is a different decision from the earlier attempts
+# rather than a repeat of one. Cost is more (smaller) files and more
+# per-segment RMS checks -- both cheap, in-memory, no extra API calls.
 RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state after a failed recording
 
 # Real bug fixed live: "sometimes the call cuts, and it still thinks
@@ -212,7 +219,16 @@ RECORDING_FAILURE_RETRY_SECONDS = 1  # brief pause before re-checking call state
 # consecutive turns means there's no real audio source at all anymore
 # -- either the call ended, or was never a real call to begin with.
 TRUE_SILENCE_RMS_THRESHOLD = 1.0  # at/below this = no real audio source, not just a quiet room
-HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS = 6  # ~6 turns at TURN_RECORD_SECONDS=3s each = ~18s of true silence
+# TIME-BASED, not a raw segment count. It used to be a hardcoded "6
+# turns", which silently meant ~18s at 3s segments -- and would have
+# meant ~6s once segments dropped to 1s, i.e. hanging up on anyone who
+# paused to think for six seconds. Expressing the real intent (how
+# long of TRUE digital silence proves there's no call anymore) in
+# seconds and deriving the count keeps this correct no matter what
+# TURN_RECORD_SECONDS becomes later.
+HANGUP_TRUE_SILENCE_SECONDS = 18.0
+HANGUP_CONSECUTIVE_TRUE_SILENT_TURNS = max(
+    3, int(math.ceil(HANGUP_TRUE_SILENCE_SECONDS / TURN_RECORD_SECONDS)))
 
 # NOTE: there is deliberately no MAX_CALL_TURNS anymore. Per explicit
 # direction, Curant must never be the one to end a call — only the human
@@ -1401,7 +1417,7 @@ SPEAK_INTERRUPT_POLL_SECONDS = 0.2  # how often speak() checks interrupt_check()
 SPEAK_MAX_SECONDS = 60  # hard backstop so a stuck playback process can't hang the call forever
 
 
-def speak(text, device_name=None, interrupt_check=None):
+def speak(text, device_name=None, interrupt_check=None, prerendered_aiff=None):
     """Same free, local 'standard' tier as curant-watcher.py's
     _tts_macos_say — generates speech and plays it into BlackHole 2ch so
     FaceTime picks it up as the caller-facing "microphone" (see
@@ -1448,13 +1464,24 @@ def speak(text, device_name=None, interrupt_check=None):
     greeting) this just polls in a tight loop until it finishes on its
     own, same effective behavior as the old blocking call.
 
+    prerendered_aiff, if given and still present on disk, skips the
+    `say` synthesis step entirely and plays that file instead. Used for
+    fixed, known-in-advance lines (the greeting) so their audio is
+    generated once at startup rather than re-synthesized while a caller
+    is already connected and waiting -- see GREETING_TEXT.
+
     Returns True if playback was interrupted, False if it played to
     completion (or interrupt_check was never given)."""
-    fd, aiff_path = tempfile.mkstemp(suffix=".aiff")
-    os.close(fd)
+    reuse = bool(prerendered_aiff) and os.path.exists(prerendered_aiff)
+    if reuse:
+        aiff_path = prerendered_aiff
+    else:
+        fd, aiff_path = tempfile.mkstemp(suffix=".aiff")
+        os.close(fd)
     interrupted = False
     try:
-        subprocess.run(["say", "-v", TTS_VOICE, "-o", aiff_path, text], check=True, timeout=30)
+        if not reuse:
+            subprocess.run(["say", "-v", TTS_VOICE, "-o", aiff_path, text], check=True, timeout=30)
         # `say` exits 0 and produces a well-formed but near-empty AIFF on
         # this failure mode -- no exception to catch. Bytes-per-character
         # is a crude but effective tripwire: a real sentence runs roughly
@@ -1496,9 +1523,56 @@ def speak(text, device_name=None, interrupt_check=None):
                 break
             time.sleep(SPEAK_INTERRUPT_POLL_SECONDS)
     finally:
-        if os.path.exists(aiff_path):
+        # NEVER delete a pre-rendered file -- it's a cache owned by the
+        # caller and reused for the life of the process. Only temp files
+        # this call created are cleaned up here.
+        if not reuse and os.path.exists(aiff_path):
             os.remove(aiff_path)
     return interrupted
+
+
+GREETING_TEXT = "Hi, this is Curant. I'm listening."
+_GREETING_AIFF = None
+
+
+def prerender_greeting():
+    """Synthesizes the fixed greeting ONCE, at startup, so answering a
+    call doesn't pay for TTS synthesis while the caller is already on
+    the line.
+
+    The greeting is the only line in the whole call that is known ahead
+    of time, and it sits at the most latency-sensitive moment there is:
+    the caller has just been connected and is listening to silence.
+    `say` synthesis of this sentence measured ~112KB of AIFF and takes
+    a few hundred milliseconds -- small in isolation, but it is pure
+    dead air at the exact moment a human decides whether the thing that
+    picked up is broken.
+
+    Best-effort: on any failure this returns None and speak() falls
+    back to synthesizing normally, so a broken cache can never stop a
+    call from being greeted."""
+    global _GREETING_AIFF
+    try:
+        fd, path = tempfile.mkstemp(prefix="curant_greeting_", suffix=".aiff")
+        os.close(fd)
+        subprocess.run(["say", "-v", TTS_VOICE, "-o", path, GREETING_TEXT],
+                       check=True, timeout=30)
+        size = os.path.getsize(path)
+        if size < max(2000, len(GREETING_TEXT) * 200):
+            # Same near-empty-AIFF tripwire speak() uses -- catching it
+            # here means a broken voice is reported once at startup
+            # instead of once per call.
+            print(f"  WARNING: pre-rendered greeting looks near-empty ({size} bytes) for voice "
+                  f"{TTS_VOICE!r} -- not caching it; speak() will synthesize per call.",
+                  file=sys.stderr)
+            os.remove(path)
+            return None
+        _GREETING_AIFF = path
+        return path
+    except Exception as e:
+        print(f"  Could not pre-render the greeting ({e}) -- it will be synthesized per call.",
+              file=sys.stderr)
+        return None
 
 
 def record_caller_audio(seconds):
@@ -1527,11 +1601,15 @@ def record_caller_audio(seconds):
     return wav_path
 
 
-SEGMENT_WAIT_POLL_SECONDS = 0.2   # how often to check whether the next segment file has appeared --
-# LOWERED from 0.5 (latency pass): this is a cheap os.path.exists()
-# filesystem check, not a network call or subprocess spawn, so a
-# tighter interval costs essentially nothing. Averages out to ~0.1s of
-# pure added wait per turn instead of ~0.25s.
+SEGMENT_WAIT_POLL_SECONDS = 0.05  # how often to check whether the next segment file has appeared --
+# LOWERED 0.5 -> 0.2 -> 0.05 across successive latency passes. This is
+# a bare os.path.exists() on a local temp file: no network, no
+# subprocess, no API. At 1s segments this is now polled ~20x per
+# segment and still costs microseconds of CPU per check, while cutting
+# the average pure-wait overhead from ~0.1s to ~0.025s per turn. Small
+# on its own; it matters because it sits in series with every other
+# per-turn delay and there are now ~3x more segments per turn than
+# there were at 3s.
 SEGMENT_WAIT_TIMEOUT_SECONDS = 20  # give up waiting for a turn's segment after this long (should
                                     # normally appear within ~TURN_RECORD_SECONDS of the previous one)
 
@@ -1881,7 +1959,17 @@ def _is_quota_error(e):
 
 
 MAX_UTTERANCE_SECONDS = 15.0   # hard cap: flush and transcribe even if the caller hasn't paused
-UTTERANCE_TRAILING_SILENCE_SEGMENTS = 1  # how many silent segments end an utterance
+
+# How much trailing silence means "they're done talking, answer them".
+# Expressed in SECONDS and converted, so it stays a real duration if
+# TURN_RECORD_SECONDS changes again (it has changed four times now).
+# 0.8s is around the low end of natural conversational turn-taking:
+# long enough not to cut in on a brief mid-sentence breath, short
+# enough that Curant doesn't feel slow to start answering. At 1.0s
+# segments this rounds to a single silent segment.
+UTTERANCE_TRAILING_SILENCE_SECONDS = 0.8
+UTTERANCE_TRAILING_SILENCE_SEGMENTS = max(
+    1, int(round(UTTERANCE_TRAILING_SILENCE_SECONDS / TURN_RECORD_SECONDS)))
 
 
 def _concat_wavs(paths, out_path):
@@ -1937,12 +2025,40 @@ class _UtteranceBuffer:
         self.paths = []
         self.silent_run = 0
         self.seconds = 0.0
+        self._preroll = None  # most recent BELOW-threshold segment, kept as lead-in (see note_silence)
+        self._seq = 0         # monotonic, see _stash
+
+    def _stash(self, wav_path, tag):
+        # Names are keyed on a MONOTONIC counter, not len(self.paths).
+        # Caught by the pre-roll unit test: len(self.paths) stays 0
+        # while only pre-roll segments are arriving, so every stash
+        # produced the identical filename -- the new copy overwrote the
+        # old one and the "delete the previous pre-roll" step then
+        # deleted the file that had just been written, leaving nothing
+        # to prepend. Silent data loss, invisible in any log.
+        self._seq += 1
+        dest = os.path.join(self.dir, f"{tag}_{self._seq:05d}.wav")
+        shutil.copy2(wav_path, dest)
+        return dest
 
     def add_speech(self, wav_path, seconds):
         try:
-            dest = os.path.join(self.dir, f"part_{len(self.paths):05d}.wav")
-            shutil.copy2(wav_path, dest)
-            self.paths.append(dest)
+            # PRE-ROLL: the segment immediately before speech was
+            # detected gets prepended to the utterance. A segment is
+            # classified by its AVERAGE RMS over the whole window, so a
+            # word that begins in the last fraction of a segment can
+            # easily leave that segment's average below threshold --
+            # the segment reads "silent" and gets dropped, taking the
+            # word's onset with it. Transcription of a clip that starts
+            # mid-consonant is exactly the "real speech, empty
+            # transcript" failure this file has chased for days.
+            # Carrying one segment of lead-in costs one extra second of
+            # audio in the request and removes that whole failure mode.
+            if not self.paths and self._preroll is not None:
+                self.paths.append(self._preroll)
+                self.seconds += TURN_RECORD_SECONDS
+                self._preroll = None
+            self.paths.append(self._stash(wav_path, "part"))
             self.seconds += seconds or 0.0
             self.silent_run = 0
         except Exception as e:
@@ -1950,8 +2066,21 @@ class _UtteranceBuffer:
                   f"transcribing this segment alone instead.", file=sys.stderr)
             self.paths.append(wav_path)  # degrade gracefully rather than lose the audio
 
-    def note_silence(self):
+    def note_silence(self, wav_path=None):
         self.silent_run += 1
+        # Keep the newest silent segment as a candidate lead-in for
+        # speech that may start in the next one. Only meaningful while
+        # nothing is buffered yet -- mid-utterance silence is either
+        # a real pause (ends the utterance) or already surrounded by
+        # speech segments that were kept.
+        if wav_path is not None and not self.paths:
+            try:
+                old = self._preroll
+                self._preroll = self._stash(wav_path, "preroll")
+                if old and os.path.exists(old):
+                    os.remove(old)  # only ever keep ONE, so this can't grow unbounded
+            except Exception:
+                self._preroll = None
 
     def has_audio(self):
         return bool(self.paths)
@@ -1987,6 +2116,8 @@ class _UtteranceBuffer:
         self.paths = []
         self.silent_run = 0
         self.seconds = 0.0
+        self._preroll = None  # its file lived in the dir just removed
+        self._seq = 0
 
     def cleanup(self):
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -2558,7 +2689,7 @@ def handle_call(window_desc, apple_id, dry_run):
         return
     print(f"  [{_ts()}] Accepted: {detail}")
 
-    speak("Hi, this is Curant. I'm listening.")
+    speak(GREETING_TEXT, prerendered_aiff=_GREETING_AIFF)
     print(f"  [{_ts()}] Greeting playback finished.")
 
     # Per-call proof that the capture path works, run BEFORE the caller
@@ -2665,6 +2796,9 @@ def handle_call(window_desc, apple_id, dry_run):
         # docstring for the (confirmed-live) empty-transcript bug that
         # fixed-window-per-turn transcription caused.
         utterance = _UtteranceBuffer()
+        _turn_start = None  # set when a pause is detected; see the END-TO-END CLOCK note below.
+                            # Initialised here so the latency log can never raise NameError on a
+                            # path that reaches the reply block without going through a flush.
         while True:
             # REMOVED per explicit direction: no more _call_is_still_
             # connected() check here at all -- not once per turn, not
@@ -2783,8 +2917,9 @@ def handle_call(window_desc, apple_id, dry_run):
                         continue
                     print(f"  [{_ts()}] Utterance hit the {MAX_UTTERANCE_SECONDS:.0f}s cap -- "
                           f"transcribing what we have so far.")
+                    _turn_start = time.monotonic()
                 else:
-                    utterance.note_silence()
+                    utterance.note_silence(wav_path)
                     if not utterance.has_audio():
                         print(f"  [{_ts()}] Clip looked silent -- nothing buffered, still listening.")
                         continue
@@ -2792,6 +2927,14 @@ def handle_call(window_desc, apple_id, dry_run):
                         continue
                     print(f"  [{_ts()}] Caller paused -- transcribing {utterance.seconds:.1f}s "
                           f"of buffered speech ({len(utterance.paths)} segment(s)).")
+                # END-TO-END CLOCK starts the moment the pause is
+                # detected -- i.e. the moment the caller has finished
+                # talking and starts waiting. Every other timer in this
+                # loop measures one stage in isolation; this is the only
+                # number that corresponds to what the person on the
+                # phone actually experiences as "how long until it
+                # answered me".
+                _turn_start = time.monotonic()
                 # TIMED (2026-08-08, added per explicit request to make
                 # transcription/response faster): rather than guess at
                 # what's slow, measure the two real API round trips
@@ -2940,8 +3083,18 @@ def handle_call(window_desc, apple_id, dry_run):
             turn_index = watcher.resume_index()
             if reply:
                 _first_word_elapsed = (first_chunk_time[0] - _reply_start) if first_chunk_time[0] else _reply_elapsed
-                print(f"  [{_ts()}] Curant says: {reply} "
-                      f"(time to first words: {_first_word_elapsed:.2f}s, total: {_reply_elapsed:.2f}s)")
+                _e2e = (first_chunk_time[0] - _turn_start) if (first_chunk_time[0] and _turn_start) else None
+                _e2e_txt = f"{_e2e:.2f}s" if _e2e is not None else "n/a"
+                print(f"  [{_ts()}] Curant says: {reply}")
+                # Stage breakdown, printed every turn so a slow call can
+                # be attributed instead of guessed at: END-TO-END is
+                # what the caller feels; the rest says which stage owns
+                # it. hear = pause detection -> transcript in hand,
+                # think = transcript -> first token of the reply.
+                print(f"  [{_ts()}] LATENCY end-to-end {_e2e_txt} "
+                      f"(hear+transcribe {_transcribe_elapsed:.2f}s, "
+                      f"think->first words {_first_word_elapsed:.2f}s, "
+                      f"full reply {_reply_elapsed:.2f}s)")
             if interrupted_holder[0]:
                 print(f"  [{_ts()}] Reply playback interrupted by caller.")
                 pending_wav = watcher.found  # (raw_wav_path, mono_wav_path) — process next loop iteration
@@ -3026,6 +3179,8 @@ def main():
         # Report (never silently "fix") output-device configurations
         # known to make calls silent -- see audit_output_devices().
         audit_output_devices()
+        if prerender_greeting():
+            print("  Greeting audio pre-rendered once -- calls skip TTS synthesis on answer.")
         ok, detail = audio_capture_selftest()
         if ok:
             print(f"  Audio capture self-test: {detail}")
