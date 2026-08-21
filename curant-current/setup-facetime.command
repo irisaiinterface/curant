@@ -224,6 +224,50 @@ chmod +x "$BIN_DIR/curant-facetime-answerer.py"
 echo "    Installed."
 
 # ---------------------------------------------------------------------------
+# 6b. Build the ScreenCaptureKit audio tap.
+#
+#     This is what actually lets Curant HEAR the caller. The original
+#     design fed FaceTime's audio through a Multi-Output Device into
+#     BlackHole and recorded that virtual device -- which was disproven
+#     live: during a connected call, a test tone played into the system
+#     default output came back at RMS 5097 (capture path provably fine)
+#     while FaceTime's own audio measured exactly 0.0. FaceTime is a
+#     VoIP client and does not render call audio into the system default
+#     output device at all.
+#
+#     ScreenCaptureKit taps FaceTime's audio at the application level,
+#     wherever it goes, so device routing stops mattering. It reuses the
+#     Screen Recording permission this feature already needs for call
+#     detection, so there is no additional prompt. If the build fails,
+#     the answerer still runs and falls back to the old BlackHole path
+#     automatically -- degraded, not broken.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "==> Building the ScreenCaptureKit audio tap..."
+if ! command -v swiftc >/dev/null 2>&1; then
+    echo "    swiftc not found. Install Apple's command line tools with:"
+    echo "        xcode-select --install"
+    echo "    Then re-run this script. (Skipping for now -- Curant will fall back to the"
+    echo "    older BlackHole capture path, which is known to be unreliable with FaceTime.)"
+else
+    MACOS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
+    if [ "${MACOS_MAJOR:-0}" -lt 13 ]; then
+        echo "    macOS ${MACOS_MAJOR} detected -- ScreenCaptureKit audio capture needs macOS 13+."
+        echo "    Skipping; the BlackHole fallback will be used."
+    elif swiftc -O -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia \
+            -o "$BIN_DIR/curant-facetime-audiotap" \
+            "$SCRIPT_DIR/mac/curant-facetime-audiotap.swift" 2>/tmp/curant-audiotap-build.log; then
+        chmod +x "$BIN_DIR/curant-facetime-audiotap"
+        echo "    Built $BIN_DIR/curant-facetime-audiotap"
+        echo "    Hearing no longer depends on BlackHole or the Multi-Output Device."
+    else
+        echo "    Build FAILED -- see /tmp/curant-audiotap-build.log"
+        echo "    Curant will still run and fall back to the BlackHole capture path."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 7. Generate the launchd plist fresh for THIS Mac and THIS user. The
 #    one checked into the repo hardcodes the developer's own username
 #    and an Apple-Silicon-only path -- copying it as-is would silently

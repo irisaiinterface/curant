@@ -1673,6 +1673,110 @@ def _start_continuous_capture(seconds_per_segment):
     return process, segment_dir, pattern
 
 
+AUDIOTAP_BIN = os.path.expanduser("~/bin/curant-facetime-audiotap")
+AUDIOTAP_DISABLE_ENV = "CURANT_FACETIME_DISABLE_AUDIOTAP"
+AUDIOTAP_READY_TIMEOUT_SECONDS = 12
+
+
+def audiotap_available():
+    """True when the ScreenCaptureKit tap is built and not disabled.
+
+    Set CURANT_FACETIME_DISABLE_AUDIOTAP=1 to force the legacy
+    BlackHole/ffmpeg path (useful for A/B testing the two backends
+    against the same Mac)."""
+    if os.environ.get(AUDIOTAP_DISABLE_ENV) == "1":
+        return False
+    return os.path.isfile(AUDIOTAP_BIN) and os.access(AUDIOTAP_BIN, os.X_OK)
+
+
+def _start_audiotap_capture(seconds_per_segment):
+    """Captures FaceTime's audio via ScreenCaptureKit instead of via a
+    virtual output device.
+
+    WHY THIS REPLACED THE BLACKHOLE PATH -- the decisive measurement
+    (2026-08-21, live call): a test tone played into the system default
+    output was captured back from BlackHole 16ch at RMS 5097.5 DURING a
+    connected call, proving the capture path itself was working
+    perfectly at that exact moment, while FaceTime's own call audio in
+    the same window measured EXACTLY 0.0. Zero samples, not a low
+    level. The only reading consistent with both numbers is that
+    FaceTime never renders call audio into the system default output at
+    all -- it uses the OS communications audio path, which bypasses
+    aggregate/virtual devices. Every fix attempted against the old
+    model (rebuilding the Multi-Output Device, drift correction,
+    per-call vs startup switching, correcting the input device) failed
+    for that reason, and the few calls that appeared to work were
+    coincidence rather than the fix taking effect.
+
+    ScreenCaptureKit taps the APPLICATION's audio wherever it actually
+    goes, so device routing stops mattering entirely. It needs Screen
+    Recording permission, which this feature already requires for its
+    visual call detection -- so no new customer-facing permission.
+
+    The helper writes the same turn_%05d.wav layout the ffmpeg segment
+    muxer produced, already converted to 16kHz mono, so the entire turn
+    loop downstream is unchanged. It prints READY once capture is
+    actually live; we wait for that rather than assuming success,
+    because "started but silently captured nothing" is precisely the
+    failure this whole subsystem has been burned by.
+
+    Returns (process, segment_dir, pattern) -- same contract as
+    _start_continuous_capture()."""
+    segment_dir = tempfile.mkdtemp(prefix="curant_facetime_turns_")
+    pattern = os.path.join(segment_dir, "turn_%05d.wav")
+    proc = subprocess.Popen(
+        [AUDIOTAP_BIN, "--out-dir", segment_dir,
+         "--segment-seconds", str(seconds_per_segment)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    deadline = time.monotonic() + AUDIOTAP_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            err = ""
+            try:
+                err = (proc.stderr.read() or "").strip()
+            except Exception:
+                pass
+            shutil.rmtree(segment_dir, ignore_errors=True)
+            raise RuntimeError(f"audiotap exited immediately: {err[:400]}")
+        line = proc.stdout.readline() if proc.stdout else ""
+        if line.strip() == "READY":
+            return proc, segment_dir, pattern
+        if not line:
+            time.sleep(0.05)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    shutil.rmtree(segment_dir, ignore_errors=True)
+    raise RuntimeError(f"audiotap did not report READY within {AUDIOTAP_READY_TIMEOUT_SECONDS}s")
+
+
+def start_caller_capture(seconds_per_segment):
+    """Picks a capture backend and starts it.
+
+    ScreenCaptureKit first when it's built (see _start_audiotap_capture
+    for why it is strongly preferred), falling back to the legacy
+    BlackHole/ffmpeg path if the helper is missing, disabled, or fails
+    to come up. The fallback is deliberate rather than fatal: an
+    existing customer whose Multi-Output Device setup happens to work
+    should not be broken by a helper that failed to build, and the
+    fallback is loudly logged so a silent downgrade is impossible."""
+    if audiotap_available():
+        try:
+            proc, segment_dir, pattern = _start_audiotap_capture(seconds_per_segment)
+            print(f"  [{_ts()}] Capture backend: ScreenCaptureKit app tap (pid {proc.pid}) -- "
+                  f"device routing bypassed.")
+            return proc, segment_dir, pattern, "screencapturekit"
+        except Exception as e:
+            print(f"  [{_ts()}] ScreenCaptureKit tap failed to start ({e}) -- falling back to the "
+                  f"BlackHole/ffmpeg capture path.", file=sys.stderr)
+    proc, segment_dir, pattern = _start_continuous_capture(seconds_per_segment)
+    print(f"  [{_ts()}] Capture backend: BlackHole/ffmpeg (pid {proc.pid}) -- depends on FaceTime "
+          f"following the system default output device, which it has been observed NOT to do.")
+    return proc, segment_dir, pattern, "blackhole"
+
+
 def _stop_continuous_capture(process):
     """Best-effort clean shutdown of the persistent ffmpeg process
     started by _start_continuous_capture(). Never raises -- this runs on
@@ -2700,13 +2804,21 @@ def handle_call(window_desc, apple_id, dry_run):
     # startup: the system default output has been observed changing
     # out from under this process mid-session, so a pass at startup is
     # not a guarantee for a call minutes later.
-    _st_ok, _st_detail = audio_capture_selftest()
-    if _st_ok:
-        print(f"  [{_ts()}] Audio capture self-test: {_st_detail}")
-    else:
-        print(f"  [{_ts()}] AUDIO CAPTURE SELF-TEST FAILED: {_st_detail}. Every turn of this "
-              f"call will read as silent -- this is a routing/config problem, NOT the caller "
-              f"being quiet. See the startup log for the full checklist.", file=sys.stderr)
+    # The tone self-test only means anything for the BlackHole backend,
+    # where we capture a system output device that our own tone also
+    # plays into. The ScreenCaptureKit tap captures FACETIME's audio
+    # specifically and deliberately excludes this process's own output
+    # (excludesCurrentProcessAudio), so a tone played by Curant is
+    # CORRECTLY not captured -- running the test there would report a
+    # scary, meaningless failure on a perfectly healthy setup.
+    if not audiotap_available():
+        _st_ok, _st_detail = audio_capture_selftest()
+        if _st_ok:
+            print(f"  [{_ts()}] Audio capture self-test: {_st_detail}")
+        else:
+            print(f"  [{_ts()}] AUDIO CAPTURE SELF-TEST FAILED: {_st_detail}. Every turn of this "
+                  f"call will read as silent -- this is a routing/config problem, NOT the caller "
+                  f"being quiet. See the startup log for the full checklist.", file=sys.stderr)
 
     # Fast, direct hangup detection (see _watch_for_call_end()'s docstring
     # for why this is a separate throttled thread, not an inline check).
@@ -2771,7 +2883,7 @@ def handle_call(window_desc, apple_id, dry_run):
     utterance = None  # defined here, not just inside the try below, so the finally can always
                       # clean it up even if _start_continuous_capture() itself raises first
     try:
-        capture_process, segment_dir, pattern = _start_continuous_capture(TURN_RECORD_SECONDS)
+        capture_process, segment_dir, pattern, capture_backend = start_caller_capture(TURN_RECORD_SECONDS)
         print(f"  [{_ts()}] Started continuous caller-audio capture (pid {capture_process.pid}).")
 
         turn_index = 0
@@ -3166,22 +3278,59 @@ def main():
                   f"CURANT_FACETIME_SYSTEM_OUTPUT_DEVICE to a Multi-Output Device name (Audio MIDI "
                   f"Setup) that includes {CALLER_AUDIO_DEVICE!r} before expecting hearing to work.",
                   file=sys.stderr)
+        # INPUT is still switched to BlackHole 2ch on every backend:
+        # that is how Curant's spoken replies reach FaceTime, which
+        # reads the system input device as its "microphone". Nothing
+        # about ScreenCaptureKit changes the SPEAKING direction.
         if not set_system_input_device(TTS_OUTPUT_DEVICE):
             print("  System input device switch failed at startup -- calls will likely "
                   "not be heard by the caller.", file=sys.stderr)
-        if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
-            print("  System output device switch failed at startup -- calls will likely "
-                  "not be heard BY Curant.", file=sys.stderr)
-        print(f"  Switched system audio devices for the life of this process — "
-              f"input: {TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}. "
-              f"(Will NOT revert until this process exits -- your Mac's normal mic/speakers "
-              f"are unavailable for other things while this service is running.)")
+
+        # OUTPUT is only hijacked for the BlackHole capture path, which
+        # needs the Mac's default output to be a Multi-Output Device
+        # feeding BlackHole 16ch so that FaceTime's audio (in theory)
+        # lands somewhere capturable. The ScreenCaptureKit tap reads
+        # FaceTime's audio directly and does not care what the default
+        # output is -- so on that backend we leave the customer's real
+        # speakers completely alone. That removes the single worst
+        # tradeoff this feature had: previously the Mac's normal audio
+        # output was commandeered for the entire life of the service,
+        # not just during calls.
+        if audiotap_available():
+            print(f"  Switched system INPUT to {TTS_OUTPUT_DEVICE} (so FaceTime hears Curant). "
+                  f"System OUTPUT left untouched at {_ORIGINAL_OUTPUT_DEVICE!r} -- the "
+                  f"ScreenCaptureKit tap does not need it, so your speakers keep working "
+                  f"normally while this service runs.")
+        else:
+            if not set_system_output_device(SYSTEM_OUTPUT_DEVICE):
+                print("  System output device switch failed at startup -- calls will likely "
+                      "not be heard BY Curant.", file=sys.stderr)
+            print(f"  Switched system audio devices for the life of this process — "
+                  f"input: {TTS_OUTPUT_DEVICE}, output: {SYSTEM_OUTPUT_DEVICE}. "
+                  f"(Will NOT revert until this process exits -- your Mac's normal speakers "
+                  f"are unavailable for other things while this service is running. Building "
+                  f"the ScreenCaptureKit tap removes this tradeoff entirely.)")
         # Report (never silently "fix") output-device configurations
         # known to make calls silent -- see audit_output_devices().
-        audit_output_devices()
+        # Only relevant to the BlackHole path: the ScreenCaptureKit tap
+        # doesn't route through an output device at all, so stray
+        # Multi-Output devices are harmless there and warning about
+        # them would be noise.
+        if not audiotap_available():
+            audit_output_devices()
         if prerender_greeting():
             print("  Greeting audio pre-rendered once -- calls skip TTS synthesis on answer.")
-        ok, detail = audio_capture_selftest()
+        if audiotap_available():
+            print("  Capture backend: ScreenCaptureKit app tap (hearing does NOT depend on "
+                  "BlackHole, the Multi-Output Device, or the system default output).")
+            print("  Skipping the output-device tone self-test -- not meaningful for this "
+                  "backend, which taps FaceTime's own audio directly.")
+            ok, detail = True, "n/a (ScreenCaptureKit backend)"
+        else:
+            print(f"  Capture backend: BlackHole/ffmpeg. The ScreenCaptureKit tap is not built at "
+                  f"{AUDIOTAP_BIN} -- build it (see setup-facetime.command) to stop depending on "
+                  f"FaceTime following the system default output device.")
+            ok, detail = audio_capture_selftest()
         if ok:
             print(f"  Audio capture self-test: {detail}")
         else:

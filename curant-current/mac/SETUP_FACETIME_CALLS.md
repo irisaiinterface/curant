@@ -1,3 +1,64 @@
+## How Curant hears the caller (updated 2026-08-21)
+
+Curant now captures FaceTime's audio with **ScreenCaptureKit**, tapping
+the FaceTime application directly. It does **not** depend on BlackHole,
+a Multi-Output Device, or the system default output device for hearing.
+
+### Why this changed
+
+The original design routed FaceTime's audio into a Multi-Output Device
+that fed BlackHole 16ch, and recorded that virtual device. That was
+debugged over several nights and finally disproven with one decisive
+measurement during a live, connected call:
+
+- A test tone played into the system default output was captured back
+  at **RMS 5097.5** — the capture path was provably working, mid-call.
+- FaceTime's own call audio in that same window measured **exactly
+  0.0** — zero samples, not a low level.
+
+The only explanation consistent with both numbers is that FaceTime
+never renders call audio into the system default output device.
+It's a VoIP client using the OS communications audio path, which
+bypasses aggregate and virtual output devices. That is why rebuilding
+the Multi-Output Device, enabling drift correction, switching devices
+per-call vs. at startup, and correcting the input device all failed —
+and why a few calls appeared to work briefly (coincidence, not the fix
+taking effect).
+
+### What this means for setup
+
+- **BlackHole 2ch is still required.** It's how Curant *speaks* —
+  FaceTime reads the system input device as its microphone, so Curant's
+  replies are played into BlackHole 2ch. That direction never had a
+  problem.
+- **BlackHole 16ch and the "Curant Call Output" Multi-Output Device are
+  no longer needed for hearing.** They're only used if the
+  ScreenCaptureKit tap isn't built, as a fallback.
+- **Your Mac's speakers keep working.** Previously the service
+  commandeered the default output for its entire lifetime. With the tap,
+  only the *input* is switched.
+- **No new permission.** The tap uses Screen Recording, which this
+  feature already required for visual call detection.
+
+### Requirements
+
+- macOS 13 or newer
+- Apple command line tools (`xcode-select --install`) so `swiftc` exists
+
+`setup-facetime.command` builds the tap automatically. To check it's in
+use, look for this line in `/tmp/curant-facetime.log` at startup:
+
+```
+Capture backend: ScreenCaptureKit app tap (hearing does NOT depend on BlackHole...)
+```
+
+If you instead see `Capture backend: BlackHole/ffmpeg`, the tap wasn't
+built — check `/tmp/curant-audiotap-build.log`.
+
+To force the old backend for comparison, set
+`CURANT_FACETIME_DISABLE_AUDIOTAP=1` in the launchd plist.
+
+
 # Setting up FaceTime auto-answer calls (EXPERIMENTAL)
 
 **Most testers should run `setup-facetime.command`** (in the folder above
