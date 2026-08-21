@@ -2005,6 +2005,82 @@ SILENCE_RMS_THRESHOLD = 15.0  # int16 RMS units — RECALIBRATED from a real cal
 # the noise floor looks like on this specific Mac/setup.
 
 
+AGC_TARGET_RMS = 1500.0     # what a well-levelled speech clip should measure
+AGC_MAX_GAIN = 60.0         # hard ceiling -- see normalize_for_transcription()
+AGC_PEAK_CEILING = 0.95     # leave headroom so amplification can't clip and distort
+
+
+def normalize_for_transcription(wav_path, target_rms=AGC_TARGET_RMS,
+                                max_gain=AGC_MAX_GAIN):
+    """Boost (or attenuate) a clip toward a consistent speech level before
+    sending it for transcription. Returns a path to the adjusted file, or
+    the original path if no change was warranted or anything went wrong.
+
+    WHY THIS EXISTS. How loud the caller lands in BlackHole depends on
+    the system volume, FaceTime's own call volume, and the per-device
+    sliders inside the Multi-Output Device -- three settings that differ
+    on every Mac and that a customer can change at any time without
+    realising it affects Curant. Measured on the dev Mac: real, clearly
+    audible call speech arrived at RMS 15.5 against a silence threshold
+    of 15.0, a 3% margin, while the SAME voice recorded through the
+    built-in microphone measured 4060. Transcription quality and the
+    reliability of every downstream decision should not rest on whether
+    someone nudged a volume slider.
+
+    THE SAFETY PROPERTY, and it is the whole design. Gain is applied
+    ONLY to the copy handed to the transcription API. The silence gate
+    (_wav_has_speech) is deliberately still evaluated on the RAW,
+    un-boosted signal by the caller. That ordering is not incidental:
+    amplifying a silent clip by 60x would push noise floor above the
+    threshold, and a clip that reaches Gemini while containing no real
+    speech is exactly how "The weather is nice today" got invented from
+    a 0.0 RMS recording (see SILENCE_RMS_THRESHOLD's comment). Boosting
+    must never be able to promote silence into speech.
+
+    Gain is capped two ways: max_gain bounds how much noise can be
+    magnified even on a clip that legitimately passed the gate, and a
+    peak ceiling prevents amplification from clipping the waveform --
+    clipped audio transcribes worse than quiet audio, so overshooting
+    would defeat the purpose.
+    """
+    try:
+        import wave
+        import numpy as np
+        with wave.open(wav_path, "rb") as w:
+            if w.getsampwidth() != 2:
+                return wav_path  # only int16 is handled; leave anything else untouched
+            params = w.getparams()
+            frames = w.readframes(w.getnframes())
+        samples = np.frombuffer(frames, dtype=np.int16)
+        if samples.size == 0:
+            return wav_path
+        as_float = samples.astype(np.float64)
+        rms = float(np.sqrt(np.mean(as_float ** 2)))
+        peak = float(np.max(np.abs(as_float)))
+        if rms <= 0 or peak <= 0:
+            return wav_path
+
+        gain = target_rms / rms
+        # Never amplify past the point of clipping: whichever limit binds
+        # first wins.
+        gain = min(gain, (AGC_PEAK_CEILING * 32767.0) / peak, max_gain)
+        if 0.9 < gain < 1.1:
+            return wav_path  # already close enough; skip the rewrite
+
+        boosted = np.clip(as_float * gain, -32768, 32767).astype(np.int16)
+        out_path = wav_path[:-4] + "_agc.wav" if wav_path.endswith(".wav") else wav_path + "_agc.wav"
+        with wave.open(out_path, "wb") as w_out:
+            w_out.setparams(params)
+            w_out.writeframes(boosted.tobytes())
+        print(f"  [{_ts()}] AGC: RMS {rms:.1f} -> {rms * gain:.1f} (gain {gain:.1f}x)",
+              file=sys.stderr)
+        return out_path
+    except Exception as e:
+        print(f"  [{_ts()}] AGC skipped ({e}) -- transcribing the original clip.",
+              file=sys.stderr)
+        return wav_path
+
+
 def _wav_has_speech(wav_path, threshold=SILENCE_RMS_THRESHOLD):
     """Cheap voice-activity gate run BEFORE spending an API call on
     transcription. transcribe()'s Gemini prompt already asks for an
@@ -3093,6 +3169,7 @@ def handle_call(window_desc, apple_id, dry_run):
                 # whole thing, so a sentence that happens to straddle a
                 # segment boundary is no longer torn into two
                 # untranscribable fragments.
+                _agc_wav = None  # set only on the transcription path; the finally below checks it
                 try:
                     _seg_seconds = os.path.getsize(wav_path) / float(16000 * 2)
                 except Exception:
@@ -3132,8 +3209,13 @@ def handle_call(window_desc, apple_id, dry_run):
                 # timer on the reply side.
                 _transcribe_start = time.monotonic()
                 _utterance_wav = utterance.build() or wav_path
+                # Level-normalise ONLY the copy sent for transcription.
+                # The silence gate above already ran on the raw signal --
+                # see normalize_for_transcription()'s docstring for why
+                # that ordering is a safety property, not a detail.
+                _agc_wav = normalize_for_transcription(_utterance_wav)
                 try:
-                    text = transcribe_with_retry(_utterance_wav, cfg)
+                    text = transcribe_with_retry(_agc_wav, cfg)
                 except Exception as e:
                     # Real bug found live (2026-08-20): a transient
                     # Gemini "503 UNAVAILABLE -- high demand" error during
@@ -3179,6 +3261,8 @@ def handle_call(window_desc, apple_id, dry_run):
                         print(f"  [{_ts()}] Could not save failing clip (non-fatal): {e}",
                               file=sys.stderr)
             finally:
+                if _agc_wav and _agc_wav != _utterance_wav and os.path.exists(_agc_wav):
+                    os.remove(_agc_wav)
                 if os.path.exists(raw_wav_path):
                     os.remove(raw_wav_path)
                 if wav_path != raw_wav_path and os.path.exists(wav_path):
@@ -3363,12 +3447,15 @@ def main():
             print("return an empty string for it. This is precisely why the silence gate")
             print("exists and why it runs BEFORE transcription in the real turn loop.")
         t0 = time.monotonic()
+        agc_path = normalize_for_transcription(mono)
         try:
-            text = transcribe_with_retry(mono, cfg)
+            text = transcribe_with_retry(agc_path, cfg)
         except Exception as e:
             print(f"Transcription FAILED: {e}", file=sys.stderr)
             sys.exit(2)
         elapsed = time.monotonic() - t0
+        if agc_path != mono and os.path.exists(agc_path):
+            os.remove(agc_path)
         if mono != wav and os.path.exists(mono):
             os.remove(mono)
         if text:
