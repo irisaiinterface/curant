@@ -1,3 +1,55 @@
+## Multi-Output Device settings that actually matter (read this first)
+
+Curant hears the caller through a Multi-Output Device named
+**`Curant Call Output`** containing BlackHole 16ch. Three of its
+settings are non-obvious and each one silently breaks capture when
+wrong. All three were found by measurement on live calls, not from
+documentation.
+
+### 1. Primary Device must be **BlackHole 16ch**
+
+The primary device's volume scales the entire group, including the copy
+BlackHole receives. Same tone, same call, only this setting changed:
+
+| Primary Device | Captured RMS |
+|---|---|
+| MacBook Air Speakers | **3.5** (unusable) |
+| BlackHole 16ch | **2144.6** |
+
+BlackHole is also the best clock in the group: Internal Fixed, 48 kHz,
+unity gain, and it cannot drift the way a speaker or Bluetooth clock
+can.
+
+### 2. Sample Rate must be **48 kHz**, matching BlackHole
+
+A Bluetooth device as primary put the group at 44.1 kHz while BlackHole
+ran at 48 kHz. The result was **exactly 0.0 RMS** — not quiet, no
+signal at all — while a control tone through the same device measured
+5097. Several days of debugging went into what turned out to be this
+mismatch. It is completely silent: nothing logs an error.
+
+### 3. No Bluetooth devices in the group
+
+Bluetooth headphones reconnect at 44.1 kHz and take the group with them,
+recreating problem 2 at random. This is why calls "worked sometimes":
+capture succeeded exactly when the headphones happened to be
+disconnected.
+
+### Verifying it without placing a call
+
+Restart the service and read the self-test line:
+
+```
+launchctl bootout gui/$(id -u)/app.curant.facetime; sleep 3
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.curant.facetime.plist
+sleep 8; grep "self-test" /tmp/curant-facetime.log | tail -1
+```
+
+- **Thousands** — correct.
+- **Single/double digits** — the primary device is wrong, or its volume
+  is turned down.
+- **0.0** — sample-rate mismatch, or BlackHole isn't in the group.
+
 ## How Curant hears the caller — and the limits found (2026-08-21)
 
 **Current state: hearing the caller is UNRELIABLE on this macOS version.**
