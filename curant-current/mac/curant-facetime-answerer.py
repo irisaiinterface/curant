@@ -1179,11 +1179,31 @@ def caller_is_approved(window_desc, cfg):
         kind = _call_kind_from_ocr(ocr_text)
         return True, f"caller ID OCR matched configured handle {matched_handle} [{kind}]"
 
+    # Distinguish "wrong caller" from "we OCR'd the wrong thing entirely".
+    # Real incident: a Terminal window sitting in the caller-ID region
+    # while displaying Curant's own logs caused four consecutive calls to
+    # be refused. The OCR text contained the right number AND the words
+    # "FaceTime Audio" -- both read out of the log on screen, not out of
+    # the banner -- so no content-based heuristic could tell them apart.
+    # The tell is that the text is full of things a call banner never
+    # contains.
+    noise_markers = ("latency", "end-to-end", "curant-facetime", "transcribe",
+                     "zsh", "macbook-air", "% grep", "$ ", "~ %")
+    lowered = (ocr_text or "").lower()
+    hits = [mark for mark in noise_markers if mark in lowered]
+    screen_noise_hint = ""
+    if hits:
+        screen_noise_hint = (
+            f" NOTE: the OCR text contains {hits[:3]} -- that is terminal/log content, not a call "
+            f"banner. A window is covering the caller-ID region of the screen, so OCR is reading it "
+            f"instead of the banner. Move or minimise that window (it sits in the top-right area) "
+            f"and the call will verify normally. This is NOT a caller-approval problem."
+        )
     return False, (
         f"approved mode requires verifying the caller — OCR read the call banner but found no digit "
-        f"sequence matching any configured handle ({', '.join(customer_handles)}). Raw OCR text: "
-        f"{ocr_text!r}. This means either the caller genuinely isn't approved, OR (this is UNVERIFIED "
-        f"against a real call) the crop region needs tuning — set CURANT_FACETIME_CALLERID_REGION="
+        f"sequence matching any configured handle ({', '.join(customer_handles)}).{screen_noise_hint} "
+        f"Raw OCR text: {ocr_text!r}. This means either the caller genuinely isn't approved, OR the "
+        f"crop region needs tuning — set CURANT_FACETIME_CALLERID_REGION="
         f'"x0,x1,y0,y1" if the raw OCR text above looks like it missed the actual caller-ID text entirely.'
     )
 

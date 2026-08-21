@@ -1,3 +1,24 @@
+## Keep the top-right of the screen clear during calls
+
+Caller-ID verification works by screenshotting the top-right region of
+the screen and OCR'ing the FaceTime banner. **Any window sitting in that
+region gets read instead**, and the call is refused as unverified.
+
+This is not hypothetical: four consecutive calls were refused because a
+Terminal window there was displaying Curant's own log output. The OCR
+text contained both the correct phone number and the words "FaceTime
+Audio" — read out of the log, not the banner — so no amount of
+content-matching could distinguish it. The refusal message now detects
+terminal/log content and says so explicitly rather than reporting it as
+an unapproved caller.
+
+If calls are being refused, check `/tmp/curant-facetime.log` for
+`access check: REFUSED` and read the raw OCR text. If it looks like your
+screen rather than a call banner, move the offending window.
+
+`CURANT_FACETIME_CALLERID_REGION="x0,x1,y0,y1"` retunes the region if
+your setup needs a different one.
+
 ## Multi-Output Device settings that actually matter (read this first)
 
 Curant hears the caller through a Multi-Output Device named
