@@ -3286,7 +3286,68 @@ def main():
                           "(defaults to the configured customer_apple_id)")
     ap.add_argument("--dry-run", action="store_true",
                      help="Detect calls and log what would happen, but never click Accept or speak")
+    ap.add_argument("--transcribe-file", metavar="WAV", default=None,
+                     help="Transcribe one WAV through the exact production path and exit. "
+                          "Isolates the hear->transcribe stage from call capture entirely.")
+    ap.add_argument("--record-seconds", type=float, default=None, metavar="N",
+                     help="With --transcribe-file, first record N seconds from the given "
+                          "input device into that path (see --record-device).")
+    ap.add_argument("--record-device", default=None, metavar="NAME",
+                     help="Input device name to record from (default: the Mac's current "
+                          "system input). Use with --record-seconds.")
     args = ap.parse_args()
+
+    # ---- Isolated transcription test -------------------------------------
+    # Added because every FaceTime failure so far has been a CAPTURE
+    # failure, and capture failures and transcription failures produce
+    # identical-looking logs ("Clip looked silent" / empty transcript).
+    # This runs the same _wav_has_speech -> transcribe_with_retry path a
+    # real turn uses, on audio whose provenance is known, so the two can
+    # be told apart instead of guessed at.
+    if args.transcribe_file:
+        cfg = _load_config()
+        wav = os.path.expanduser(args.transcribe_file)
+        if args.record_seconds:
+            device = args.record_device or _get_current_device("input")
+            if not device:
+                print("Could not determine an input device to record from.", file=sys.stderr)
+                sys.exit(1)
+            idx = _find_avfoundation_audio_device_index(device)
+            if idx is None:
+                print(f"No avfoundation capture device named {device!r}.", file=sys.stderr)
+                sys.exit(1)
+            print(f"Recording {args.record_seconds}s from {device!r} -- speak now...")
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "avfoundation", "-i", f":{idx}",
+                 "-t", str(args.record_seconds), "-ar", "16000", "-ac", "1", wav],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            print(f"Recorded to {wav}")
+        if not os.path.exists(wav):
+            print(f"No such file: {wav}", file=sys.stderr)
+            sys.exit(1)
+
+        mono = _extract_loudest_channel_mono(wav)
+        has_speech, rms = _wav_has_speech(mono)
+        print(f"Silence gate: RMS={rms} threshold={SILENCE_RMS_THRESHOLD} -> "
+              f"{'HAS SPEECH' if has_speech else 'SILENT'}")
+        if not has_speech:
+            print("This clip would be SKIPPED by a real turn (never sent for transcription).")
+            print("If you can hear speech in it, the silence threshold is wrong for this audio.")
+        t0 = time.monotonic()
+        try:
+            text = transcribe_with_retry(mono, cfg)
+        except Exception as e:
+            print(f"Transcription FAILED: {e}", file=sys.stderr)
+            sys.exit(2)
+        elapsed = time.monotonic() - t0
+        if mono != wav and os.path.exists(mono):
+            os.remove(mono)
+        if text:
+            print(f"\nTRANSCRIPT ({elapsed:.2f}s): {text}")
+        else:
+            print(f"\nEMPTY TRANSCRIPT ({elapsed:.2f}s) -- audio reached the model, "
+                  f"which returned nothing. Listen to the file: afplay {wav}")
+        sys.exit(0)
 
     if sys.platform != "darwin":
         print("This must run on the Mac hosting FaceTime.", file=sys.stderr)
