@@ -1234,6 +1234,55 @@ def _get_current_device(device_type):
         return None
 
 
+PIN_OUTPUT_VOLUME = os.environ.get("CURANT_FACETIME_PIN_VOLUME", "1") == "1"
+
+
+def pin_output_volume(reason=""):
+    """Force the system output volume to maximum, and report what it was.
+
+    WHY: `Curant Call Output` is the system default output device, so the
+    Mac's ordinary volume control acts on it -- and therefore on the copy
+    of the call audio that BlackHole 16ch receives. That makes "can Curant
+    hear the caller" depend on the volume keys, which is indefensible: a
+    customer turning their Mac down to take a call in a quiet room would
+    silently disable the assistant, with no error anywhere.
+
+    Measured across consecutive identical self-tests on one machine with
+    nothing but volume changing: RMS 3.5, then 54.5, then 2144, then
+    2690. Same command, same device, three orders of magnitude apart.
+    That instability is what this removes.
+
+    Deliberately max rather than "restore what it was": the level reaching
+    BlackHole should be the highest available, and AGC
+    (normalize_for_transcription) handles the rest downstream. What the
+    HUMAN hears is set separately by the speakers' own slider inside the
+    Multi-Output group, which does not affect BlackHole's copy while
+    BlackHole is the group's primary device -- so this does not
+    necessarily mean loud speakers.
+
+    Best-effort and non-fatal: osascript failing must never stop a call
+    being answered. Disable with CURANT_FACETIME_PIN_VOLUME=0.
+    """
+    if not PIN_OUTPUT_VOLUME:
+        return None
+    try:
+        before = subprocess.run(
+            ["osascript", "-e", "output volume of (get volume settings)"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        subprocess.run(["osascript", "-e", "set volume output volume 100"],
+                       capture_output=True, text=True, timeout=5)
+        after = subprocess.run(
+            ["osascript", "-e", "output volume of (get volume settings)"],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+        if before != after:
+            print(f"  [{_ts()}] Pinned system output volume {before} -> {after}"
+                  f"{(' (' + reason + ')') if reason else ''} so capture level can't drift.")
+        return after
+    except Exception as e:
+        print(f"  [{_ts()}] Could not pin output volume ({e}) -- continuing.", file=sys.stderr)
+        return None
+
+
 def _list_output_devices():
     """All output device names known to CoreAudio, via SwitchAudioSource.
     Returns [] on failure -- callers treat an empty list as "couldn't
@@ -2979,6 +3028,12 @@ def handle_call(window_desc, apple_id, dry_run):
         return
     print(f"  [{_ts()}] Accepted: {detail}")
 
+    # Re-assert before every call: anything could have moved the volume
+    # since startup (the volume keys, another app, a Bluetooth device
+    # connecting). Cheap, and it removes a whole class of "worked
+    # yesterday" failures.
+    pin_output_volume("call start")
+
     speak(GREETING_TEXT, prerendered_aiff=_GREETING_AIFF)
     print(f"  [{_ts()}] Greeting playback finished.")
 
@@ -3436,6 +3491,9 @@ def main():
                           "(defaults to the configured customer_apple_id)")
     ap.add_argument("--dry-run", action="store_true",
                      help="Detect calls and log what would happen, but never click Accept or speak")
+    ap.add_argument("--listen", action="store_true",
+                     help="Live transcribe-only mode: capture continuously and print what is "
+                          "said, with timing, replying to nothing. Isolates hear->transcribe.")
     ap.add_argument("--transcribe-file", metavar="WAV", default=None,
                      help="Transcribe one WAV through the exact production path and exit. "
                           "Isolates the hear->transcribe stage from call capture entirely.")
@@ -3446,6 +3504,87 @@ def main():
                      help="Input device name to record from (default: the Mac's current "
                           "system input). Use with --record-seconds.")
     args = ap.parse_args()
+
+    # ---- Live transcribe-only mode ---------------------------------------
+    # No answering, no replying, no speaking -- just capture and print what
+    # was said, with per-stage timing. Two things this is for:
+    #   1. Tuning hear->transcribe latency without an LLM reply and TTS
+    #      playback sitting on top of the measurement.
+    #   2. Watching endpointing behave in real time -- whether utterances
+    #      are being cut short, merged, or flushed on the wrong pauses --
+    #      which is invisible when a reply immediately follows.
+    # Works during a real call, or against anything else playing through
+    # the capture device.
+    if args.listen:
+        cfg = _load_config()
+        pin_output_volume("listen mode")
+        print("Listening. Speak (or place a call and talk). Ctrl+C to stop.\n")
+        capture_process, segment_dir, pattern, backend = start_caller_capture(TURN_RECORD_SECONDS)
+        print(f"Capture backend: {backend}, segments every {TURN_RECORD_SECONDS}s\n")
+        utterance = _UtteranceBuffer()
+        turn_index = 0
+        heard = 0
+        try:
+            while True:
+                seg = _wait_for_next_turn_segment(pattern, turn_index)
+                if seg is None:
+                    continue
+                turn_index += 1
+                try:
+                    mono = _extract_loudest_channel_mono(seg)
+                except Exception:
+                    mono = seg
+                try:
+                    has_speech, rms = _wav_has_speech(mono)
+                    try:
+                        secs = os.path.getsize(mono) / float(16000 * 2)
+                    except Exception:
+                        secs = TURN_RECORD_SECONDS
+                    if has_speech:
+                        utterance.add_speech(mono, secs)
+                        if not utterance.should_flush():
+                            print(f"  ... buffering {utterance.seconds:.1f}s (RMS {rms:.0f})")
+                            continue
+                    else:
+                        utterance.note_silence(mono)
+                        if not utterance.has_audio() or not utterance.should_flush():
+                            continue
+                    t0 = time.monotonic()
+                    clip = utterance.build() or mono
+                    boosted = normalize_for_transcription(clip)
+                    try:
+                        text = transcribe_with_retry(boosted, cfg)
+                    except Exception as e:
+                        print(f"  transcription failed: {e}", file=sys.stderr)
+                        text = None
+                    elapsed = time.monotonic() - t0
+                    if boosted != clip and os.path.exists(boosted):
+                        os.remove(boosted)
+                    utterance.reset()
+                    if text:
+                        heard += 1
+                        print(f"[{heard}] ({elapsed:.2f}s)  {text}")
+                    else:
+                        print(f"     ({elapsed:.2f}s)  <empty transcript>")
+                finally:
+                    for p in (seg, mono):
+                        if p and os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        finally:
+            try:
+                utterance.cleanup()
+            except Exception:
+                pass
+            if capture_process is not None:
+                _stop_continuous_capture(capture_process)
+            if segment_dir:
+                shutil.rmtree(segment_dir, ignore_errors=True)
+        sys.exit(0)
 
     # ---- Isolated transcription test -------------------------------------
     # Added because every FaceTime failure so far has been a CAPTURE
@@ -3587,6 +3726,8 @@ def main():
                   f"(Will NOT revert until this process exits -- your Mac's normal speakers "
                   f"are unavailable for other things while this service is running. Building "
                   f"the ScreenCaptureKit tap removes this tradeoff entirely.)")
+        pin_output_volume("startup")
+
         # Report (never silently "fix") output-device configurations
         # known to make calls silent -- see audit_output_devices().
         # Only relevant to the BlackHole path: the ScreenCaptureKit tap
