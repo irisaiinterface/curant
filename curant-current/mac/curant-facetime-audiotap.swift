@@ -164,6 +164,8 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
     private var sawAnyAudio = false
     private var bufferCount = 0
     private var lastHeartbeat = Date()
+    private var peakSinceHeartbeat: Int = 0   // running max, NOT a spot sample -- see the heartbeat
+    private var peakAllTime: Int = 0
 
     init(writer: SegmentWriter, targetFormat: AVAudioFormat) {
         self.writer = writer
@@ -212,6 +214,23 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
                 + "\(pcm.format.channelCount)ch) -- ScreenCaptureKit IS delivering audio")
         }
         bufferCount += 1
+
+        // Track the RUNNING MAX between heartbeats, not the amplitude of
+        // whichever buffer happens to coincide with the heartbeat. The
+        // first version sampled only the latest buffer, which at ~50
+        // buffers/second means a short word could easily land between
+        // two heartbeats and be reported as silence -- turning a
+        // measurement meant to settle the question into one that could
+        // manufacture a false negative.
+        if let ch = out.int16ChannelData {
+            var peak: Int = 0
+            for i in 0..<Int(out.frameLength) {
+                peak = max(peak, abs(Int(ch[0][i])))
+            }
+            peakSinceHeartbeat = max(peakSinceHeartbeat, peak)
+            peakAllTime = max(peakAllTime, peak)
+        }
+
         // Periodic proof-of-life. Without this, "the tap is running but
         // the OS is sending it nothing" and "the tap is receiving audio
         // that happens to be silent" look identical from outside, which
@@ -219,13 +238,9 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
         // expensive to debug.
         if Date().timeIntervalSince(lastHeartbeat) >= 5.0 {
             lastHeartbeat = Date()
-            var peak: Float = 0
-            if let ch = out.int16ChannelData {
-                for i in 0..<Int(out.frameLength) {
-                    peak = max(peak, abs(Float(ch[0][i])))
-                }
-            }
-            log("heartbeat: \(bufferCount) buffers so far, latest peak amplitude \(Int(peak))")
+            log("heartbeat: \(bufferCount) buffers, peak since last heartbeat "
+                + "\(peakSinceHeartbeat), peak all-time \(peakAllTime)")
+            peakSinceHeartbeat = 0
         }
 
         do {
@@ -380,8 +395,13 @@ Task {
 
         // If nothing arrives at all, say so plainly rather than leaving
         // the caller to infer it from an absence of log lines.
+        // nonisolated(unsafe) is deliberate and safe here: warnIfNoAudioYet()
+        // only reads a Bool that the audio callback sets once and never
+        // clears. Without it the compiler warns about capturing a
+        // non-Sendable class in a @Sendable closure.
+        nonisolated(unsafe) let tapRef = tap
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-            tap.warnIfNoAudioYet()
+            tapRef.warnIfNoAudioYet()
         }
     } catch {
         fail("could not start capture: \(error.localizedDescription)")
