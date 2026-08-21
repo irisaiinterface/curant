@@ -58,6 +58,7 @@
 // Prints READY on stdout once the tap is running.
 
 import Foundation
+import AppKit          // NSWorkspace, for bundle id -> pid
 import AVFoundation
 import CoreAudio
 import AudioToolbox
@@ -423,8 +424,9 @@ if probeMode {
             log("Core Audio process taps DO expose FaceTime call audio. This is the")
             log("capture backend to use; wire it into curant-facetime-answerer.py.")
         }
-        log("Control: run this against a music player's bundle id to confirm the")
-        log("pipeline itself works, e.g. --bundle-id com.apple.Music --probe")
+        log("Control: run this against a music player to confirm the pipeline")
+        log("itself works -- e.g. --bundle-id com.spotify.client --probe (Spotify)")
+        log("or --bundle-id com.apple.Music --probe, with audio actually playing.")
         teardown()
         exit(saw && peak > 2 ? 0 : 3)
     }
