@@ -2462,6 +2462,99 @@ class _UtteranceBuffer:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+LOCAL_WHISPER_MODEL_NAME = os.environ.get("CURANT_FACETIME_WHISPER_MODEL", "base.en")
+TRANSCRIBE_BACKEND_ENV = "CURANT_FACETIME_TRANSCRIBE"   # local | cloud | auto (default)
+_WHISPER_MODEL = None
+_WHISPER_UNAVAILABLE = False
+
+
+def preload_local_whisper():
+    """Load the Whisper model ONCE, at startup, and keep it in memory.
+
+    Loading is the expensive part (seconds); transcribing with an
+    already-loaded model is fast. Doing it lazily on the first turn would
+    put that entire cost on the first thing the caller says, which is the
+    worst possible moment -- so it happens before any call arrives.
+
+    Returns True if a model is ready. Never raises: if whisper isn't
+    installed, transcription falls back to the cloud path.
+    """
+    global _WHISPER_MODEL, _WHISPER_UNAVAILABLE
+    if _WHISPER_MODEL is not None:
+        return True
+    if _WHISPER_UNAVAILABLE:
+        return False
+    try:
+        t0 = time.monotonic()
+        import whisper  # noqa: F401  (lazy -- same pattern curant-watcher.py uses)
+        _WHISPER_MODEL = whisper.load_model(LOCAL_WHISPER_MODEL_NAME)
+        print(f"  Local Whisper model {LOCAL_WHISPER_MODEL_NAME!r} loaded in "
+              f"{time.monotonic() - t0:.1f}s -- transcription runs on this Mac, "
+              f"no network round trip.")
+        return True
+    except Exception as e:
+        _WHISPER_UNAVAILABLE = True
+        print(f"  Local Whisper unavailable ({e}). Falling back to cloud transcription, "
+              f"which measured 2.6-13.2s per turn on this Mac. Install it with: "
+              f"pip3 install openai-whisper --break-system-packages",
+              file=sys.stderr)
+        return False
+
+
+def _transcribe_local_whisper(wav_path):
+    """Transcribe with the preloaded local model. Returns text, or None if
+    the model isn't available (caller falls back to cloud)."""
+    if not preload_local_whisper():
+        return None
+    try:
+        result = _WHISPER_MODEL.transcribe(
+            wav_path,
+            fp16=False,          # CPU/MPS-safe; avoids a noisy warning on Apple Silicon
+            language="en",
+            condition_on_previous_text=False,  # each utterance is independent -- stops the model
+                                               # carrying hallucinated context between turns
+        )
+        return (result.get("text") or "").strip()
+    except Exception as e:
+        print(f"  [{_ts()}] Local Whisper failed ({e}) -- falling back to cloud.", file=sys.stderr)
+        return None
+
+
+def transcribe_fast(wav_path, cfg):
+    """Transcription for LIVE CALLS specifically, preferring local Whisper.
+
+    WHY THIS EXISTS, measured rather than assumed. Cloud transcription of
+    call audio on this Mac, timed per utterance in --listen mode:
+
+        5.63s, 13.18s, 2.58s, 2.88s, 7.04s, 8.26s   (mean ~6.6s)
+
+    Two separate problems with that, and the second is worse than the
+    first. It's slow, obviously. But it also BLOCKS the capture loop:
+    while a 13-second transcription is in flight, segments pile up on
+    disk and are then processed in a burst -- a dozen segments in 24
+    milliseconds was observed -- so endpointing decisions get made on
+    stale audio and utterances come out merged or garbled ("are wah",
+    "Hey, hello can you hear me? What?"). Latency was corrupting
+    accuracy, not just delaying it.
+
+    Local Whisper removes the network entirely: no variance, no
+    rate limits, no cost, and it keeps call audio on the customer's own
+    machine, which matches what Curant promises everywhere else.
+
+    Falls back to the cloud path automatically when the model isn't
+    installed, so nothing breaks on a Mac without it. Force either side
+    with CURANT_FACETIME_TRANSCRIBE=local|cloud.
+    """
+    mode = (os.environ.get(TRANSCRIBE_BACKEND_ENV) or "auto").lower()
+    if mode != "cloud":
+        text = _transcribe_local_whisper(wav_path)
+        if text is not None:
+            return text
+        if mode == "local":
+            raise RuntimeError("local transcription was forced but Whisper is unavailable")
+    return transcribe_with_retry(wav_path, cfg)
+
+
 def _is_transient_api_error(e):
     """Broader than _is_quota_error(): also catches the SERVER-side
     overload/availability failures that aren't about this account's
@@ -3315,7 +3408,7 @@ def handle_call(window_desc, apple_id, dry_run):
                 # that ordering is a safety property, not a detail.
                 _agc_wav = normalize_for_transcription(_utterance_wav)
                 try:
-                    text = transcribe_with_retry(_agc_wav, cfg)
+                    text = transcribe_fast(_agc_wav, cfg)
                 except Exception as e:
                     # Real bug found live (2026-08-20): a transient
                     # Gemini "503 UNAVAILABLE -- high demand" error during
@@ -3518,6 +3611,7 @@ def main():
     if args.listen:
         cfg = _load_config()
         pin_output_volume("listen mode")
+        preload_local_whisper()
         print("Listening. Speak (or place a call and talk). Ctrl+C to stop.\n")
         capture_process, segment_dir, pattern, backend = start_caller_capture(TURN_RECORD_SECONDS)
         print(f"Capture backend: {backend}, segments every {TURN_RECORD_SECONDS}s\n")
@@ -3553,7 +3647,7 @@ def main():
                     clip = utterance.build() or mono
                     boosted = normalize_for_transcription(clip)
                     try:
-                        text = transcribe_with_retry(boosted, cfg)
+                        text = transcribe_fast(boosted, cfg)
                     except Exception as e:
                         print(f"  transcription failed: {e}", file=sys.stderr)
                         text = None
@@ -3633,7 +3727,7 @@ def main():
         t0 = time.monotonic()
         agc_path = normalize_for_transcription(mono)
         try:
-            text = transcribe_with_retry(agc_path, cfg)
+            text = transcribe_fast(agc_path, cfg)
         except Exception as e:
             print(f"Transcription FAILED: {e}", file=sys.stderr)
             sys.exit(2)
@@ -3727,6 +3821,9 @@ def main():
                   f"are unavailable for other things while this service is running. Building "
                   f"the ScreenCaptureKit tap removes this tradeoff entirely.)")
         pin_output_volume("startup")
+        # Load the speech model before any caller is on the line -- see
+        # preload_local_whisper()'s docstring.
+        preload_local_whisper()
 
         # Report (never silently "fix") output-device configurations
         # known to make calls silent -- see audit_output_devices().

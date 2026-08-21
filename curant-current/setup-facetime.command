@@ -132,6 +132,23 @@ echo "    Done."
 echo ""
 echo "==> Installing required Python packages..."
 "$PY312" -m pip install --break-system-packages --quiet pillow numpy google-genai requests pytesseract
+
+# Local speech-to-text. This is what makes calls feel responsive rather
+# than laggy: cloud transcription of call audio measured 2.6-13.2s per
+# utterance on real hardware (mean ~6.6s) and, worse, blocked the capture
+# loop while it waited -- segments piled up and utterances came out
+# merged or garbled. Whisper runs on this Mac in a fraction of that, with
+# no network variance, no cost, and the caller's audio never leaves the
+# machine. The download is a few hundred MB and only happens once.
+echo ""
+echo "==> Installing local speech-to-text (openai-whisper)..."
+echo "    This is a large one-time download. Calls are much faster with it,"
+echo "    and the caller's audio never leaves this Mac."
+"$PY312" -m pip install --break-system-packages --quiet openai-whisper || {
+    echo "    Whisper install failed -- calls will fall back to cloud transcription,"
+    echo "    which works but is noticeably slower. You can retry later with:"
+    echo "        $PY312 -m pip install --break-system-packages openai-whisper"
+}
 echo "    Done."
 
 # ---------------------------------------------------------------------------
