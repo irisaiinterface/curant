@@ -169,6 +169,101 @@ DEAN_SHELL_ALLOWLIST = {
 # by the customer's own explicit choice.
 SHELL_METACHARACTERS = (";", "&", "|", "`", "$", ">", "<", "\n", "\r", "(", ")")
 
+# ── Catastrophic-command floor (applies in EVERY safety mode) ───────────────
+# Borrowed in spirit from macOS26/Agent, which hard-blocks `rm -rf /`,
+# `rm -rf ~`, `dd` to a raw disk, fork bombs and --no-preserve-root
+# regardless of mode. Curant's containment is already structurally
+# stronger than a blocklist (sandbox-exec denies writes outside the
+# workspace, credential reads, and network -- see
+# DEAN_SHELL_SANDBOX_DENIED_READS), so this is NOT the primary defence
+# and must not be mistaken for one.
+#
+# It exists to cover the one documented hole in that containment, stated
+# plainly in shell_exec's own docstring: "If sandbox-exec is unavailable
+# (non-macOS, or the profile is rejected) the command still runs, but the
+# output carries a visible warning." A warning does not stop `rm -rf ~`.
+# On a Mac where the profile is rejected -- which has NOT been ruled out,
+# since the docstring also admits the profile "has not yet been exercised
+# on real macOS hardware" -- autonomous mode would run it in full.
+#
+# Two deliberate improvements over a plain string blocklist:
+#
+#   1. MATCHING IS DONE ON A NORMALIZED FORM. Naive substring matching
+#      catches `rm -rf /` and misses `rm  -rf  /`, `rm -r -f /`,
+#      `rm "-rf" /`, and `rm -fr /`. Flags are parsed and combined, quotes
+#      are stripped, whitespace collapsed -- so the check is about what
+#      the command DOES, not how it happens to be spelled.
+#   2. IT APPLIES EVEN WHEN THE CUSTOMER CONFIRMS. That is the
+#      uncomfortable part and it is intentional. The confirmation flow is
+#      mediated by a model reading attacker-controllable content (an
+#      email, a web page, a repo README), and prompt injection is the
+#      exact threat these commands represent. A human who genuinely wants
+#      to wipe their home directory can open Terminal; nothing here
+#      prevents that. What this prevents is Curant being the instrument.
+CATASTROPHIC_COMMAND_RULES = (
+    # (command-head pattern, argument pattern, human description)
+    # All matched case-insensitively against the NORMALIZED command --
+    # see _normalize_shell_command. Case-insensitivity is load-bearing:
+    # an earlier version lowercased the command but left uppercase "R"
+    # and "HOME" in these patterns, so `chmod -R 000 /` and
+    # `rm -rf $HOME` both slipped straight through. Caught by the test
+    # table below this file's own rules, not in review.
+    (r"^rm\b.*(?:^|\s)-[a-z]*r[a-z]*f|^rm\b.*(?:^|\s)-[a-z]*f[a-z]*r",
+     r"(?:^|\s)(?:/|~|/\*|\$HOME|\$\{HOME\}|\$HOME/\*)(?:\s|$)",
+     "a recursive force-delete of / or your home directory"),
+    (r"^rm\b", r"--no-preserve-root", "rm with --no-preserve-root"),
+    (r"^dd\b", r"of=\s*/dev/r?disk|of=\s*/dev/sd", "dd writing directly to a raw disk device"),
+    (r"^(?:mkfs|newfs)", r".*", "a filesystem format"),
+    (r"^diskutil\b", r"erase(?:disk|volume)", "diskutil erasing a disk or volume"),
+    (r"^chmod\b", r"(?:^|\s)-[a-z]*r[a-z]*\s+0{3,4}\s+/(?:\s|$)", "chmod -R 000 on /"),
+    (r"^chown\b", r"(?:^|\s)-[a-z]*r[a-z]*\s+\S+\s+/(?:\s|$)", "a recursive chown of /"),
+    (r":\s*\(\s*\)", r"\{.*:\|:.*&.*\}", "a fork bomb"),
+    (r"^sudo\b", r".*", "sudo -- Curant never escalates privileges on your behalf"),
+    (r"^(?:shutdown|halt|reboot)\b", r".*", "shutting down or rebooting the machine"),
+)
+
+
+def _normalize_shell_command(command):
+    """Collapse a command to a canonical form for safety matching.
+
+    The point is to defeat spelling variations, not to be a shell parser:
+    quotes are removed so `rm "-rf" /` reads as `rm -rf /`, runs of
+    whitespace collapse, and separate short flags are merged so
+    `rm -r -f /` reads the same as `rm -rf /`. Anything unparseable falls
+    back to a whitespace-collapsed lowercase string rather than being
+    treated as safe -- failing OPEN here would defeat the entire check.
+    """
+    text = (command or "").strip()
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return re.sub(r"\s+", " ", text)
+    if not parts:
+        return ""
+    head = [parts[0]]
+    short_flags = ""
+    rest = []
+    for arg in parts[1:]:
+        if re.fullmatch(r"-[A-Za-z]+", arg):
+            short_flags += arg[1:]
+        else:
+            rest.append(arg)
+    merged = head + ([f"-{short_flags}"] if short_flags else []) + rest
+    return re.sub(r"\s+", " ", " ".join(merged)).strip()
+
+
+def is_catastrophic_command(command):
+    """(blocked: bool, human_reason: str). See CATASTROPHIC_COMMAND_RULES."""
+    normalized = _normalize_shell_command(command)
+    if not normalized:
+        return False, ""
+    for head_pattern, arg_pattern, description in CATASTROPHIC_COMMAND_RULES:
+        if (re.search(head_pattern, normalized, re.IGNORECASE)
+                and re.search(arg_pattern, normalized, re.IGNORECASE)):
+            return True, description
+    return False, ""
+
+
 # ── OS-level containment for shell_exec (macOS) ──────────────────────────────
 # The Aug 2026 audit's finding #3 was that the "sandbox" was only a working
 # directory: in confirm/autonomous mode a command could still write anywhere
@@ -5039,6 +5134,20 @@ def shell_exec(command: str, cwd: str | None, confirmed: bool, config: dict) -> 
     run at all (blocked by safety mode, or a real subprocess failure).
     """
     os.makedirs(DEAN_SHELL_WORKSPACE, exist_ok=True)
+
+    # Checked BEFORE mode dispatch, so it applies identically in
+    # confirm, allowlist and autonomous -- including when the customer
+    # has already confirmed. See CATASTROPHIC_COMMAND_RULES for why a
+    # confirmation is not treated as sufficient here.
+    catastrophic, why = is_catastrophic_command(command)
+    if catastrophic:
+        return None, (
+            f"Refused, and this one is not negotiable: `{command}` is {why}. Curant will not "
+            f"run this in any safety mode, confirmed or not, because the request to run it can "
+            f"come from content Curant was asked to read rather than from the customer. If the "
+            f"customer genuinely wants this, they can run it themselves in Terminal. Tell them "
+            f"that plainly rather than looking for a way around it."
+        )
 
     mode = get_shell_safety_mode(config)
     if mode == "confirm" and not confirmed:
