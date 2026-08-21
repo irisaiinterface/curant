@@ -1353,10 +1353,13 @@ def audio_capture_selftest():
         )
         time.sleep(0.45)  # let avfoundation actually open the device before the tone starts
         if _sox_available():
+            # timeout LOWERED 10 -> 4: sox was observed hanging outright on a
+            # Multi-Output Device, and a diagnostic that can block for ten
+            # seconds is worse than one that gives up and says so.
             subprocess.run(
                 ["sox", "-n", "-t", "coreaudio", SYSTEM_OUTPUT_DEVICE,
                  "synth", str(AUDIO_SELFTEST_TONE_SECONDS), "sine", "440", "vol", "0.35"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4,
             )
         else:
             subprocess.run(["afplay", "/System/Library/Sounds/Ping.aiff"],
@@ -2994,7 +2997,18 @@ def handle_call(window_desc, apple_id, dry_run):
     # (excludesCurrentProcessAudio), so a tone played by Curant is
     # CORRECTLY not captured -- running the test there would report a
     # scary, meaningless failure on a perfectly healthy setup.
-    if not audiotap_available():
+    # REMOVED from the per-call path (2026-08-21). This used to run here,
+    # right after the greeting, and it was a real latency bug: the test
+    # plays a tone and waits for it, and sox was observed HANGING on the
+    # Multi-Output Device and hitting its 10s timeout -- ten seconds of
+    # dead air injected at the single worst moment, immediately after
+    # the caller has been greeted and is waiting to speak.
+    #
+    # The startup self-test (see main()) already answers the question
+    # this was asking, and answers it before any caller is on the line.
+    # Set CURANT_FACETIME_PERCALL_SELFTEST=1 to re-enable per-call
+    # testing while diagnosing a Mac where routing changes mid-session.
+    if os.environ.get("CURANT_FACETIME_PERCALL_SELFTEST") == "1" and not audiotap_available():
         _st_ok, _st_detail = audio_capture_selftest()
         if _st_ok:
             print(f"  [{_ts()}] Audio capture self-test: {_st_detail}")
