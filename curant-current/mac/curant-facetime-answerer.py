@@ -1969,6 +1969,27 @@ def _extract_loudest_channel_mono(multi_channel_path):
 
 
 SILENCE_RMS_THRESHOLD = 15.0  # int16 RMS units — RECALIBRATED from a real call, see below
+# WHY THIS GATE IS LOAD-BEARING, not a nice-to-have optimisation.
+# Proven live (2026-08-21): a capture measuring EXACTLY 0.0 RMS -- digital
+# silence, zero signal on every channel -- was sent to Gemini as an
+# experiment and came back with the confident, fully-formed transcript
+# "The weather is nice today." The caller had said nothing whatsoever.
+# The model hallucinates plausible speech out of silence even though
+# _transcribe_gemini's prompt explicitly instructs it to return an empty
+# string when there is no discernible speech.
+#
+# The consequence if this gate were removed or set too low: Curant would
+# answer questions the caller never asked, in a voice call, confidently.
+# That is materially worse than saying nothing -- it is the single most
+# damaging failure mode this feature has. The gate is what makes it
+# structurally impossible rather than merely unlikely, because it runs
+# BEFORE the API call and a skipped clip cannot be hallucinated over.
+#
+# Raise this value if quiet-room noise starts triggering transcription.
+# Do NOT lower it below the observed true-silence floor to "catch more
+# speech" -- that trades a missed turn (recoverable: the caller repeats
+# themselves) for an invented one (not recoverable: Curant has already
+# said something wrong out loud).
 # CHANGED after real live data: this was originally 250.0, a guess made
 # before any real audio had ever actually been captured through this
 # pipeline. Once the Multi-Output Device fix got real signal flowing
@@ -3333,6 +3354,14 @@ def main():
         if not has_speech:
             print("This clip would be SKIPPED by a real turn (never sent for transcription).")
             print("If you can hear speech in it, the silence threshold is wrong for this audio.")
+            print("")
+            print("!! Transcribing it anyway, for diagnosis only. DO NOT TRUST THE RESULT. !!")
+            print("Confirmed live (2026-08-21): a clip measuring EXACTLY 0.0 RMS -- digital")
+            print("silence, no signal on any channel -- produced the confident transcript")
+            print("\"The weather is nice today.\" The caller had said nothing at all. Gemini")
+            print("hallucinates speech from silence despite being explicitly instructed to")
+            print("return an empty string for it. This is precisely why the silence gate")
+            print("exists and why it runs BEFORE transcription in the real turn loop.")
         t0 = time.monotonic()
         try:
             text = transcribe_with_retry(mono, cfg)
