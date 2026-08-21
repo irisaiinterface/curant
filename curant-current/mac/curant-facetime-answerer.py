@@ -146,6 +146,7 @@ import threading
 import time
 import math
 import re
+import random
 import shutil  # module-level now -- a later LOCAL 'import shutil' inside
                      # handle_call() would make every 'shutil' reference in that whole function
                      # resolve as local (Python scopes by static analysis of the function body),
@@ -1642,6 +1643,71 @@ def speak(text, device_name=None, interrupt_check=None, prerendered_aiff=None):
 
 GREETING_TEXT = "Hi, this is Curant. I'm listening."
 _GREETING_AIFF = None
+
+# --- Filler phrases during long "think" gaps ---
+# Added per explicit request ("add some kind of filler like hmm, or give
+# me a sec") once the LATENCY logging showed reply generation -- not
+# hearing -- was the dominant, and highly variable, cost per turn
+# (4.85s-28.47s "think->first words", see _call_gemini_with_tools_streaming's
+# new [voice-stream-timing] logging for why the worst cases are so much
+# slower: a tool-call turn currently pays for generation TWICE, once
+# streamed-then-discarded and once redone from scratch). Silence that
+# long reads as a dropped call, not a thinking assistant -- a short,
+# cheap phrase breaks that up without pretending to be a real answer.
+FILLER_PHRASES = [
+    "Mm, one sec.",
+    "Let me check.",
+    "Hmm, give me a moment.",
+    "One moment.",
+    "Let me see.",
+]
+FILLER_FIRST_DELAY_SECONDS = 1.4  # below this, most turns have already
+                                  # started replying for real -- a filler
+                                  # would just be a needless interruption
+FILLER_REPEAT_SECONDS = 4.5  # only reached on the genuinely slow turns;
+                             # a second filler is better than 20+ seconds
+                             # of dead air with only one "one sec" at the start
+
+
+class _FillerSpeaker:
+    """Speaks a short filler phrase into a live gap while the real reply
+    is still generating, WITHOUT needing a second, independent audio
+    path -- reuses speak()'s existing interrupt_check plumbing (built
+    for caller barge-in) so that the instant the real first sentence is
+    ready, this gets cut off exactly like a caller interrupting, rather
+    than needing new coordination logic. Runs in its own thread because
+    speak() blocks, and the main thread is itself blocked inside
+    get_reply_streaming() for the entire "think" duration this exists
+    to fill.
+
+    real_ready_event MUST be set by the caller (see handle_call's turn
+    loop) at the moment the first real sentence is about to be spoken,
+    BEFORE that real speak() call starts -- this is what both stops
+    this thread from starting another filler and tells any
+    already-in-progress filler playback to cut itself off. There is a
+    small unavoidable race (bounded by SPEAK_INTERRUPT_POLL_SECONDS,
+    0.2s) where both could be heard briefly overlapping; the same bound
+    already exists for real caller barge-in and hasn't been a problem
+    live.
+    """
+
+    def __init__(self, real_ready_event):
+        self.real_ready_event = real_ready_event
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def _run(self):
+        wait_for = FILLER_FIRST_DELAY_SECONDS
+        while not self.real_ready_event.wait(timeout=wait_for):
+            if self.real_ready_event.is_set():
+                return  # set between the timeout firing and this check
+            phrase = random.choice(FILLER_PHRASES)
+            print(f"  [{_ts()}] (reply still generating -- speaking filler: {phrase!r})",
+                  file=sys.stderr)
+            speak(phrase, interrupt_check=self.real_ready_event.is_set)
+            wait_for = FILLER_REPEAT_SECONDS
 
 
 def prerender_greeting():
@@ -3618,9 +3684,21 @@ def handle_call(window_desc, apple_id, dry_run):
             first_chunk_time = [None]  # list, not a plain var -- mutated from the nested callback below
             interrupted_holder = [False]
 
+            # Filler phrase support (see _FillerSpeaker's docstring):
+            # started unconditionally every turn -- it's a no-op past
+            # FILLER_FIRST_DELAY_SECONDS if the real reply is already
+            # underway by then, which is the common, fast case. Event is
+            # set the instant the real first sentence is about to play,
+            # which both stops any further filler and cuts off one
+            # already in progress via speak()'s existing interrupt_check.
+            _real_reply_ready = threading.Event()
+            _filler = _FillerSpeaker(_real_reply_ready)
+            _filler.start()
+
             def _speak_sentence(sentence):
                 if first_chunk_time[0] is None:
                     first_chunk_time[0] = time.monotonic()
+                _real_reply_ready.set()
                 if interrupted_holder[0]:
                     return  # already interrupted this turn -- don't keep speaking later sentences
                 sentences_spoken.append(sentence)
@@ -3653,6 +3731,11 @@ def handle_call(window_desc, apple_id, dry_run):
                         print(f"  [{_ts()}] Non-streaming reply also failed: {e2}", file=sys.stderr)
                         reply = None
             if reply is None and not sentences_spoken:
+                # Nothing was ever handed to _speak_sentence on this turn,
+                # so _real_reply_ready was never set -- do it here too,
+                # or the filler thread would keep firing "one sec" over
+                # and past this apology instead of stopping with it.
+                _real_reply_ready.set()
                 speak("Sorry, I ran into a problem there — could you say that again?",
                       interrupt_check=watcher.check)
 

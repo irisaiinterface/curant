@@ -6478,6 +6478,21 @@ def _call_gemini_with_tools_streaming(api_key, system_prompt, messages, max_toke
         system_instruction=system_prompt, max_output_tokens=max_tokens, tools=gemini_tools,
     )
 
+    # TIMING INSTRUMENTATION, added to confirm/measure a suspected cause
+    # of two anomalous live-call latencies (29.40s and 11.28s
+    # "think->first words", vs. 2.4-5.8s on turns that didn't need a
+    # tool): the suspicion is that a tool-call turn pays for the model's
+    # work TWICE -- once here (streamed, then thrown away the instant a
+    # function_call part is seen) and once more in the full
+    # _call_gemini_with_tools() fallback below, which re-sends the same
+    # conversation from scratch and re-runs the entire tool-calling loop
+    # non-streaming. Logged with a distinct [voice-stream-timing] tag
+    # (separate from the existing LATENCY line in
+    # curant-facetime-answerer.py) so a real call's stderr shows exactly
+    # how the "think" time splits between the discarded streamed attempt
+    # and the redo, rather than just the single combined total the
+    # LATENCY line already reports.
+    _stream_start = time.monotonic()
     text_parts = []
     saw_function_call = False
     stream = client.models.generate_content_stream(model=model, contents=conversation, config=config)
@@ -6491,12 +6506,24 @@ def _call_gemini_with_tools_streaming(api_key, system_prompt, messages, max_toke
             elif getattr(p, "text", None):
                 text_parts.append(p.text)
                 on_text_delta(p.text)
+    _stream_elapsed = time.monotonic() - _stream_start
 
     if saw_function_call:
+        print(f"  [voice-stream-timing] streamed first turn for {_stream_elapsed:.2f}s before "
+              f"a tool call was seen -- that work is now DISCARDED and the full "
+              f"tool-calling loop is about to re-run from scratch, non-streaming.",
+              file=sys.stderr)
         print("  [voice-stream] first turn needed a tool call -- falling back to the "
               "non-streaming tool-calling path for this reply (no streaming benefit "
               "this turn, but correct).", file=sys.stderr)
-        return _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model, tools, available_tools)
+        _fallback_start = time.monotonic()
+        result = _call_gemini_with_tools(api_key, system_prompt, messages, max_tokens, model, tools, available_tools)
+        _fallback_elapsed = time.monotonic() - _fallback_start
+        print(f"  [voice-stream-timing] non-streaming fallback (the redo) took "
+              f"{_fallback_elapsed:.2f}s -- discarded stream + redo = "
+              f"{_stream_elapsed + _fallback_elapsed:.2f}s total for this turn's "
+              f"generation.", file=sys.stderr)
+        return result
 
     return "".join(text_parts)
 
