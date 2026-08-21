@@ -71,6 +71,10 @@ rsync -a \
     --exclude '*.pyc' \
     --exclude 'server/' \
     --exclude 'mac/com.curant.server.plist' \
+    --exclude 'mac/*.plist' \
+    --exclude 'deploy.sh' \
+    --exclude 'build_protected.sh' \
+    --exclude 'curant.rb' \
     "$SCRIPT_DIR/" "$STAGE_DIR/"
 
 echo "==> Stamping version $VERSION into the staged copy..."
@@ -95,6 +99,27 @@ with open(path, "w") as f:
     f.write(new_content)
 PYEOF2
 
+# mac/*.plist: every checked-in plist hardcodes the DEVELOPER's own home
+# directory (/Users/AbhyudayDhundhel/bin) in its PATH. None of them are
+# used by an install: install.command generates the watcher and all
+# scheduled-service plists fresh from ${BIN_DIR}/${BREW_PREFIX}, and
+# setup-facetime.command generates the FaceTime one the same way (both
+# verified by inspecting the shipped package). So they are dead weight
+# that (a) leaks the developer's username and home layout to every
+# tester and (b) is actively dangerous if a tester ever copies one by
+# hand, since it would point launchd at a path that doesn't exist on
+# their Mac and fail silently -- the exact bug class that cost a full
+# debugging session before setup-facetime.command started generating
+# its plist per-user.
+#
+# deploy.sh / build_protected.sh: developer-only scripts. deploy.sh
+# symlinks /usr/local/bin into THIS repo checkout, which is meaningless
+# (and misleading) on a tester's machine.
+#
+# curant.rb: a Homebrew formula pointing at a public tap that does not
+# exist. Beta distribution is a private zip; shipping a formula implies
+# an install route that isn't real.
+#
 # server/ and com.curant.server.plist are deliberately left out: that's
 # your own local billing/license dashboard (not something a tester's Mac
 # runs -- install.command never touches it), and com.curant.server.plist
