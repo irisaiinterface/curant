@@ -2501,6 +2501,57 @@ def preload_local_whisper():
         return False
 
 
+MAX_PLAUSIBLE_WORDS_PER_SECOND = 5.0
+# Fast conversational English runs about 3 words/second; 5 is generous
+# headroom before a transcript becomes physically impossible.
+
+
+def _wav_duration_seconds(wav_path):
+    try:
+        import wave
+        with wave.open(wav_path, "rb") as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:
+        return None
+
+
+def _is_implausible_transcript(text, wav_path):
+    """Reject transcripts that contain more words than the audio had time
+    to hold. Returns (implausible, reason).
+
+    REAL FAILURE, caught live: 1.9 seconds of audio produced a ~70-word
+    transcript beginning "illas and I think that is what I genuinely
+    wanted to talk to you..." and continuing into fluent nonsense
+    ("a vapid of fear and external degrees"). The caller had said
+    "hello, can you hear me". Curant then replied to the hallucination
+    in earnest.
+
+    That is the worst thing this feature can do -- worse than silence,
+    because the caller hears a confident answer to something they never
+    said. Whisper's own no_speech/logprob thresholds (set below) reduce
+    it but demonstrably do not eliminate it.
+
+    This check is different in kind: it does not try to judge whether the
+    text is plausible ENGLISH, which is exactly what the model is
+    already wrong about. It checks a physical constraint -- 70 words
+    cannot fit in 1.9 seconds at any speaking rate -- so it holds no
+    matter how fluent the hallucination is. That property is why it
+    belongs here rather than a smarter-sounding heuristic.
+    """
+    words = len((text or "").split())
+    if words == 0:
+        return False, ""
+    duration = _wav_duration_seconds(wav_path)
+    if not duration or duration <= 0:
+        return False, ""
+    max_words = max(4, int(duration * MAX_PLAUSIBLE_WORDS_PER_SECOND))
+    if words > max_words:
+        return True, (f"{words} words from {duration:.1f}s of audio "
+                      f"(max plausible ~{max_words}) -- physically impossible, treating as "
+                      f"a hallucination")
+    return False, ""
+
+
 def _transcribe_local_whisper(wav_path):
     """Transcribe with the preloaded local model. Returns text, or None if
     the model isn't available (caller falls back to cloud)."""
@@ -2513,8 +2564,21 @@ def _transcribe_local_whisper(wav_path):
             language="en",
             condition_on_previous_text=False,  # each utterance is independent -- stops the model
                                                # carrying hallucinated context between turns
+            # Whisper's own confabulation guards. These are its documented
+            # defaults, set explicitly so a future library change can't
+            # silently relax them -- and because on this workload they are
+            # load-bearing rather than incidental.
+            no_speech_threshold=0.6,
+            logprob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
         )
-        return (result.get("text") or "").strip()
+        text = (result.get("text") or "").strip()
+        implausible, why = _is_implausible_transcript(text, wav_path)
+        if implausible:
+            print(f"  [{_ts()}] Discarded transcript: {why}. Text was: {text[:120]!r}",
+                  file=sys.stderr)
+            return ""
+        return text
     except Exception as e:
         print(f"  [{_ts()}] Local Whisper failed ({e}) -- falling back to cloud.", file=sys.stderr)
         return None
