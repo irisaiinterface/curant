@@ -162,6 +162,8 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
     private var converter: AVAudioConverter?
     private var announcedReady = false
     private var sawAnyAudio = false
+    private var bufferCount = 0
+    private var lastHeartbeat = Date()
 
     init(writer: SegmentWriter, targetFormat: AVAudioFormat) {
         self.writer = writer
@@ -206,7 +208,24 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 
         if !sawAnyAudio {
             sawAnyAudio = true
-            log("first audio buffer received (\(Int(pcm.format.sampleRate))Hz, \(pcm.format.channelCount)ch)")
+            log("FIRST AUDIO BUFFER received (\(Int(pcm.format.sampleRate))Hz, "
+                + "\(pcm.format.channelCount)ch) -- ScreenCaptureKit IS delivering audio")
+        }
+        bufferCount += 1
+        // Periodic proof-of-life. Without this, "the tap is running but
+        // the OS is sending it nothing" and "the tap is receiving audio
+        // that happens to be silent" look identical from outside, which
+        // is exactly the ambiguity that made the previous backend so
+        // expensive to debug.
+        if Date().timeIntervalSince(lastHeartbeat) >= 5.0 {
+            lastHeartbeat = Date()
+            var peak: Float = 0
+            if let ch = out.int16ChannelData {
+                for i in 0..<Int(out.frameLength) {
+                    peak = max(peak, abs(Float(ch[0][i])))
+                }
+            }
+            log("heartbeat: \(bufferCount) buffers so far, latest peak amplitude \(Int(peak))")
         }
 
         do {
@@ -219,6 +238,15 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("stream stopped with error: \(error.localizedDescription)")
         exit(2)
+    }
+
+    func warnIfNoAudioYet() {
+        if !sawAnyAudio {
+            log("WARNING: 10s elapsed and ScreenCaptureKit has delivered ZERO audio buffers. "
+                + "The stream started without error, so this is the OS declining to provide this "
+                + "audio rather than a crash. Try --system-audio (whole-system mix) to test "
+                + "whether app-scoped capture is the limitation.")
+        }
     }
 
     func markReady() {
@@ -234,6 +262,14 @@ final class AudioTap: NSObject, SCStreamOutput, SCStreamDelegate {
 var outDirPath: String?
 var segmentSeconds: Double = 1.0
 var bundleID = "com.apple.FaceTime"
+// SYSTEM-WIDE fallback mode. App-scoped capture asks ScreenCaptureKit
+// for one application's audio; if macOS treats FaceTime call audio as
+// protected communications audio, that can legitimately yield nothing.
+// System-wide capture takes the whole display's audio mix instead and
+// relies on excludesCurrentProcessAudio to keep Curant's own TTS out of
+// it. Worth trying second, not first: it also picks up every other
+// noise the Mac makes.
+var systemWide = false
 
 var args = Array(CommandLine.arguments.dropFirst())
 while !args.isEmpty {
@@ -248,6 +284,8 @@ while !args.isEmpty {
     case "--bundle-id":
         guard !args.isEmpty else { fail("--bundle-id needs a value") }
         bundleID = args.removeFirst()
+    case "--system-audio":
+        systemWide = true
     case "-h", "--help":
         print("""
         usage: curant-facetime-audiotap --out-dir DIR [--segment-seconds 1.0] [--bundle-id com.apple.FaceTime]
@@ -292,12 +330,16 @@ Task {
         // to attach the audio filter to.
         let content = try await SCShareableContent.excludingDesktopWindows(false,
                                                                           onScreenWindowsOnly: false)
-        guard let app = content.applications.first(where: { $0.bundleIdentifier == bundleID }) else {
-            fail("\(bundleID) is not running -- start a call first. "
-                 + "(Found \(content.applications.count) running applications.)")
-        }
         guard let display = content.displays.first else {
             fail("no display available to attach the capture filter to")
+        }
+        var app: SCRunningApplication?
+        if !systemWide {
+            app = content.applications.first(where: { $0.bundleIdentifier == bundleID })
+            if app == nil {
+                fail("\(bundleID) is not running -- start a call first. "
+                     + "(Found \(content.applications.count) running applications.)")
+            }
         }
 
         let config = SCStreamConfiguration()
@@ -318,7 +360,12 @@ Task {
         // voice as the caller interrupting.
         config.excludesCurrentProcessAudio = true
 
-        let filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+        let filter: SCContentFilter
+        if let app = app {
+            filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
+        } else {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        }
         let writer = try SegmentWriter(outDir: outDir, segmentSeconds: segmentSeconds, format: targetFormat)
         let tap = AudioTap(writer: writer, targetFormat: targetFormat)
 
@@ -328,8 +375,14 @@ Task {
         try await stream.startCapture()
         streamRef = stream
         tap.markReady()
-        log("capturing audio from \(app.applicationName) [\(bundleID)] "
-            + "-> \(outDir.path) every \(segmentSeconds)s")
+        let source = app.map { "\($0.applicationName) [\(bundleID)]" } ?? "ENTIRE SYSTEM (all apps)"
+        log("capturing audio from \(source) -> \(outDir.path) every \(segmentSeconds)s")
+
+        // If nothing arrives at all, say so plainly rather than leaving
+        // the caller to infer it from an absence of log lines.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+            tap.warnIfNoAudioYet()
+        }
     } catch {
         fail("could not start capture: \(error.localizedDescription)")
     }

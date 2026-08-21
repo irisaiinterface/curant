@@ -1675,6 +1675,8 @@ def _start_continuous_capture(seconds_per_segment):
 
 AUDIOTAP_BIN = os.path.expanduser("~/bin/curant-facetime-audiotap")
 AUDIOTAP_DISABLE_ENV = "CURANT_FACETIME_DISABLE_AUDIOTAP"
+AUDIOTAP_SYSTEM_AUDIO_ENV = "CURANT_FACETIME_SYSTEM_AUDIO"  # =1 -> capture the whole system mix
+AUDIOTAP_LOG_PATH = "/tmp/curant-facetime-audiotap.log"
 AUDIOTAP_READY_TIMEOUT_SECONDS = 12
 
 
@@ -1724,23 +1726,47 @@ def _start_audiotap_capture(seconds_per_segment):
     _start_continuous_capture()."""
     segment_dir = tempfile.mkdtemp(prefix="curant_facetime_turns_")
     pattern = os.path.join(segment_dir, "turn_%05d.wav")
+    # REAL BUG this fixes: stderr was subprocess.PIPE and nothing ever
+    # read it. Every diagnostic the Swift tap emits -- the audio format
+    # it received, its heartbeat, its "zero buffers delivered" warning
+    # -- went into a pipe no one drained, so from outside the tap was
+    # completely mute and the first live test was undiagnosable. Worse,
+    # an undrained pipe blocks the writer once the OS buffer fills
+    # (~64KB), which could stall the tap itself. stderr now goes to a
+    # real file that can be tailed like every other Curant log.
+    log_path = AUDIOTAP_LOG_PATH
+    tap_log = open(log_path, "a", buffering=1)
+    tap_log.write(f"\n===== audiotap starting {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"(segment {seconds_per_segment}s) =====\n")
+    extra = ["--system-audio"] if os.environ.get(AUDIOTAP_SYSTEM_AUDIO_ENV) == "1" else []
     proc = subprocess.Popen(
         [AUDIOTAP_BIN, "--out-dir", segment_dir,
-         "--segment-seconds", str(seconds_per_segment)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+         "--segment-seconds", str(seconds_per_segment)] + extra,
+        stdout=subprocess.PIPE, stderr=tap_log, text=True,
     )
     deadline = time.monotonic() + AUDIOTAP_READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             err = ""
             try:
-                err = (proc.stderr.read() or "").strip()
+                with open(AUDIOTAP_LOG_PATH) as fh:
+                    err = "".join(fh.readlines()[-12:]).strip()
             except Exception:
                 pass
             shutil.rmtree(segment_dir, ignore_errors=True)
             raise RuntimeError(f"audiotap exited immediately: {err[:400]}")
         line = proc.stdout.readline() if proc.stdout else ""
         if line.strip() == "READY":
+            # Keep draining stdout for the life of the process. Same
+            # class of bug as the stderr one above: a pipe nobody reads
+            # eventually blocks the writer.
+            def _drain(stream):
+                try:
+                    for _ in iter(stream.readline, ""):
+                        pass
+                except Exception:
+                    pass
+            threading.Thread(target=_drain, args=(proc.stdout,), daemon=True).start()
             return proc, segment_dir, pattern
         if not line:
             time.sleep(0.05)
