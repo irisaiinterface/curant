@@ -75,6 +75,7 @@ rsync -a \
     --exclude 'deploy.sh' \
     --exclude 'build_protected.sh' \
     --exclude 'curant.rb' \
+    --exclude 'BETA_SMOKE_TEST.md' \
     "$SCRIPT_DIR/" "$STAGE_DIR/"
 
 echo "==> Stamping version $VERSION into the staged copy..."
@@ -119,6 +120,10 @@ PYEOF2
 # curant.rb: a Homebrew formula pointing at a public tap that does not
 # exist. Beta distribution is a private zip; shipping a formula implies
 # an install route that isn't real.
+#
+# BETA_SMOKE_TEST.md: internal release checklist. Testers don't run it,
+# and it documents which failure modes we already know about -- not a
+# useful first impression.
 #
 # server/ and com.curant.server.plist are deliberately left out: that's
 # your own local billing/license dashboard (not something a tester's Mac
